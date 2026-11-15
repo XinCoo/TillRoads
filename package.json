@@ -3,12 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "题路 TillRoad · 核心闭环规则层与 API 骨架（Node 24 零第三方依赖，可移植到 Flutter/NestJS）",
+  "description": "题路 TillRoad · core/ 端无关零依赖规则层 + server/ API 与 PG 仓储骨架（server/ 运行时依赖 pg）",
   "scripts": {
-    "test": "node --test core/*.test.mjs server/*.test.mjs",
+    "test": "node --test core/*.test.mjs server/*.test.mjs server/*/*.test.mjs",
     "test:core": "node --test core/*.test.mjs",
-    "test:server": "node --test server/*.test.mjs",
+    "test:server": "node --test server/*.test.mjs server/*/*.test.mjs",
+    "test:integration": "node --test server/db/pg-smoke.integration.test.mjs",
     "start": "node server/index.mjs"
+  },
+  "dependencies": {
+    "pg": "^8.23.1"
   },
   "engines": {
     "node": ">=20"

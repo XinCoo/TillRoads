@@ -4,8 +4,8 @@ name: Schema CI
 # 用途: 在 GitHub Actions 的临时 PostgreSQL 15 服务容器里「真跑」schema。
 #   验证范围 = 建表 + 二次执行幂等 + down/up 可逆 + 末尾自检 DO 块通过。
 #   **不是**业务语义验证: 状态机 / 禁用语 / 三次验证 / 去重哈希等业务规则
-#   由仓库内 Node 规则层单测(core/*.test.mjs)覆盖, 本 workflow 不重复。
-#   CI 中无任何密钥; 下面的 PGUSER/PGPASSWORD 是本次容器的一次性占位凭据。
+#   **不是**业务语义验证: 状态机 / 禁用语 / 三次验证 / 去重哈希等业务规则
+#   由下方 node-tests job 的 Node 单测(core/ + server/)覆盖, 本 schema job 不重复。
 # ---------------------------------------------------------------------------
 on:
   push:
@@ -13,11 +13,19 @@ on:
       - 'schema.sql'
       - 'migrations/**'
       - '.github/workflows/schema-ci.yml'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'core/**'
+      - 'server/**'
   pull_request:
     paths:
       - 'schema.sql'
       - 'migrations/**'
       - '.github/workflows/schema-ci.yml'
+      - 'package.json'
+      - 'package-lock.json'
+      - 'core/**'
+      - 'server/**'
 
 jobs:
   schema:
@@ -85,3 +93,58 @@ jobs:
           set -euo pipefail
           psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql 2>&1 | tee /tmp/up3.log
           grep -q 'SCHEMA_VERIFY_OK' /tmp/up3.log
+
+  # -------------------------------------------------------------------------
+  # BE-01 第 2 步新增: Node 单测 + 一条 PG smoke 集成测试。
+  # 与 schema job 用 needs 串联: 先确认 schema 可上/幂等/可逆, 再跑 Node 测试。
+  # services 是 job 级作用域(不能跨 job 共享同一容器), 这里复用同一份
+  # postgres:15 定义而非另写镜像; smoke 只需一个可连的 PG(SELECT 1 / 类型解析 /
+  # 临时表事务), 不需要已迁移的业务库。
+  # -------------------------------------------------------------------------
+  node-tests:
+    name: Node 24 · unit tests + PG smoke
+    needs: schema
+    runs-on: ubuntu-24.04  # 与 schema job 一致, 固定 LTS 镜像
+
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: tillroad_ci
+      PGPASSWORD: tillroad_ci_pw
+      PGDATABASE: tillroad_ci
+      # 仅本 job 显式打开集成开关; 本机/其它环境默认跳过, 绝不假装跑过 PG。
+      RUN_PG_INTEGRATION: '1'
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: tillroad_ci
+          POSTGRES_PASSWORD: tillroad_ci_pw
+          POSTGRES_DB: tillroad_ci
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tillroad_ci -d tillroad_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5  # 与 schema job 一致: Node 24 原生, 无 Node 20 弃用告警
+
+      - name: Setup Node 24
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24'
+          cache: 'npm'   # 依赖 package-lock.json(BE-01 第 2 步已生成, 须随代码提交)
+
+      - name: Install dependencies
+        run: npm ci   # 按 lockfile 精确安装, 含 pg@8.23.1
+
+      # services.options 的 health-cmd 已让 GitHub 等容器 healthy 才进入 steps,
+      # 故无需额外的 sleep/pg_isready 等待步骤(也避免对 psql 客户端的隐式依赖)。
+      - name: Node unit tests + PG smoke integration test
+        run: npm test

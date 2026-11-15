@@ -105,3 +105,16 @@
 3. **FE-09 / BE-08**：按 `offline-sync-spec.md` v1.2 落地 `flutter/local_ai_task_queue.dart`（当前仓尚不存在）。
 4. **FE-11**：按 `fe-11-audit-motion-spec.md` 画七态原型（注意是 FE-11，不是 FE-02）。
 5. 补 Flutter SDK + PG/Docker 工具链后，把 `core/` 规则移植到 Dart / 接入 NestJS，跑全栈集成与 QA-01~06。
+
+---
+
+## 8. BE-01 已知缺口（随实现记录，非文档修订）
+
+- **四张表无业务唯一约束**：`exam_profiles` / `subjects` / `knowledge_nodes` / `capability_layers` 在 `schema.sql` 上只有主键 + 非唯一索引，没有「同 exam_profile 下 subject.name 不重复」「同 parent 下 knowledge_node.title 不重复」等业务唯一约束。`schema.sql` 已冻结（BE-00 已归档，CI 绿），**MVP 阶段不夹带改 schema 加 UNIQUE**；改由**仓储层在同一事务内显式查重**（`SELECT … FOR UPDATE` / 查重）实现，并以集成测试覆盖并发竞态窗口。**见 BE-01 第 3 步**。若将来要 DB 级唯一，须独立 schema issue + 独立 PR。
+- 本轮（BE-01 第 1 步）仅新增 `core/validators.mjs`（V1–V12 纯校验函数）与 `core/validators.test.mjs`，未引入 `pg`、未改 `package.json`、未动 `server/` 与冻结的 `schema.sql`；`npm test` 仅验证纯函数逻辑，本机无 PostgreSQL，未实跑 PG。
+
+---
+
+## 9. BE-02 前评估（待办，不夹带改代码）
+
+- **`validateAIGenerateRequest` 返回形状是否统一为扁平形**：`core/index.mjs` 的 `validateAIGenerateRequest()` 返回 `{ ok:false, error:{ code, message } }`（嵌套形）；`core/validators.mjs`（BE-01 第 1 步新增）与 `server/repositories/base.mjs` 的 `mapPgError()` 等新代码统一用 `{ ok:false, code, message }` / 带 `.code` 的扁平形。HTTP 层目前用 `r.error?.code ?? r.code` 兼容两种形状。**待 BE-02（AI 生成接入）前决定**：是否把 `validateAIGenerateRequest` 也改成扁平形以消除分叉；若改，须同步 `server/index.mjs` 的调用处与 `core/index.test.mjs` 断言，并作为独立改动（不夹带在 BE-01 第 2/3/4 步）。本轮不动 `core/index.mjs`。

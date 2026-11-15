@@ -1,0 +1,17 @@
+# ---- Node / npm ----
+node_modules/
+*.log
+npm-debug.log*
+
+# ---- 本地环境变量与凭据（严禁入库；CI 用 job env 注入一次性占位值）----
+.env
+.env.*
+!.env.example
+
+# ---- 测试 / 覆盖率产物 ----
+coverage/
+.nyc_output/
+
+# ---- 操作系统 / 编辑器 ----
+.DS_Store
+Thumbs.db
