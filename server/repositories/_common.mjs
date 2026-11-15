@@ -37,6 +37,47 @@ export function isBlank(v) {
   return v == null || (typeof v === 'string' && v.trim() === '');
 }
 
+// ---------------------------------------------------------------------------
+// jsonb 列参数处理（BE-01 第 3 步 CI 修复 A）
+//   根因**不是**「我们手动 stringify 了一次、驱动又处理一次」（仓储层从未调用
+//   JSON.stringify）；而是 pg 驱动的 prepareValue() 先判 Array.isArray()：
+//     * JS 数组 -> PG 数组字面量 {"{\"order\":1}"}，jsonb 列解析必失败（22P02
+//       `Expected ":", but found ","`）；
+//     * JS 对象 -> JSON.stringify，恰好正确；
+//     * JS 字符串 -> 原样下发，当作 JSON 文本，也正确。
+//   所以对 jsonb 列必须**自己序列化数组/对象**（对象虽侥幸可用，仍统一处理避免歧义）。
+//   作用范围是 schema.sql 里全部 jsonb 列，不只 capability_layers.layers。
+// ---------------------------------------------------------------------------
+
+export const JSONB_COLUMNS = Object.freeze({
+  ai_generation_jobs: Object.freeze(['payload']),
+  exam_profiles: Object.freeze(['subject_target', 'source_scope', 'baseline']),
+  capability_layers: Object.freeze(['layers']),
+  questions: Object.freeze(['options', 'tags', 'generation_meta', 'asset_refs']),
+  defect_tickets: Object.freeze(['actions', 'verification_state']),
+  mock_exams: Object.freeze(['questions', 'report']),
+  review_cycles: Object.freeze(['metrics']),
+  plans: Object.freeze(['items']),
+});
+
+/** 该表该列是否为 jsonb（表名/列名都来自硬编码常量，不来自请求输入）。 */
+export function isJsonbColumn(table, column) {
+  const cols = JSONB_COLUMNS[table];
+  return Array.isArray(cols) && cols.includes(column);
+}
+
+/**
+ * jsonb 参数归一：
+ *   * null / undefined 原样（NULL 合法，且 undefined 要留给 buildUpdateSet 跳过）；
+ *   * 字符串视为「调用方已序列化好的 JSON 文本」，原样下发（二次 stringify 会变成 JSON 字符串字面量，反而错）；
+ *   * 其他（数组 / 对象 / 数字 / 布尔）用 JSON.stringify —— 数组是关键，见上方根因。
+ */
+export function toJsonbParam(value) {
+  if (value === null || value === undefined) return value;
+  if (typeof value === 'string') return value;
+  return JSON.stringify(value);
+}
+
 export function assertSafeTable(table) {
   if (typeof table !== 'string' || !IDENT_RE.test(table)) {
     throw new TypeError(`assertSafeTable: 非法表名 ${table}`);
@@ -199,7 +240,9 @@ export async function insertRow(client, table, columnList, values, { returning =
   const cols = columnList.map((c) => `"${c}"`).join(', ');
   const holders = columnList.map((_, i) => `$${i + 1}`).join(', ');
   const sql = `INSERT INTO ${table} (${cols}) VALUES (${holders}) RETURNING ${returning}`;
-  return queryOne(client, sql, values);
+  // jsonb 列统一在这里序列化，调用方（各仓储模块）只管传 JS 数组/对象。
+  const boundValues = columnList.map((c, i) => (isJsonbColumn(table, c) ? toJsonbParam(values[i]) : values[i]));
+  return queryOne(client, sql, boundValues);
 }
 
 /**
@@ -218,8 +261,12 @@ export async function updateWithVersion(client, { table, id, baseVersion, patch,
   if (baseVersion === undefined || baseVersion === null) {
     throw new TypeError('updateWithVersion: baseVersion 必填（乐观锁不允许无基版号写入）');
   }
-  const { setClauses, values } = buildUpdateSet(patch, allowedColumns);
-
+  // jsonb 列统一在这里序列化（数组必须显式 stringify，否则驱动当 PG 数组下发）
+  const boundPatch = {};
+  for (const key of Object.keys(patch || {})) {
+    boundPatch[key] = isJsonbColumn(table, key) ? toJsonbParam(patch[key]) : patch[key];
+  }
+  const { setClauses, values } = buildUpdateSet(boundPatch, allowedColumns);
   if (setClauses.length === 0) {
     return requireRow(client, table, id, { includeDeleted: false });
   }

@@ -150,7 +150,9 @@ export async function getTree(client, subjectId) {
 
 /**
  * 更新（乐观锁）。
- * 只有 patch 含 title 时才锁父行 + 查重（排除自己）。
+ * 查重触发条件：patch 含 title **或** parent_id —— 两者任一变化都会改变
+ *   (subject_id, parent_id, title) 这个业务唯一键；只移动不改名时，新父下
+ *   已存在同名节点也必须 409（BE-01 第 3 步 CI 修复 D：原实现只判 title，漏掉移动）。
  * 若 patch 移动节点（含 parent_id），用「生效后的 subject_id + parent_id」查重，
  * 否则「移到另一个父下、与目标父下某节点同名」会漏检。
  * 移动节点还需校验目标父与节点同科目（同 create）。
@@ -191,17 +193,20 @@ export async function update(client, id, patch = {}, baseVersion) {
     await lockParentRow(client, 'subjects', current.subject_id);
   }
 
-  if (renames) {
-    await lockParentRow(client, 'subjects', current.subject_id);
+  // 查重：title 或 parent_id 任一变化都要查（只移动也必须查新父下的同名）。
+  //   上面 movesParent 块已锁 subject 父行做串行化，这里只补「同名判定」。
+  if (renames || movesParent) {
+    if (!movesParent) await lockParentRow(client, 'subjects', current.subject_id); // 移动路径已在上方锁过，避免重复加锁
     const effectiveParentId = movesParent ? (patch.parent_id ?? null) : current.parent_id;
+    const effectiveTitle = renames ? patch.title : current.title;
     const dup = await findTitleConflict(
       client,
       current.subject_id,
       effectiveParentId,
-      patch.title,
+      effectiveTitle,
       id,
     );
-    if (dup) throw duplicateError('title', dup, { title: patch.title });
+    if (dup) throw duplicateError('title', dup, { title: effectiveTitle });
   }
 
   return updateWithVersion(client, {

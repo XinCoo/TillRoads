@@ -124,4 +124,35 @@
 
 ## 9. BE-02 前评估（待办，不夹带改代码）
 
-- **`validateAIGenerateRequest` 返回形状是否统一为扁平形**：`core/index.mjs` 的 `validateAIGenerateRequest()` 返回 `{ ok:false, error:{ code, message } }`（嵌套形）；`core/validators.mjs`（BE-01 第 1 步新增）与 `server/repositories/base.mjs` 的 `mapPgError()` 等新代码统一用 `{ ok:false, code, message }` / 带 `.code` 的扁平形。HTTP 层目前用 `r.error?.code ?? r.code` 兼容两种形状。**待 BE-02（AI 生成接入）前决定**：是否把 `validateAIGenerateRequest` 也改成扁平形以消除分叉；若改，须同步 `server/index.mjs` 的调用处与 `core/index.test.mjs` 断言，并作为独立改动（不夹带在 BE-01 第 2/3/4 步）。本轮不动 `core/index.mjs`。
+- **`validateAIGenerateRequest` 返回形状是否统一为扁平形**：`core/index.mjs` 的 `validateAIGenerateRequest()` 返回 `{ ok:false, error:{ code, message } }`（嵌套形）；`core/validators.mjs`（BE-01 第 1 步新增）与 `server/repositories/base.mjs` 的 `mapPgError()` 等新代码统一用 `{ ok:false, code, message }` / 带 `.code` 的扁平形。HTTP 层目前用 `r.error?.code ?? r.code` 兼容两种形状。**待 BE-02（AI 生成接入）前决定**：是否把 `validateAIGenerateRequest` 也改成扁平形以消除分叉；若改，须同步 `server/routes/defect_tickets.mjs` 的调用处与 `core/index.test.mjs` 断言，并作为独立改动（不夹带在 BE-01 第 2/3/4 步）。本轮不动 `core/index.mjs`。
+
+---
+
+## 10. BE-01 第 4 步（路由层拆分 + AC-KM-01/02 事务）
+
+完成状态（本轮新增/修改）：
+
+- **新增 `core/templates.mjs` + `core/templates.test.mjs`**（纯数据，不 import `pg`、不 import `server/`）：`TEMPLATE_VERSION='tpl-1'`，5 个 `exam_type` 各一套默认科目（civil_service 6 / postgrad 4 / final_exam 3 / vocational 2 / adult_self_study 3），`getTemplateSubjects(examType)` 未知类型返回 `[]` 不报错。**踩坑**：`Object.freeze` 的模板对象直接索引会命中原型链（`TEMPLATES['constructor']` → `tpl.map is not a function`），已用 `hasOwnProperty` 守卫。
+- **新增 `server/routes/`**（6 个文件 + 挂载器）：`_http.mjs`（唯一 HTTP 出口：`ok`/`fail`/`assertValid`/`readBaseVersion`/`httpError`/`readBody`/`pagination`）、`exam_profiles.mjs`、`subjects.mjs`、`knowledge_nodes.mjs`、`capability_layers.mjs`、`defect_tickets.mjs`、`index.mjs`（`dispatch()` 先给 `GET /health`，再按 `ROUTE_MODULES` 顺序问各 `match()`）。
+- **`server/index.mjs` 瘦身 452 → 约 150 行**：只做 HTTP server + `pool`/`state` 注入 + 交给 `dispatch()` + 404/异常映射；四表端点已全部走 `server/repositories/` 真 PG。
+- **`base_version` 强制**：`_http.readBaseVersion(body)` 只认 body 的 `version`（刻意不支持 `If-Match`），缺失或非正整数 → `400 { error:'INVALID_BASE_VERSION' }`。仅覆盖已接 PG 的四张表。
+- **三处事务编排**：AC-KM-01（`POST /exam-profiles` → profile + 模板科目）、AC-KM-02（`POST /subjects/:id/customize-layers` → 副本模板 + 重指向）、级联软删（`DELETE /exam-profiles/:id` → profile + 两条批量 `UPDATE`），全部用 `withTransaction`，未用 `pool.query` 拼多条。
+- **测试改造**：`server/index.test.mjs` 重写为 fake 层 29 条（不连 PG，验证路由分发 / 入参解析 / `base_version` 400 / 409 两种形状）；新增 `server/index.integration.test.mjs` 10 条（真 PG，`RUN_PG_INTEGRATION=1` 才跑）。`repositories.integration.test.mjs` 的 `before()` 同步改为 `withTransaction` 包 `schema.sql`（失败整笔回滚，不留半个 schema）。
+- **`capability_layers.archive` 受 gate 拦截 —— 刻意加严，非遗漏**：`customizable=false` 的共享模板连软删也拒绝（`400 CUSTOMIZABLE_LOCKED`）。理由：软删后 `list` 查不到、但别人的 `subject` 仍指向它，比「不能改」更强的保护是必要的。决策 6 明确保留该行为。
+- **缺陷单等内存端点未强制 `base_version`**：决策 8 的强制范围仅限第 3 步已接 PG 的四张表；缺陷单仍在内存 Map，BE-03 重写到 PG 时一并统一（现在改会让 9 条状态机测试无谓失效，且还得改第二遍）。
+- **验证**：`npm test` → `tests 133 / pass 91 / fail 0 / skipped 42`（42 = 4 smoke + 28 仓储集成 + 10 路由集成，本机全跳过）；本机无 PostgreSQL，**PG 侧的真跑全部留给 CI**。
+- **仍未统一的具体事项**：`validateAIGenerateRequest` 的嵌套返回形（见 §9）。
+
+---
+
+## 11. BE-01 第 3 步 CI 失败修复（8 fail → 4 类根因）
+
+CI `node-tests` 首跑：`106 tests / 98 pass / 8 fail / 0 skipped`。逐类定位与修复：
+
+- **A（5 条 capability_layers）jsonb 参数被当成 PG 数组**：报错 `invalid input syntax for type json` / `Expected ":", but found ","`（22P02）。根因**不是**"手动 stringify 后又处理一次"（仓储层从未调用 `JSON.stringify`，`grep` 已证），而是 `pg/lib/utils.js` 的 `prepareValue()` 先判 `Array.isArray(val)`：JS 数组 → PG **数组**字面量 `{"{\"order\":1}"}`，JSON 解析必失败；JS 对象才会走 `JSON.stringify`；JS 字符串原样下发。**必须自己序列化数组**。修：`server/repositories/_common.mjs` 新增 `JSONB_COLUMNS`（覆盖 schema 全部 8 张表 15 个 jsonb 列）/`isJsonbColumn`/`toJsonbParam`，并在 `insertRow` 与 `updateWithVersion` 对 jsonb 列统一处理（字符串不二次序列化，null/undefined 原样）。新增 `server/repositories/_common.test.mjs` 7 条 fake 单测锁死行为。
+- **B（1 条 exam_profiles.update）时间戳断言错**：`inRollback` 把 create 与 update 放同一事务，PG 的 `now()` 在事务内恒定 → `updated_at` 必然等于 `created_at`。不是乐观锁失效，是断言写错。修：改断言为 `version === created.version + 1` + 字段变化 + `updated_at >= created_at` 非严格单调。
+- **C（1 条 getTree）排序依赖随机 uuid**：两根节点同事务创建 → `created_at` 相同 → 退化为 `id`（`gen_random_uuid()` 随机）。修：断言改为「集合正确 + 排序键单调（`created_at` 不降，相等时 `id` 升序）」，并用 id 建 Map 定位节点而非下标。理由：手动 `UPDATE created_at` 要额外写权限与清理，且会掩盖"排序键是否正确"这个真正要验的点。
+- **D（1 条 knowledge_nodes.update）实现缺口**：原查重只在 `patch` 含 `title` 时执行，"只移动不改名"会漏检。修：`update` 的查重条件改为 `renames || movesParent`，用"生效后的 `parent_id` + 生效后的 `title`"在同 `subject_id` 下查重（排除自身）；移动路径上方已 `lockParentRow(subjects)`，查重块内不重复加锁。新增 2 条集成测试："移动撞新父下同名 → 409"（并补反向对照"移到无同名父下成功"）、"跨科目移动 → 400 `parent_subject_mismatch`"。
+- **第 5 项（before 包事务）**：BE-01 第 4 步（T7）已完成，本轮跳过，`before()` 现状为 `withTransaction(pool, client => client.query(SCHEMA_SQL))`。
+- **验证**：`npm test` → `tests 141 / pass 98 / fail 0 / skipped 43`。明细：98 pass = core/index 14 + templates 4 + validators 15 + server/index(fake) 29 + pool 9 + base 20 + `_common` 7（新增）；43 skip = pg-smoke 4 + 仓储集成 29（原 28，D 新增 1 条）+ 路由集成 10。本机无 PostgreSQL，**8 条原失败集成用例只有 CI 能转红为绿**。
+- **未变的约束**：未改 `schema.sql` / `core/index.mjs` / `core/validators.mjs` / `server/db/pool.mjs` / `server/repositories/base.mjs`（A 的修复定位在 `_common.mjs`，未触 `buildUpdateSet`）。

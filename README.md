@@ -33,10 +33,21 @@ TillRoads/
 │   ├── index.mjs              #   状态机 / 禁用语 / 三次验证 / 去重哈希 / 优先级 / BYOK 校验
 │   ├── index.test.mjs         #   14 个 node:test 用例
 │   ├── validators.mjs         #   BE-01 输入校验 V1–V12（扁平 result 形状，17 个导出）
-│   └── validators.test.mjs    #   15 个用例
+│   ├── validators.test.mjs    #   15 个用例
+│   ├── templates.mjs          #   AC-KM-01 官方科目模板（纯数据，5 个 exam_type）
+│   └── templates.test.mjs     #   4 个用例
 ├── server/                    # HTTP API 骨架 + PG 仓储
-│   ├── index.mjs              #   路由 + 服务（内存存储，当前仍走内存；第 4 步切 PG）
-│   ├── index.test.mjs         #   16 个集成测试
+│   ├── index.mjs              #   启动 + pool/state 注入 + 交给 dispatch()（已瘦身至 ~150 行）
+│   ├── index.test.mjs         #   29 个 fake 层用例（路由分发 / 入参 / base_version / 409，不连 PG）
+│   ├── index.integration.test.mjs  # 10 条路由层 PG 集成（AC-KM-01/02 + 级联软删，仅 CI 跑）
+│   ├── routes/
+│   │   ├── _http.mjs          #   ok/fail/assertValid/readBaseVersion/httpError/readBody/pagination
+│   │   ├── index.mjs          #   dispatch()：health 优先，再按 ROUTE_MODULES 顺序问各 match()
+│   │   ├── exam_profiles.mjs  #   目标配置 + AC-KM-01 事务 + 级联软删事务
+│   │   ├── subjects.mjs       #   科目 + AC-KM-02 层级副本事务
+│   │   ├── knowledge_nodes.mjs#   考点树（含扁平/嵌套两种 GET）
+│   │   ├── capability_layers.mjs # 层级模板 + customizable gate
+│   │   └── defect_tickets.mjs #   缺陷单/模考/复盘/AI（暂为内存实现，BE-03 重写）
 │   ├── db/
 │   │   ├── pool.mjs           #   createPool() + 7 个 OID 类型解析器（numeric→number 等）
 │   │   ├── pool.test.mjs      #   9 个用例（零 PG）
@@ -88,11 +99,10 @@ psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql   # 打印 SCHEMA_VERIFY_
 psql -v ON_ERROR_STOP=1 -f migrations/0001_init_down.sql # 回滚
 ```
 
-集成测试（四表仓储 + PG smoke）需要真实 PG，默认跳过：
+集成测试（四表仓储 + 路由层 + PG smoke）需要真实 PG，默认跳过：
 
 ```bash
-# 先迁移，再跑集成（CI 由 node-tests job 自动完成这两步）
-psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql
+# 集成测试的 before() 会自行执行整份 schema.sql，无需先手动迁移
 RUN_PG_INTEGRATION=1 npm test
 ```
 
@@ -183,12 +193,52 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 - 所有 SQL 值均参数化；列名只来自各模块的硬编码白名单（`buildUpdateSet` 三道闸校验）。
 - `core/` 一行 `pg` 都不 import；`capability_layers.mjs` 反向 import `core/validators.mjs` 的纯函数是唯一例外。
 
-## 5. HTTP API（server/index.mjs）
+### 路由层（server/routes/，BE-01 第 4 步）
+
+`server/index.mjs` 只做三件事：建 HTTP server、注入 `pool` / `state`、把 `(method, seg)` 交给 `server/routes/index.mjs` 的 `dispatch()`。四个连 PG 的模块各占一个文件；`defect_tickets.mjs` 暂存内存实现（BE-03 会重写到 PG）。
+
+`base_version` 传递方式：**只认请求体的 `version` 字段**，刻意不支持 `If-Match` 头（现有 16 条测试、`conflictBody`、`offline-sync-spec.md` 与 SQL 骨架 `WHERE version = $base_version` 都以 body 为准；同时支持两者会产生「不一致时听谁的」歧义）。缺失或非正整数：
+
+```json
+{ "error": "INVALID_BASE_VERSION", "message": "version 必须是正整数（乐观锁基版号）" }
+```
+
+409 有两种形状，客户端按 `resolution` 分支；HTTP 层只有一处 `catch`，直接用 `err.body` 输出，不重新拼：
+
+```json
+{ "error": "conflict", "current": {...}, "incoming": 3, "resolution": "client_merge" }
+{ "error": "conflict", "field": "name", "current": {...}, "incoming": {"name":"x"}, "resolution": "user_choice" }
+```
+
+> 缺陷单等内存端点本轮**未**强制 `base_version`（保持原行为）；强制范围仅限已接 PG 的四张表，BE-03 重写缺陷单时一并统一。
+
+## 5. HTTP API（server/routes/）
 
 | 方法 & 路径 | 说明 |
 |---|---|
 | `GET /health` | 健康检查 |
-| `POST /exam-profiles` | 目标配置 |
+| `POST /exam-profiles` | 建目标配置（**AC-KM-01**：同事务按 `exam_type` 模板预置科目 → `201 {profile, subjects}`） |
+| `GET /exam-profiles/:id` | 取单个目标配置 |
+| `GET /users/:userId/exam-profiles` | 某用户的目标配置列表（分页 `{items,...page}`） |
+| `PATCH /exam-profiles/:id` | 更新（**`base_version` 必填**；空 patch 不发 UPDATE、不推进 `version`） |
+| `DELETE /exam-profiles/:id` | 软删（**`base_version` 必填**；级联软删 subjects + knowledge_nodes，返回 `cascaded` 行数） |
+| `GET /exam-profiles/:id/subjects` | 某目标下的科目列表 |
+| `POST /subjects` | 建科目（缺 `exam_profile_id` → `400 missing_exam_profile_id`） |
+| `GET /subjects/:id` | 取单个科目 |
+| `PATCH /subjects/:id` | 更新科目（`base_version` 必填） |
+| `DELETE /subjects/:id` | 软删科目（`base_version` 必填） |
+| `POST /subjects/:id/customize-layers` | **AC-KM-02**：同事务建自定义层级副本并把该科目重指向它 → `201 {subject, capability_layer}` |
+| `POST /knowledge-nodes` | 建考点（缺 `subject_id` → `400 missing_subject_id`；跨科目挂子 / 成环 → `400 parent_subject_mismatch` / `cyclic_parent`） |
+| `GET /knowledge-nodes/:id` | 取单个考点 |
+| `GET /subjects/:id/knowledge-nodes` | 某科目下扁平考点列表（分页） |
+| `GET /subjects/:id/knowledge-tree` | 某科目下**嵌套**考点树（AC-KM-03，不分页） |
+| `PATCH`/`PUT /knowledge-nodes/:id` | 更新/移动考点（`base_version` 必填；递归 CTE 防环） |
+| `DELETE /knowledge-nodes/:id` | 软删考点（`base_version` 必填） |
+| `POST /capability-layers` | 建层级模板（`layers` 必填，缺失 → `400 LAYERS_REQUIRED`） |
+| `GET /capability-layers` | 模板列表（分页） |
+| `GET /capability-layers/:id` | 取单个模板 |
+| `PATCH /capability-layers/:id` | 更新模板（`base_version` 必填；`customizable=false` 时改 `layers` → `400 CUSTOMIZABLE_LOCKED`） |
+| `DELETE /capability-layers/:id` | 软删模板（`base_version` 必填；**同样受 gate 拦截**，刻意加严） |
 | `POST /defect-tickets` | 建单（禁用语 → `400 {error:"forbidden_phrase"}`；缺归因 → `400 {error:"missing_error_layer_or_cause"}`；未归因草稿 → `201 DRAFT`；带归因 → `201 ANALYZED`） |
 | `POST /defect-tickets/:id/analyze` | DRAFT→ANALYZED 补齐归因（缺归因 → `400 missing_error_layer_or_cause`） |
 | `POST /defect-tickets/:id/action` | ANALYZED→ACTION_DONE |
@@ -200,8 +250,7 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 | 乐观锁 | 版本冲突 → `409` |
 
 > 契约收敛（详见 REVIEW-NOTES.md §4 附带修正）：`analyze` 规范方法为 `POST`（原骨架的 `PATCH` 保留为兼容别名），缺归因错误码统一为 `missing_error_layer_or_cause`（废弃自造的 `missing_analysis`），`POST /verifications` 为规范路径、嵌套路径为等价别名。
-> server 当前仍使用内存存储（第 4 步再切 PG 仓储）；已实现的 `server/repositories/` 是可直接接线的仓位层，规则层复用 `core/`。
-> 接 NestJS + PostgreSQL 时把第 4 步的接线做完（把 `server/index.mjs` 的数据访问换成 `server/repositories/`），规则层复用 `core/`。
+> 第 4 步已完成接线：`exam_profiles` / `subjects` / `knowledge_nodes` / `capability_layers` 四组端点已走 `server/repositories/` + 真 PG（`POST /exam-profiles` 不再是内存实现）；缺陷单 / 模考 / 复盘 / AI 生成仍是内存 Map，等 BE-03/04、BE-05/06、BE-08 重写。
 
 ---
 
@@ -214,7 +263,7 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 - ✅ **BE-01 第 1 步**：`core/validators.mjs` 17 个纯校验函数 + 15 个用例
 - ✅ **BE-01 第 2 步**：`server/db/pool.mjs` + `server/repositories/base.mjs`（withTransaction / 乐观锁工具 / SQLSTATE 映射 / buildUpdateSet），29 个 fake-pool 单测 + 4 条 PG smoke
 - ✅ **BE-01 第 3 步**：四表仓储（`exam_profiles` / `subjects` / `knowledge_nodes` / `capability_layers`）+ 28 条 PG 集成测试（含并发查重竞态），CI 加 `node-tests` job 并防「假绿」
-- ⏳ BE-01 第 4 步：切 `POST /exam-profiles` 到 PG 仓储，补 subjects / knowledge_nodes / capability_layers 端点
+- ✅ **BE-01 第 4 步**：路由层拆分为 `server/routes/`（四表端点全部接 PG、AC-KM-01 模板预置事务、AC-KM-02 层级副本事务、级联软删事务、`base_version` 强制）+ `core/templates.mjs` 模板数据 + 测试改造成 fake 层 22 条 / PG 集成层 9 条
 - ⏳ BE-03 / BE-04 → FE-09 / BE-08 → FE-11 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
 

@@ -64,11 +64,20 @@ before(async () => {
   // 单一事实来源：整份 schema.sql 一次性执行。
   // schema.sql 里没有 psql 元命令，且 node-postgres 在「无参数」时走简单查询协议，
   // 可一次提交多语句；末尾的 DO 块会自行打印/抛错 SCHEMA_VERIFY_OK|FAILED。
+  //
+  // BE-01 第 4 步（T7）：**用 withTransaction 包住**。
+  //   理由：多语句在简单协议下是逐条执行的，中途失败会在库里留下半个 schema
+  //   （例如 users 建了、exam_profiles 没建）。后续重跑时 CREATE ... IF NOT EXISTS
+  //   虽然幂等，但残留的旧结构会让「这到底是新建还是复用」不可判定，
+  //   调试成本远高于一次 BEGIN/COMMIT。失败则整笔回滚，库回到 before 之前的空态。
+  //   注意：PG 的 DDL 是事务性 的（CREATE TABLE/TYPE/INDEX/FUNCTION 均可回滚）。
   try {
-    await pool.query(SCHEMA_SQL);
+    await withTransaction(pool, async (client) => {
+      await client.query(SCHEMA_SQL);
+    });
   } catch (err) {
     // 明确报错终止，绝不让后续 test 在半个 schema 上跑出误导性结果
-    throw new Error(`before: 执行 schema.sql 失败 —— ${err.message}`);
+    throw new Error(`before: 执行 schema.sql 失败（已回滚）—— ${err.message}`);
   }
 
   // 已提交的基线数据（并发竞态用例需要别的连接能看到）
@@ -183,11 +192,13 @@ test('exam_profiles.update: 乐观锁生效 —— version 自增、旧 version 
     const updated = await examProfiles.update(
       client, created.id, { daily_minutes: 60 }, created.version,
     );
-    // version / updated_at 由 set_updated() 触发器维护，仓储层不手写
-    assert.equal(updated.version, 2);
+    // version / updated_at 由 set_updated() 触发器维护，仓储层不手写。
+    // 注意：inRollback 把 create 与 update 放在**同一事务**里，PG 的 now() 在事务内恒定，
+    //   所以 updated_at 必然等于 created_at —— 不能拿时间戳不等来证明 update 生效（那是断言错，不是实现错）。
+    //   真正能证明「写入了」的是 version 自增 + 字段变化；updated_at 只做非严格单调校验。
+    assert.equal(updated.version, created.version + 1);
     assert.equal(updated.daily_minutes, 60);
-    assert.notEqual(updated.updated_at, created.updated_at);
-
+    assert.ok(updated.updated_at >= created.updated_at, 'updated_at 不应早于 created_at');
     // 用过期基版号再写 -> 409，并交回服务端当前行
     await assert.rejects(
       () => examProfiles.update(client, created.id, { daily_minutes: 90 }, created.version),
@@ -427,20 +438,38 @@ test('knowledge_nodes.getTree: 返回嵌套根节点数组，children 按 create
 
     // 基点 subject 下已有 before 里的「集成测试科目」... 注意 seed.subjectId 是 subject 行，
     // 该 subject 下此前没有节点，所以这里应恰好 2 个根（另加种子前不存在其它节点）
-    const titles = tree.map((n) => n.title);
-    assert.deepEqual(titles, ['根A', '根B'], '根节点按 created_at ASC 稳定排序');
-    assert.equal(tree[0].children.length, 1);
-    assert.equal(tree[0].children[0].title, '子1');
-    assert.equal(tree[0].children[0].children[0].title, '孙1');
-    assert.equal(tree[0].children[0].children[0].children.length, 0);
-    assert.equal(tree[1].children.length, 0);
+    // 两个根节点在**同一事务**里创建，created_at 相同（PG 的 now() 在事务内恒定），
+    // 排序键退化为 id，而 id 是 gen_random_uuid() 随机 -> 具体先后不可预测。
+    // 因此断言「集合正确 + 排序键单调」，不假设顺序（BE-01 第 3 步 CI 修复 C）。
+    const titles = tree.map((n) => n.title).sort();
+    assert.deepEqual(titles, ['根A', '根B'], '两个根节点都在');
+    assert.equal(tree.length, 2);
+    for (let i = 1; i < tree.length; i += 1) {
+      const prev = tree[i - 1];
+      const cur = tree[i];
+      assert.ok(prev.created_at <= cur.created_at, '根节点按 created_at ASC 单调不降');
+      if (prev.created_at === cur.created_at) {
+        assert.ok(prev.id <= cur.id, 'created_at 相同时按 id 升序作为稳定 tie-break');
+      }
+    }
+
+    // 用 id 定位节点，而不是下标（下标顺序不可预测）
+    const rootsById = new Map(tree.map((n) => [n.id, n]));
+    const rootANode = rootsById.get(root1.id);
+    const rootBNode = rootsById.get(root2.id);
+    assert.ok(rootANode, '根A 应在结果里');
+    assert.ok(rootBNode, '根B 应在结果里');
+
+    assert.equal(rootANode.children.length, 1);
+    assert.equal(rootANode.children[0].title, '子1');
+    assert.equal(rootANode.children[0].children[0].title, '孙1');
+    assert.equal(rootANode.children[0].children[0].children.length, 0);
+    assert.equal(rootBNode.children.length, 0);
 
     // 节点保留原始字段（不是只有 title/children）
-    assert.equal(tree[0].id, root1.id);
-    assert.equal(tree[0].children[0].id, child1.id);
-    assert.equal(tree[0].children[0].children[0].id, grand.id);
-    assert.equal(tree[0].children[0].parent_id, root1.id);
-    assert.equal(root2.id, tree[1].id);
+    assert.equal(rootANode.children[0].id, child1.id);
+    assert.equal(rootANode.children[0].children[0].id, grand.id);
+    assert.equal(rootANode.children[0].parent_id, root1.id);
   });
 });
 
@@ -481,9 +510,55 @@ test('knowledge_nodes.update: 移动节点后按新父查重（撞新父下同�
     });
 
     // 把移到 parentB 下 -> 与新父下同名节点冲突
+    // （修复 D：原实现只在 patch 含 title 时查重，纯移动会漏检，assert 不到 rejection）
     await assert.rejects(
       () => knowledgeNodes.update(client, moved.id, { parent_id: parentB.id }, moved.version),
-      (err) => err.code === 'conflict' && err.body.field === 'title',
+      (err) => {
+        assert.equal(err.code, 'conflict');
+        assert.equal(err.body.field, 'title');
+        assert.equal(err.body.resolution, 'user_choice');
+        assert.equal(err.body.current.parent_id, parentB.id);
+        return true;
+      },
+    );
+
+    // 反向对照：移到「新父下无同名」的位置应正常成功（不能因为加了查重就把合法移动拦住）
+    const emptyParent = await knowledgeNodes.create(client, {
+      subject_id: seed.subjectId, title: '空父',
+    });
+    const moved2 = await knowledgeNodes.update(
+      client, moved.id, { parent_id: emptyParent.id }, moved.version,
+    );
+    assert.equal(moved2.parent_id, emptyParent.id);
+    assert.equal(moved2.version, moved.version + 1);
+  });
+});
+
+test('knowledge_nodes.update: 移动到另一个科目下 -> 400 parent_subject_mismatch', skipOpt, async () => {
+  await inRollback(pool, async (client) => {
+    // 造一个属于别的 profile 的 subject（同一 user，避免多造 users）
+    const otherProfile = await examProfiles.create(client, {
+      user_id: seed.userId, exam_type: 'civil_service', target_label: '另一个目标',
+      exam_date: '2027-07-01', daily_minutes: 30,
+    });
+    const otherSubject = await subjects.create(client, {
+      exam_profile_id: otherProfile.id, name: '另一个科目', kind: 'objective',
+    });
+
+    const node = await knowledgeNodes.create(client, {
+      subject_id: seed.subjectId, title: '不跨科节点',
+    });
+    const otherNode = await knowledgeNodes.create(client, {
+      subject_id: otherSubject.id, title: '异科目父',
+    });
+
+    await assert.rejects(
+      () => knowledgeNodes.update(client, node.id, { parent_id: otherNode.id }, node.version),
+      (err) => {
+        assert.equal(err.code, 'parent_subject_mismatch');
+        assert.equal(err.statusCode, 400);
+        return true;
+      },
     );
   });
 });

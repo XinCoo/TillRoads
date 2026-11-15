@@ -105,7 +105,7 @@ jobs:
   # 故仍不需要跑 psql 迁移脚本 —— 迁移本身已由 needs: schema 的 job 验证过。
   # -------------------------------------------------------------------------
   node-tests:
-    name: Node 24 · unit tests + PG integration (smoke + 四表仓储)
+    name: Node 24 · unit tests + PG integration (smoke + 四表仓储 + 路由层)
     needs: schema
     runs-on: ubuntu-24.04  # 与 schema job 一致, 固定 LTS 镜像
 
@@ -152,7 +152,7 @@ jobs:
       # RUN_PG_INTEGRATION=1 已使 skip 条件失效；若 PG 不可连，集成测试的
       # before() 会直接抛错让 job 变红。这里再做一道保险：显式断言
       # skipped=0，避免「全部被跳过也算绿」的假绿。
-      - name: Node unit tests + PG integration (smoke + 四表仓储)
+      - name: Node unit tests + PG integration (smoke + 四表仓储 + 路由层)
         run: |
           set -o pipefail
           npm test 2>&1 | tee /tmp/test-output.txt
