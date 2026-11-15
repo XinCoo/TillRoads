@@ -1,0 +1,87 @@
+name: Schema CI
+
+# ---------------------------------------------------------------------------
+# 用途: 在 GitHub Actions 的临时 PostgreSQL 15 服务容器里「真跑」schema。
+#   验证范围 = 建表 + 二次执行幂等 + down/up 可逆 + 末尾自检 DO 块通过。
+#   **不是**业务语义验证: 状态机 / 禁用语 / 三次验证 / 去重哈希等业务规则
+#   由仓库内 Node 规则层单测(core/*.test.mjs)覆盖, 本 workflow 不重复。
+#   CI 中无任何密钥; 下面的 PGUSER/PGPASSWORD 是本次容器的一次性占位凭据。
+# ---------------------------------------------------------------------------
+on:
+  push:
+    paths:
+      - 'schema.sql'
+      - 'migrations/**'
+      - '.github/workflows/schema-ci.yml'
+  pull_request:
+    paths:
+      - 'schema.sql'
+      - 'migrations/**'
+      - '.github/workflows/schema-ci.yml'
+
+jobs:
+  schema:
+    name: PG15 · up / idempotent / reversible
+    runs-on: ubuntu-latest
+
+    # 一次性占位凭据(仅用于本次服务容器); 非真实密钥, 不写入仓库 Secrets。
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGUSER: tillroad_ci
+      PGPASSWORD: tillroad_ci_pw
+      PGDATABASE: tillroad_ci
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_USER: tillroad_ci
+          POSTGRES_PASSWORD: tillroad_ci_pw
+          POSTGRES_DB: tillroad_ci
+          # 强制 UTF8: schema.sql 的 normalize_question_text() 用 convert_to(s,'UTF8')
+          # 且冒烟测试含中文, 若库编码非 UTF8 会误判。
+          POSTGRES_INITDB_ARGS: "--encoding=UTF8"
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U tillroad_ci -d tillroad_ci"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Ensure psql client is available
+        run: |
+          if ! command -v psql >/dev/null 2>&1; then
+            sudo apt-get update -qq
+            sudo apt-get install -y -qq postgresql-client
+          fi
+          psql --version
+
+      # 迁移脚本 migrations/0001_init_up.sql 内部是 `\ir ../schema.sql`
+      # (psql \ir 相对「脚本所在目录」解析 -> 仓库根 schema.sql), 故 -f 用仓库根相对路径。
+      - name: Up #1 — apply migration (must print SCHEMA_VERIFY_OK)
+        run: |
+          set -euo pipefail
+          psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql 2>&1 | tee /tmp/up1.log
+          grep -q 'SCHEMA_VERIFY_OK' /tmp/up1.log
+
+      - name: Up #2 — re-run the SAME script (二次执行幂等)
+        run: |
+          set -euo pipefail
+          psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql 2>&1 | tee /tmp/up2.log
+          grep -q 'SCHEMA_VERIFY_OK' /tmp/up2.log
+
+      # 可选但推荐: 顺序有依赖 —— 必须先 down 再 up, 不可反过来。
+      - name: Down — rollback (可下)
+        run: psql -v ON_ERROR_STOP=1 -f migrations/0001_init_down.sql
+
+      - name: Up #3 — re-apply after rollback (可上, down/up 可逆)
+        run: |
+          set -euo pipefail
+          psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql 2>&1 | tee /tmp/up3.log
+          grep -q 'SCHEMA_VERIFY_OK' /tmp/up3.log

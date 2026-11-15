@@ -1,0 +1,16 @@
+{
+  "name": "tillroad",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "题路 TillRoad · 核心闭环规则层与 API 骨架（Node 24 零第三方依赖，可移植到 Flutter/NestJS）",
+  "scripts": {
+    "test": "node --test core/*.test.mjs server/*.test.mjs",
+    "test:core": "node --test core/*.test.mjs",
+    "test:server": "node --test server/*.test.mjs",
+    "start": "node server/index.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
