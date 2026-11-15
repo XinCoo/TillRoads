@@ -208,7 +208,13 @@ export function match(method, seg, ctx) {
     return (async () => {
       const baseVersion = readBaseVersion(body);
       const patch = pickProfileFields(body, { partial: true });
-      return ok(await rep.update(pool, id, patch, baseVersion));
+
+      // 必须包事务：exam_profiles.update 在 patch 含 target_label 时会
+      // lockParentRow(users) 再查重。若不入事务，FOR UPDATE 的锁在语句
+      // 自动提交后立刻释放，查重与写入落在两个快照里，两个并发改名会
+      // 双双通过查重 -> 同一 user 下出现重复 target_label。
+      const row = await withTransaction(pool, (client) => rep.update(client, id, patch, baseVersion));
+      return ok(row);
     })();
   }
 

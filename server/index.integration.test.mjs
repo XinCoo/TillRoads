@@ -397,6 +397,41 @@ test('PATCH /exam-profiles：正常推进 version，旧版本再来 409，空 pa
   assert.equal(noop.data.version, up.data.version);
 });
 
+test('PATCH /exam-profiles：同一 user 下两个 profile 并发改成同一 target_label -> 恰好一个成功一个 409', skipOpt, async () => {
+  const mk = async (label) => {
+    const r = await req('POST', '/exam-profiles', {
+      user_id: seed.userId,
+      exam_type: 'postgrad',
+      target_label: label,
+      exam_date: '2027-12-01',
+      daily_minutes: 60,
+    });
+    assert.equal(r.status, 201, JSON.stringify(r.data));
+    return r.data.profile;
+  };
+
+  const a = await mk('并发目标A');
+  const b = await mk('并发目标B');
+
+  const [ra, rb] = await Promise.all([
+    req('PATCH', `/exam-profiles/${a.id}`, { version: a.version, target_label: '并发同名' }),
+    req('PATCH', `/exam-profiles/${b.id}`, { version: b.version, target_label: '并发同名' }),
+  ]);
+
+  const statuses = [ra.status, rb.status].sort((x, y) => x - y);
+  // 若查重与写入不在同一事务，两次 `users FOR UPDATE` 会各自在语句结束就
+  // 释放锁，双发都能读到「尚无同名」-> [200,200] 双写成功（脏数据）。
+  assert.deepEqual(
+    statuses,
+    [200, 409],
+    `期望一个 200 一个 409，实际 ${JSON.stringify([ra.data, rb.data])}`,
+  );
+
+  const conflict = ra.status === 409 ? ra : rb;
+  assert.equal(conflict.data.resolution, 'user_choice');
+  assert.equal(conflict.data.field, 'target_label');
+});
+
 test('capability_layers: customizable=false 的模板改 layers -> 400 CUSTOMIZABLE_LOCKED，删也拒', skipOpt, async () => {
   const mk = await req('POST', '/capability-layers', {
     name: '只读官方模板',

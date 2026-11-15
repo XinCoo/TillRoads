@@ -3,15 +3,16 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "题路 TillRoad · core/ 端无关零依赖规则层 + server/ API 与 PG 仓储骨架（server/ 运行时依赖 pg）",
+  "description": "题路 TillRoad · core/ 端无关零依赖规则层 + server/ API、PG 仓储与题目导入管线（server/ 运行时依赖 pg + pdfjs-dist）",
   "scripts": {
     "test": "node --test --test-concurrency=1 core/*.test.mjs server/*.test.mjs server/*/*.test.mjs",
     "test:core": "node --test core/*.test.mjs",
     "test:server": "node --test --test-concurrency=1 server/*.test.mjs server/*/*.test.mjs",
-    "test:integration": "node --test --test-concurrency=1 server/db/pg-smoke.integration.test.mjs server/repositories/repositories.integration.test.mjs server/index.integration.test.mjs",
+    "test:integration": "node --test --test-concurrency=1 server/db/pg-smoke.integration.test.mjs server/repositories/repositories.integration.test.mjs server/index.integration.test.mjs server/import/import.integration.test.mjs",
     "start": "node server/index.mjs"
   },
   "dependencies": {
+    "pdfjs-dist": "^6.5.438",
     "pg": "^8.23.1"
   },
   "engines": {

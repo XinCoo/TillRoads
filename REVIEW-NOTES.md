@@ -186,3 +186,85 @@ CI `node-tests` 首跑：`106 tests / 98 pass / 8 fail / 0 skipped`。逐类定�
 - 「先分清是哪个文件的失败」比直接看报错更重要：`logs` 里 `server/index.integration.test.mjs` 与 `server/repositories/*` 是两批改动，混在一起排查会误改已修好的代码。
 - 测试依赖机器核数 = flaky。共用同一数据库的集成测试必须显式串行。
 - 错误码分层：「5 位大写 SQLSTATE」是**基础设施层**，「小写/下划线业务码」是**应用层**，不能共用同一个映射分支。
+
+---
+
+## 13. BE-01 第 4 步收尾自查（三件）与补缺口
+
+按用户要求先做三件自查再动手。
+
+### 1. CI 状态
+
+- 代码已推送：`git ls-remote origin HEAD` = `c9a8704a27281f804bec1c36bef6a5b076698723`，与本地 HEAD 一致。
+- **CI 结论无法由本机代查**：GitHub API 返回 `403 rate limit exceeded`，网页 `fetch failed`。上轮的 40P01 修复已入库，但「是否全绿」需要用户确认。
+
+### 2. base_version 强制覆盖（grep `server/routes/`）
+
+| 端点 | 方法 | 强制 |
+|---|---|---|
+| `/exam-profiles/:id` | PATCH、DELETE | ✅ |
+| `/subjects/:id` | PATCH、DELETE | ✅ |
+| `/knowledge-nodes/:id` | PATCH、PUT、DELETE | ✅ |
+| `/capability-layers/:id` | PATCH、DELETE | ✅ |
+| `/defect-tickets/:id` 及其 analyze | PATCH | ❌ 刻意不强制（内存 Map，BE-03 统一） |
+
+### 3. 三处事务边界（逐一核实，非仅看代码存在）
+
+| 场景 | 位置 | 结论 |
+|---|---|---|
+| AC-KM-01 建 profile + 批量 subjects | `exam_profiles.mjs:106` | ✅ 整段在 `withTransaction` 内 |
+| AC-KM-02 customize-layers | `subjects.mjs:116` | ✅ 建副本 + 重指向同事务 |
+| 级联软删 | `exam_profiles.mjs:219` | ✅ 三步批量 UPDATE 同事务 |
+| **PATCH /exam-profiles/:id** | `exam_profiles.mjs:207` | ❌ **发现缺口**（详见下） |
+
+### 找出的真实缺口：PATCH /exam-profiles/:id 未包事务
+
+- 原实现 `return ok(await rep.update(pool, id, patch, baseVersion));` —— 直接传 `pool`。
+- 后果：`exam_profiles.update` 在 patch 含 `target_label` 时会先 `lockParentRow(users)` 再 `findLabelConflict`。脱离事务时 `FOR UPDATE` 的锁在**语句自动提交后立刻释放**，查重与写入落在两个快照里，两个并发改名会**双双通过查重**，同一 user 下出现重复 `target_label`。
+- 同库 `capability_layers.mjs:89` 的 PATCH 是包事务的，两处不一致说明这是遗漏而非设计。
+- 修：`withTransaction(pool, (client) => rep.update(client, id, patch, baseVersion))`。
+- 新增集成测试：`PATCH /exam-profiles：同一 user 下两个 profile 并发改成同一 target_label -> 恰好一个成功一个 409`（`Promise.all` 双发，断言状态码集合为 `[200,409]` 且 409 带 `resolution:'user_choice'`、`field:'target_label'`）。若不包事务，此测试会得到 `[200,200]`。
+- 验证：`npm test` → `tests 143 / pass 99 / fail 0 / skipped 44`（44 = 4 smoke + 29 仓储 + 11 路由集成）。
+
+---
+
+## 14. BE-02（题目导入管线 + questions/assets 仓储）
+
+完成状态：
+
+- **新增运行时依赖 `pdfjs-dist@6.5.438`**（`package.json` 已显式声明，`package-lock.json` 锁定，CI 用 `npm ci`）。这是继 `pg` 之后第二个运行时依赖。
+  - **必须用 `pdfjs-dist/legacy/build/pdf.mjs` 导入**：包的 `main` 指向 `build/pdf.mjs`、无 `exports` map、无 `type` 字段，裸 import 在 Node ESM 下会走现代构建（依赖 DOM），只有 legacy 构建在 Node 下可用（实测 61ms 导入成功）。
+  - `destroy()` 在 **loadingTask** 上，不在 document 上（`doc.destroy is not a function`）。代码里用 `try { await task.destroy(); } catch {}` 兜住。
+  - stderr 会打 3 条无害告警（`Cannot load "@napi-rs/canvas"`、`Cannot polyfill 'DOMMatrix'`、`Cannot polyfill 'Path2D'`）—— 只抽文本不渲染，可忽略，**不要把它们当成测试失败**。
+  - PDF 断行必须靠 `getTextContent()` 每个 item 上的 `hasEOL`，否则整页会被拼成一行，行首题号判断全部失效。
+- **新增 `server/import/`**（6 个模块 + 3 个测试）：`splitter.mjs`（纯函数零依赖，四类分隔符规则切题）、`extract.mjs`（mime 分派 + 体积/页数上限）、`xlsx.mjs`（手写最小 xlsx 读取，仅 `node:zlib`）、`dedupe.mjs`（按 `content_hash` 一次 `= ANY($1)` 查重）、`separate.mjs`（第四阶段：图片占位识别，MVP 不落库）、`splitter.test.mjs`（8 条）、`separate.test.mjs`（8 条）、`import.integration.test.mjs`（7 条）。
+- **新增 `server/repositories/questions.mjs` / `assets.mjs`**（与四表同形：首参 `client`、乐观锁、软删）。`questions` 在 `create` 前按 `content_hash` 查重（命中 → `409 DUPLICATE_QUESTION`，body 含 `current` 行）；`update` 只要 patch 触及 `stem`/`options`/`formula_text` 就重算 hash 并排除自身查重。`assets` 有 `version` 列但**刻意不走乐观锁**（归档只需 `deleted_at`）。
+- **新增 `server/routes/questions_import.mjs`**（`POST /questions/import` + 别名 `/questions-import`），已挂入 `ROUTE_MODULES` 末尾。整段导入包在 `withTransaction` 内；逐题 `create` 遇到 `DUPLICATE_QUESTION` 转为 `duplicates`（标 `raced:true`）继续，其它错误整批回滚。
+- **新增 `tests/fixtures/questions/`**：`sample-01-markdown.md`（12 题）、`sample-02-plain.txt`（10 题）、`sample-03-pdf-extracted.txt`（12 题，模拟 PDF 抽取后的碎换行）、`make-fixtures.mjs`（手写 PDF 1.4 生成器）+ `text-simple.pdf`（3 题，ASCII）、`scanned-no-text.pdf`（无文本层，用于 422 断言）。三份文本样本切题 `accuracy = 1`。
+
+### 三个设计取舍（都已在 README 写明）
+
+1. **同步导入 + 体积硬上限**（单文件 10MB / PDF 100 页 / 图片 20 张），超限 `413 PAYLOAD_TOO_LARGE`。`schema.sql` 无通用导入任务表，复用 `ai_generation_jobs` 语义不符，新增表又违反 schema 冻结 —— 故 `import_jobs` 放 V1 独立 schema issue。上限比开发文档的 50MB/200 页更严，因为同步请求没有任务表兜长任务。
+2. **只做规则切题，不上 AI**。分隔符四类：`1.` / `1、`、`（1）`、`一、`、`第1题`。已知局限：题干内部的编号列表会被误判成新题起点 —— 这条已写成 `splitter.test.mjs` 的基线测试（若将来修复，该测试会先红，强制更新 README 与测试）。
+3. **端点只收 JSON + base64，不实现 multipart**。Node 原生无 multipart 解析器，引 `busboy`/`formidable` 会打破「运行时依赖只保留 `pg` + `pdfjs-dist`」；导入是低频操作，base64 的 +33% 体积在 10MB 内可接受。multipart 与 `import_jobs` 一起放 V1。
+
+### 本轮修正的两个实测问题
+
+- **样本声明题数与实际不符**：首轮实测 sample-01 只切出 11 题（声明 12）、sample-02 只切出 9 题（声明 10）。原因是样本本身漏题，不是 splitter 缺陷 —— 已补齐样本。教训：**先跑探针核对真实题数，再把数字写死进断言**。
+- **手写 PDF 不能放中文**：base-14 Helvetica 只有 WinAnsi 字形集，没有中日韩字形。`text-simple.pdf` 改成 3 道纯 ASCII 题；中文场景一律用文本文件模拟「PDF 抽取结果」（即 `sample-03-pdf-extracted.txt`）。
+
+### 验证
+
+- `npm test` → `tests 166 / pass 115 / fail 0 / skipped 51`。
+  - 通过：`core/index` 14 + `core/templates` 4 + `core/validators` 15 + `server/index`(fake) 30 + `server/db/pool` 9 + `server/repositories/base` 20 + `_common` 7 + `server/import/splitter` 8 + `server/import/separate` 8 = 115。
+  - 跳过（本机无 PG）：smoke 4 + 仓储集成 29 + 路由集成 11 + 导入集成 7 = 51。
+- `node --check` 全部 12 个新模块通过。
+- `git status --short`：`M package.json` / `M package-lock.json` / `M README.md` / `M REVIEW-NOTES.md` / `M server/routes/index.mjs` / `M server/index.integration.test.mjs` / `M server/routes/exam_profiles.mjs` / `?? server/import/` / `?? server/repositories/questions.mjs` / `?? server/repositories/assets.mjs` / `?? server/routes/questions_import.mjs` / `?? tests/`。**未改 `schema.sql`、`core/index.mjs`、`core/validators.mjs`、`server/db/pool.mjs`、`server/repositories/base.mjs`、四表仓储。**
+
+### V1 待补
+
+- 图片 OCR（`422 UNSUPPORTED_IMAGE` 的替代实现）。
+- 题干图片的实际分离（`separate.mjs` 本轮只识别占位并计入 `stats.image_placeholders`，`asset_refs` 恒为空）。
+- `import_jobs` 异步任务表 + multipart 上传。
+- AI 切题（替换规则切题的已知局限）。
+

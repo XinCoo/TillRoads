@@ -38,8 +38,8 @@ TillRoads/
 │   └── templates.test.mjs     #   4 个用例
 ├── server/                    # HTTP API 骨架 + PG 仓储
 │   ├── index.mjs              #   启动 + pool/state 注入 + 交给 dispatch()（已瘦身至 ~150 行）
-│   ├── index.test.mjs         #   29 个 fake 层用例（路由分发 / 入参 / base_version / 409，不连 PG）
-│   ├── index.integration.test.mjs  # 10 条路由层 PG 集成（AC-KM-01/02 + 级联软删，仅 CI 跑）
+│   ├── index.test.mjs         #   30 个 fake 层用例（路由分发 / 入参 / base_version / 409，不连 PG）
+│   ├── index.integration.test.mjs  # 11 条路由层 PG 集成（AC-KM-01/02 + 级联软删，仅 CI 跑）
 │   ├── routes/
 │   │   ├── _http.mjs          #   ok/fail/assertValid/readBaseVersion/httpError/readBody/pagination
 │   │   ├── index.mjs          #   dispatch()：health 优先，再按 ROUTE_MODULES 顺序问各 match()
@@ -47,20 +47,35 @@ TillRoads/
 │   │   ├── subjects.mjs       #   科目 + AC-KM-02 层级副本事务
 │   │   ├── knowledge_nodes.mjs#   考点树（含扁平/嵌套两种 GET）
 │   │   ├── capability_layers.mjs # 层级模板 + customizable gate
-│   │   └── defect_tickets.mjs #   缺陷单/模考/复盘/AI（暂为内存实现，BE-03 重写）
+│   │   ├── defect_tickets.mjs #   缺陷单/模考/复盘/AI（暂为内存实现，BE-03 重写）
+│   │   └── questions_import.mjs   # POST /questions/import（BE-02 导入端点，JSON+base64）
+
 │   ├── db/
 │   │   ├── pool.mjs           #   createPool() + 7 个 OID 类型解析器（numeric→number 等）
 │   │   ├── pool.test.mjs      #   9 个用例（零 PG）
 │   │   └── pg-smoke.integration.test.mjs   # 4 条 smoke（仅 RUN_PG_INTEGRATION=1 跑）
-│   └── repositories/
-│       ├── base.mjs           #   withTransaction / buildUpdateSet / conflictError / mapPgError
-│       ├── base.test.mjs      #   20 个用例（fake client）
-│       ├── _common.mjs        #   四表共享原语（乐观锁 / 父行加锁 / 查重 / 软删）
-│       ├── exam_profiles.mjs  #   考试目标 CRUD
-│       ├── subjects.mjs       #   科目 CRUD
-│       ├── knowledge_nodes.mjs#   考点树 CRUD + getTree（递归 CTE 防环）
-│       ├── capability_layers.mjs # 能力层级模板 + customizable gate
-│       └── repositories.integration.test.mjs # 28 条 PG 集成测试
+│   ├── repositories/
+│   │   ├── base.mjs           #   withTransaction / buildUpdateSet / conflictError / mapPgError
+│   │   ├── base.test.mjs      #   20 个用例（fake client）
+│   │   ├── _common.mjs        #   共享原语（乐观锁 / 父行加锁 / 查重 / 软删 / jsonb 参数）
+│   │   ├── _common.test.mjs   #   7 个用例（JSONB_COLUMNS / toJsonbParam）
+│   │   ├── exam_profiles.mjs  #   考试目标 CRUD
+│   │   ├── subjects.mjs       #   科目 CRUD
+│   │   ├── knowledge_nodes.mjs#   考点树 CRUD + getTree（递归 CTE 防环）
+│   │   ├── capability_layers.mjs # 能力层级模板 + customizable gate
+│   │   ├── questions.mjs      #   题库 CRUD + content_hash 查重（BE-02）
+│   │   ├── assets.mjs         #   多态资产附件（owner_type/owner_id，不走乐观锁）
+│   │   └── repositories.integration.test.mjs # 29 条 PG 集成测试
+│   └── import/                # BE-02 导入管线（抽取→切题→去重→入库）
+│       ├── splitter.mjs       #   规则切题（四类分隔符，纯函数零依赖）
+│       ├── splitter.test.mjs  #   8 个用例（三份样本 + PDF 端到端）
+│       ├── extract.mjs        #   mime 分派 + 体积/页数上限（413/415/422）
+│       ├── xlsx.mjs           #   手写最小 xlsx 读取（只读首个 sheet）
+│       ├── dedupe.mjs         #   按 content_hash 查重
+│       ├── separate.mjs       #   第四阶段：图片占位识别（MVP 不落库）
+│       ├── separate.test.mjs  #   8 个用例
+│       └── import.integration.test.mjs      # 7 条导入链路集成（仅 CI 跑）
+├── tests/fixtures/questions/  # 切题样本（3 份文本 + 2 个 PDF + 生成脚本）
 ├── migrations/                # PG 迁移入口（psql 的 \ir ../schema.sql）
 ├── schema.sql                 # 数据库单一事实来源
 ├── .github/workflows/schema-ci.yml  # schema 幂等/可逆 + Node 单测 + PG 集成
@@ -75,10 +90,10 @@ TillRoads/
 
 ## 3. 快速开始
 
-环境要求：**Node.js ≥ 20**（本机实测 v24.19.0）。唯一运行时依赖为 `pg`（BE-01 第 2 步引入），需先 `npm install` / `npm ci`。
+环境要求：**Node.js ≥ 20**（本机实测 v24.19.0）。运行时依赖两个：`pg`（BE-01 第 2 步引入，PG 访问）与 `pdfjs-dist`（BE-02 引入，文字型 PDF 抽文本），需先 `npm install` / `npm ci`。
 
 ```bash
-npm ci            # 按 package-lock.json 安装（含 pg@8.23.x）
+npm ci            # 按 package-lock.json 安装（含 pg@8.23.x + pdfjs-dist@6.5.x）
 
 # 跑全部单测（core 规则层 + server 骨架 + 仓储工具层）
 npm test
@@ -86,7 +101,7 @@ npm test
 # 分别只跑核心规则层 / API 骨架单测 / 集成测试（后者需 PG）
 npm run test:core
 npm run test:server
-npm run test:integration   # pg-smoke + 四表仓储集成（需 RUN_PG_INTEGRATION=1）
+npm run test:integration   # pg-smoke + 四表仓储 + 路由层 + 导入链路集成（需 RUN_PG_INTEGRATION=1）
 
 # 启动 HTTP API（默认 http://127.0.0.1:3000，可用 PORT 覆盖）
 npm start
@@ -99,15 +114,15 @@ psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql   # 打印 SCHEMA_VERIFY_
 psql -v ON_ERROR_STOP=1 -f migrations/0001_init_down.sql # 回滚
 ```
 
-集成测试（四表仓储 + 路由层 + PG smoke）需要真实 PG，默认跳过：
+集成测试（四表仓储 + 路由层 + 导入链路 + PG smoke）需要真实 PG，默认跳过：
 
 ```bash
 # 集成测试的 before() 会自行执行整份 schema.sql，无需先手动迁移
 RUN_PG_INTEGRATION=1 npm test
 ```
 
-> **集成测试必须串行跑**：`npm test` 已内置 `--test-concurrency=1`。
-> 三个 PG 集成测试文件共用同一个数据库（`tillroad_ci`），并行执行时彼此会触发
+> **集成测试必须串行跑**：`npm test` 与 `test:integration` 已内置 `--test-concurrency=1`。
+> 四个 PG 集成测试文件共用同一个数据库（`tillroad_ci`），并行执行时彼此会触发
 > **死锁**（`40P01 deadlock_detected`）—— 仓储层的并发竞态用例会持锁 200ms，
 > 与路由层的建单抢同一行。这是 BE-01 第 4 步 CI 实际踩过的坑，不要把这层保护去掉。
 > 单测（core/ 与 fake 层）不受影响，仍可 `npm run test:core` 并行跑。
@@ -216,6 +231,8 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 { "error": "conflict", "field": "name", "current": {...}, "incoming": {"name":"x"}, "resolution": "user_choice" }
 ```
 
+> 四张 PG 表的**所有写操作**（`POST` / `PATCH` / `DELETE`）都包在 `withTransaction` 里。`PATCH /exam-profiles/:id` 也不例外：它的 patch 一旦含 `target_label`，仓储层要先 `lockParentRow(users)` 再加查重，不包事务的话 `FOR UPDATE` 会在语句自动提交后立刻释放，两个并发改名会双双通过查重。查重 + 写入必须同一快照。
+
 > 缺陷单等内存端点本轮**未**强制 `base_version`（保持原行为）；强制范围仅限已接 PG 的四张表，BE-03 重写缺陷单时一并统一。
 
 ## 5. HTTP API（server/routes/）
@@ -245,6 +262,8 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 | `GET /capability-layers/:id` | 取单个模板 |
 | `PATCH /capability-layers/:id` | 更新模板（`base_version` 必填；`customizable=false` 时改 `layers` → `400 CUSTOMIZABLE_LOCKED`） |
 | `DELETE /capability-layers/:id` | 软删模板（`base_version` 必填；**同样受 gate 拦截**，刻意加严） |
+| `POST /questions/import` | **BE-02** 题库导入（JSON + base64；四阶段：抽取→切题→去重→入库）→ `200 {imported, duplicates, errors, stats}` |
+| `POST /questions-import` | 上一行的路径别名 |
 | `POST /defect-tickets` | 建单（禁用语 → `400 {error:"forbidden_phrase"}`；缺归因 → `400 {error:"missing_error_layer_or_cause"}`；未归因草稿 → `201 DRAFT`；带归因 → `201 ANALYZED`） |
 | `POST /defect-tickets/:id/analyze` | DRAFT→ANALYZED 补齐归因（缺归因 → `400 missing_error_layer_or_cause`） |
 | `POST /defect-tickets/:id/action` | ANALYZED→ACTION_DONE |
@@ -254,10 +273,64 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 | `GET /review-cycles?type=weekly` | 周期复盘 |
 | `POST /ai/questions:generate` | BYOK 生成题（count 1–20 校验） |
 | 乐观锁 | 版本冲突 → `409` |
-
 > 契约收敛（详见 REVIEW-NOTES.md §4 附带修正）：`analyze` 规范方法为 `POST`（原骨架的 `PATCH` 保留为兼容别名），缺归因错误码统一为 `missing_error_layer_or_cause`（废弃自造的 `missing_analysis`），`POST /verifications` 为规范路径、嵌套路径为等价别名。
 > 第 4 步已完成接线：`exam_profiles` / `subjects` / `knowledge_nodes` / `capability_layers` 四组端点已走 `server/repositories/` + 真 PG（`POST /exam-profiles` 不再是内存实现）；缺陷单 / 模考 / 复盘 / AI 生成仍是内存 Map，等 BE-03/04、BE-05/06、BE-08 重写。
 
+### 题目导入（BE-02：`POST /questions/import`）
+
+管线四阶段：`extractText`（按 mime 分派）→ `splitQuestions`（规则切题）→ `dedupe`（按 `content_hash`）→ `separateAssets`（图片占位识别，MVP 只计数不落库）→ 逐题入库，**整段包在 `withTransaction` 内**，任一步失败整批回滚。
+
+请求体（JSON，只支持 base64 —— 见下方说明）：
+
+```json
+{
+  "filename": "exam.md",
+  "mime": "text/markdown",
+  "content_base64": "IyDnq6DliI3popguLi4=",
+  "subject_id": "可选 uuid（题目挂载的科目）",
+  "knowledge_node_id": "可选 uuid",
+  "source": "import",
+  "default_type": "choice"
+}
+```
+
+响应 `200`：
+
+```json
+{
+  "imported": 12,
+  "duplicates": [{ "content_hash": "…", "existing_id": "…", "stem": "…" }],
+  "errors": [],
+  "stats": { "kind": "markdown", "mime": "text/markdown", "total": 12, "preamble_lines": 3, "bytes": 2702, "image_placeholders": 0 }
+}
+```
+
+| 支持格式 | mime | 说明 |
+|---|---|---|
+| Markdown | `text/markdown` | 直接按 UTF-8 读 |
+| 纯文本 | `text/plain` | 同上 |
+| CSV | `text/csv` | 同上（不解析列语义，靠行内题号切题） |
+| 文字型 PDF | `application/pdf` | `pdfjs-dist` 抽文本；**扫描版无文本层 → `422 UNSUPPORTED_PDF`** |
+| Excel | `application/vnd.openxmlformats-officedocument.spreadsheetml.sheet` | 手写最小读取，**只读第一张 sheet** 的纯文本，不做复杂版式 |
+| 图片 | `image/*` | MVP 不支持 OCR → `422 UNSUPPORTED_IMAGE`（V1 补） |
+
+**体积上限（MVP 收紧，比开发文档的 50MB/200 页更严）**：单文件 ≤ **10MB**、文字型 PDF ≤ **100 页**、图片 ≤ 20 张。超限 → `413 PAYLOAD_TOO_LARGE`，`body` 提示「请拆分后重试」。收紧理由：同步导入没有任务表可承载长任务，超过这个量级客户端等待与超时风险不可控。
+
+**为什么只有 base64 JSON、没有 multipart**：Node 原生无 multipart 解析器，引 `busboy`/`formidable` 会打破「运行时依赖只保留 `pg` + `pdfjs-dist`」这条线；导入是低频操作，base64 的 +33% 体积在 10MB 上限内可接受。multipart 与 `import_jobs` 异步任务表一起放 V1。
+
+**切题规则（`server/import/splitter.mjs`，纯函数零依赖）**：只认四类行首编号 —— `1.` / `1、`、`（1）`、`一、`、`第1题`。题干内部自带的编号列表会被误判成新题起点（已知局限，样本集 `tests/fixtures/questions/` 与 `splitter.test.mjs` 把这个基线写成了测试），V1 上 AI 切题解决。
+
+| 错误码 | 状态码 | 含义 |
+|---|---|---|
+| `PAYLOAD_TOO_LARGE` | 413 | 超过 10MB / 100 页 |
+| `UNSUPPORTED_PDF` | 422 | 扫描版 PDF（无文本层）或 PDF 损坏 |
+| `UNSUPPORTED_IMAGE` | 422 | 图片（OCR 未实现） |
+| `UNSUPPORTED_XLSX` | 422 | xlsx 解析失败 |
+| `UNSUPPORTED_MEDIA` | 415 | 不支持的 mime |
+| `EMPTY_CONTENT` | 400 | 空文件，或抽到文字但切不出任何题 |
+| `MISSING_FILENAME` / `MISSING_CONTENT` / `INVALID_BASE64` | 400 | 请求体缺字段或 base64 非法 |
+
+**图片占位**：题干/选项里的 `![alt](asset:...)`、`data:` 内联图、`http(s)://` 外链会被识别并计入 `stats.image_placeholders`，但 **MVP 不下载、不存储、不写 `assets` 行**（入库后 `questions.asset_refs` 仍为 `null`）。真正的图片分离放 V1，与对象存储、OCR 一起做。
 ---
 
 ## 6. 当前里程碑与后续
@@ -269,7 +342,8 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 - ✅ **BE-01 第 1 步**：`core/validators.mjs` 17 个纯校验函数 + 15 个用例
 - ✅ **BE-01 第 2 步**：`server/db/pool.mjs` + `server/repositories/base.mjs`（withTransaction / 乐观锁工具 / SQLSTATE 映射 / buildUpdateSet），29 个 fake-pool 单测 + 4 条 PG smoke
 - ✅ **BE-01 第 3 步**：四表仓储（`exam_profiles` / `subjects` / `knowledge_nodes` / `capability_layers`）+ 28 条 PG 集成测试（含并发查重竞态），CI 加 `node-tests` job 并防「假绿」
-- ✅ **BE-01 第 4 步**：路由层拆分为 `server/routes/`（四表端点全部接 PG、AC-KM-01 模板预置事务、AC-KM-02 层级副本事务、级联软删事务、`base_version` 强制）+ `core/templates.mjs` 模板数据 + 测试改造成 fake 层 22 条 / PG 集成层 9 条
+- ✅ **BE-01 第 4 步**：路由层拆分为 `server/routes/`（四表端点全部接 PG、AC-KM-01 模板预置事务、AC-KM-02 层级副本事务、级联软删事务、`base_version` 强制）+ `core/templates.mjs` 模板数据 + 测试改造成 fake 层 30 条 / PG 集成层 11 条
+- ✅ **BE-02**：题目导入管线（`server/import/` 四阶段 + `POST /questions/import`）+ `questions`/`assets` 仓储（`content_hash` 查重）+ 3 份切题样本与 `pdfjs-dist` 依赖（8 条切题单测 + 7 条导入集成）
 - ⏳ BE-03 / BE-04 → FE-09 / BE-08 → FE-11 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
 

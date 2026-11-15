@@ -23,6 +23,7 @@ import * as knowledgeNodes from './knowledge_nodes.mjs';
 import * as subjects from './subjects.mjs';
 import * as capabilityLayers from './capability_layers.mjs';
 import * as defectTickets from './defect_tickets.mjs';
+import * as questionsImport from './questions_import.mjs';
 
 /**
  * 挂载顺序即匹配优先级。长路径模块在前，短路径在后。
@@ -34,6 +35,7 @@ export const ROUTE_MODULES = Object.freeze([
   { name: 'subjects', match: subjects.match },
   { name: 'capability_layers', match: capabilityLayers.match },
   { name: 'defect_tickets', match: defectTickets.match },
+  { name: 'questions_import', match: questionsImport.match },
 ]);
 
 /**
