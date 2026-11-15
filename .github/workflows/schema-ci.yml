@@ -100,9 +100,12 @@ jobs:
   # services 是 job 级作用域(不能跨 job 共享同一容器), 这里复用同一份
   # postgres:15 定义而非另写镜像; smoke 只需一个可连的 PG(SELECT 1 / 类型解析 /
   # 临时表事务), 不需要已迁移的业务库。
+  # BE-01 第 3 步: 新增的 repositories.integration.test.mjs 会在 before() 里
+  # 直接用 pg 执行整个 schema.sql(单一事实来源, 无 psql 元命令),
+  # 故仍不需要跑 psql 迁移脚本 —— 迁移本身已由 needs: schema 的 job 验证过。
   # -------------------------------------------------------------------------
   node-tests:
-    name: Node 24 · unit tests + PG smoke
+    name: Node 24 · unit tests + PG integration (smoke + 四表仓储)
     needs: schema
     runs-on: ubuntu-24.04  # 与 schema job 一致, 固定 LTS 镜像
 
@@ -146,5 +149,15 @@ jobs:
 
       # services.options 的 health-cmd 已让 GitHub 等容器 healthy 才进入 steps,
       # 故无需额外的 sleep/pg_isready 等待步骤(也避免对 psql 客户端的隐式依赖)。
-      - name: Node unit tests + PG smoke integration test
-        run: npm test
+      # RUN_PG_INTEGRATION=1 已使 skip 条件失效；若 PG 不可连，集成测试的
+      # before() 会直接抛错让 job 变红。这里再做一道保险：显式断言
+      # skipped=0，避免「全部被跳过也算绿」的假绿。
+      - name: Node unit tests + PG integration (smoke + 四表仓储)
+        run: |
+          set -o pipefail
+          npm test 2>&1 | tee /tmp/test-output.txt
+          # 用 ASCII 串 'skipped 0' 判定，避免解析带 emoji 的报告行在 locale 下不稳定
+          if ! grep -q 'skipped 0' /tmp/test-output.txt; then
+            echo "::error::存在被跳过的测试，RUN_PG_INTEGRATION 或 PG 连接有问题"
+            exit 1
+          fi

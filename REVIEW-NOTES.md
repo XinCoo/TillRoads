@@ -111,6 +111,13 @@
 ## 8. BE-01 已知缺口（随实现记录，非文档修订）
 
 - **四张表无业务唯一约束**：`exam_profiles` / `subjects` / `knowledge_nodes` / `capability_layers` 在 `schema.sql` 上只有主键 + 非唯一索引，没有「同 exam_profile 下 subject.name 不重复」「同 parent 下 knowledge_node.title 不重复」等业务唯一约束。`schema.sql` 已冻结（BE-00 已归档，CI 绿），**MVP 阶段不夹带改 schema 加 UNIQUE**；改由**仓储层在同一事务内显式查重**（`SELECT … FOR UPDATE` / 查重）实现，并以集成测试覆盖并发竞态窗口。**见 BE-01 第 3 步**。若将来要 DB 级唯一，须独立 schema issue + 独立 PR。
+- **闭环（BE-01 第 3 步）**：已按上述方案在 `server/repositories/` 实现同事务查重，不再依赖 DB 唯一约束：
+  - `exam_profiles`：同 `user_id` 下 `target_label`，创建/改名时先 `lockParentRow(client,'users',userId)` 锁父行再查重；空标签不查重。
+  - `subjects`：同 `exam_profile_id` 下 `name`，先锁 `exam_profiles` 父行；只在 patch 含 `name` 时才加锁+查重。
+  - `knowledge_nodes`：同 `subject_id` + 同 `parent_id` 下 `title`，用 `parent_id IS NOT DISTINCT FROM $2`（NULL 安全）；移动节点时按「生效后的 `parent_id`」查重。
+  - `capability_layers`：不查重（共享模板，名称允许重名），只走 `customizable` gate。
+  - 冲突统一 `409 { error:'conflict', field, current, incoming, resolution:'user_choice' }`（与乐观锁的 `client_merge` 区分）。
+  - **竞态窗口由集成测试覆盖**：`repositories.integration.test.mjs` 有 2 条并发用例（两个真提交的 client，第二条断言在第一条提交前未完成，证明 `FOR UPDATE` 真的阻塞）；这些用例在 CI 的 PG15 容器里跑，本机跳过。
 - 本轮（BE-01 第 1 步）仅新增 `core/validators.mjs`（V1–V12 纯校验函数）与 `core/validators.test.mjs`，未引入 `pg`、未改 `package.json`、未动 `server/` 与冻结的 `schema.sql`；`npm test` 仅验证纯函数逻辑，本机无 PostgreSQL，未实跑 PG。
 
 ---

@@ -29,16 +29,32 @@
 
 ```
 TillRoads/
-├── core/                      # 端无关核心规则层（零第三方依赖，纯 JS）
+├── core/                      # 端无关核心规则层（零第三方依赖，纯 JS；不 import pg）
 │   ├── index.mjs              #   状态机 / 禁用语 / 三次验证 / 去重哈希 / 优先级 / BYOK 校验
-│   └── index.test.mjs         #   14 个 node:test 用例
-├── server/                    # HTTP API 骨架（Node 原生 http，内存存储，可替换为 NestJS+PG）
-│   ├── index.mjs              #   路由 + 服务（import core/）
-│   └── index.test.mjs         #   集成测试
-├── migrations/                # PG 迁移入口
+│   ├── index.test.mjs         #   14 个 node:test 用例
+│   ├── validators.mjs         #   BE-01 输入校验 V1–V12（扁平 result 形状，17 个导出）
+│   └── validators.test.mjs    #   15 个用例
+├── server/                    # HTTP API 骨架 + PG 仓储
+│   ├── index.mjs              #   路由 + 服务（内存存储，当前仍走内存；第 4 步切 PG）
+│   ├── index.test.mjs         #   16 个集成测试
+│   ├── db/
+│   │   ├── pool.mjs           #   createPool() + 7 个 OID 类型解析器（numeric→number 等）
+│   │   ├── pool.test.mjs      #   9 个用例（零 PG）
+│   │   └── pg-smoke.integration.test.mjs   # 4 条 smoke（仅 RUN_PG_INTEGRATION=1 跑）
+│   └── repositories/
+│       ├── base.mjs           #   withTransaction / buildUpdateSet / conflictError / mapPgError
+│       ├── base.test.mjs      #   20 个用例（fake client）
+│       ├── _common.mjs        #   四表共享原语（乐观锁 / 父行加锁 / 查重 / 软删）
+│       ├── exam_profiles.mjs  #   考试目标 CRUD
+│       ├── subjects.mjs       #   科目 CRUD
+│       ├── knowledge_nodes.mjs#   考点树 CRUD + getTree（递归 CTE 防环）
+│       ├── capability_layers.mjs # 能力层级模板 + customizable gate
+│       └── repositories.integration.test.mjs # 28 条 PG 集成测试
+├── migrations/                # PG 迁移入口（psql 的 \ir ../schema.sql）
 ├── schema.sql                 # 数据库单一事实来源
+├── .github/workflows/schema-ci.yml  # schema 幂等/可逆 + Node 单测 + PG 集成
 ├── *.md                       # 设计 / 决策 / 评审文档
-├── package.json               # scripts: test / test:core / test:server / start
+├── package.json               # scripts: test / test:core / test:server / test:integration / start
 └── REVIEW-NOTES.md / README.md
 ```
 
@@ -48,26 +64,40 @@ TillRoads/
 
 ## 3. 快速开始
 
-环境要求：**Node.js ≥ 20**（本机实测 v24.19.0）。零第三方依赖，无需 `npm install`。
+环境要求：**Node.js ≥ 20**（本机实测 v24.19.0）。唯一运行时依赖为 `pg`（BE-01 第 2 步引入），需先 `npm install` / `npm ci`。
 
 ```bash
-# 跑全部测试（core 规则层 + server 集成）
+npm ci            # 按 package-lock.json 安装（含 pg@8.23.x）
+
+# 跑全部单测（core 规则层 + server 骨架 + 仓储工具层）
 npm test
 
-# 只跑核心规则层 / 只跑 API 集成
+# 分别只跑核心规则层 / API 骨架单测 / 集成测试（后者需 PG）
 npm run test:core
 npm run test:server
+npm run test:integration   # pg-smoke + 四表仓储集成（需 RUN_PG_INTEGRATION=1）
 
 # 启动 HTTP API（默认 http://127.0.0.1:3000，可用 PORT 覆盖）
 npm start
 ```
 
-数据库（需 PG15+，本机未安装，故 CI 门禁需在具备 PG 的环境补跑）：
+数据库（需 PG15+，本机未安装，故由 GitHub Actions 的 PG15 service 容器真跑）：
 
 ```bash
 psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql   # 打印 SCHEMA_VERIFY_OK 即通过
 psql -v ON_ERROR_STOP=1 -f migrations/0001_init_down.sql # 回滚
 ```
+
+集成测试（四表仓储 + PG smoke）需要真实 PG，默认跳过：
+
+```bash
+# 先迁移，再跑集成（CI 由 node-tests job 自动完成这两步）
+psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql
+RUN_PG_INTEGRATION=1 npm test
+```
+
+> 集成测试的 `before()` 会自行执行整份 `schema.sql`（单一事实来源，无 psql 元命令），
+> 因此 CI 中无需额外跑迁移步骤；本地若已迁移也是幂等的，不冲突。
 
 ---
 
@@ -111,7 +141,47 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 | `computePriority({frequency,loss,closability,targetContribution})` | 优先级 → P0 / P1 / P2 |
 | `validateAIGenerateRequest(payload)` | BYOK 生成题校验：count 1–20、provider 锁死 `deepseek`/`openai_compatible`、SSRF 拦截 |
 
+### 输入校验（core/validators.mjs，BE-01 第 1 步）
+
+统一返回扁平形状 `{ok:true}` 或 `{ok:false, code, message, ...extra}`（**不抛错**，与 `core/index.mjs` 的 `assertXxx` 明确区分，供 HTTP 层直接映射 400）：
+
+| 函数 | 校验内容 / 失败码 |
+|---|---|
+| `validateExamType(v)` | `exam_type` 枚举；K12 类 → `EXAM_TYPE_K12_FORBIDDEN` |
+| `validateSubjectKind(v)` | `objective` / `subjective` / `essay` |
+| `validateFreqTag(v)` | `high` / `mid` / `low` |
+| `validateProfileStatus(v)` | `active` / `archived` |
+| `validateTargetScore(n)` | `0 … 9999.99`（numeric(6,2)） |
+| `validateDailyMinutes(n)` | 非负整数，`null/undefined` 放行（可空列） |
+| `validateWeightToTarget(n)` | `0 … 9.999`（numeric(4,3)） |
+| `validateExamDate(v)` | 真实日历日（拒 `2026-02-30`），`YYYY-MM-DD` |
+| `validateLayers(arr, opts)` | `[{order,key,label,desc}]` 结构与重复检测；`opts.mode='create'` 时 `null` → `LAYERS_REQUIRED` |
+| `validateCustomizableGate(current, patch)` | AC-KM-02 gate，失败关闭；锁 `layers`/`customizable` → `CUSTOMIZABLE_LOCKED` |
+| `validateExamProfileRequired(input)` | AC-EXAM-01 四项必填，一次收集 `fields[]` → `MISSING_REQUIRED_FIELD` |
+| `validateBaseVersion(v)` | 乐观锁基版号：正整数 |
+| `firstInvalid(...results)` | 串起多个校验，返回第一个失败（全通过返回 `{ok:true}`） |
 ---
+
+## 4.5 PG 仓储层（server/repositories/，BE-01 第 3 步）
+
+四张表各一个模块（不用工厂函数：每表的可写列白名单是独立常量，静态审计时更好 grep）。
+**首参一律是同一个事务内的 `client`**，写操作必须包在 `withTransaction` 里。
+
+| 模块 | 方法 | 说明 |
+|---|---|---|
+| `exam_profiles` | `create / getById / listByUser / update / archive` | 查重：同 `user_id` 下 `target_label`（锁 `users` 行） |
+| `subjects` | `create / getById / listByProfile / update / archive` | 查重：同 `exam_profile_id` 下 `name`（锁父目标行） |
+| `knowledge_nodes` | `create / getById / listBySubject / getTree / update / archive` | 查重：同 `subject_id` + 同 `parent_id` 下 `title`；`getTree` 返回嵌套根节点数组，递归 CTE 防环 |
+| `capability_layers` | `create / getById / list / findByName / update / archive` | 不查重，走 `customizable` gate（失败关闭） |
+
+铁律（与 `schema.sql` 对齐，违反会在集成测试里报错）：
+
+- `SET` 永不出现 `id / created_at / updated_at / version / deleted_at`（后两者由 `set_updated()` 触发器维护）。
+- `UPDATE ... WHERE` 恒含 `version = $base_version AND deleted_at IS NULL`；0 行 → 取当前行（**含软删**）抛 `409`。
+- 空 patch 直接返回当前行，**不发 UPDATE**（避免 `version` 无意义 +1 后产生幽灵 409）。
+- 查重冲突统一 `409 { error:'conflict', field, current, incoming, resolution:'user_choice' }`，与乐观锁的 `resolution:'client_merge'` 明确区分。
+- 所有 SQL 值均参数化；列名只来自各模块的硬编码白名单（`buildUpdateSet` 三道闸校验）。
+- `core/` 一行 `pg` 都不 import；`capability_layers.mjs` 反向 import `core/validators.mjs` 的纯函数是唯一例外。
 
 ## 5. HTTP API（server/index.mjs）
 
@@ -130,8 +200,8 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 | 乐观锁 | 版本冲突 → `409` |
 
 > 契约收敛（详见 REVIEW-NOTES.md §4 附带修正）：`analyze` 规范方法为 `POST`（原骨架的 `PATCH` 保留为兼容别名），缺归因错误码统一为 `missing_error_layer_or_cause`（废弃自造的 `missing_analysis`），`POST /verifications` 为规范路径、嵌套路径为等价别名。
->
-> server 使用内存存储，仅作契约骨架；接 NestJS + PostgreSQL 时把数据访问层替换为真实仓储即可，规则层复用 `core/`。
+> server 当前仍使用内存存储（第 4 步再切 PG 仓储）；已实现的 `server/repositories/` 是可直接接线的仓位层，规则层复用 `core/`。
+> 接 NestJS + PostgreSQL 时把第 4 步的接线做完（把 `server/index.mjs` 的数据访问换成 `server/repositories/`），规则层复用 `core/`。
 
 ---
 
@@ -140,7 +210,45 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 - ✅ 文档评审 + 4 项 P0 / 4 项 P1 修订（详见 [REVIEW-NOTES.md](<REVIEW-NOTES.md>)）
 - ✅ `core/` 端无关核心规则层 + 14 个单元测试
 - ✅ `server/` HTTP API 骨架 + 集成测试
-- ⏳ BE-00：在 PG15+ 环境实跑迁移自检（本机无 psql，仅静态核验）
-- ⏳ BE-01 → BE-03 / BE-04 → FE-09 / BE-08 → FE-11 → 补 Flutter/PG 工具链后移植 Dart / 接入 NestJS
-
+- ✅ **BE-00 归档**：Schema CI 在 GitHub Actions 的 PG15 service 容器上真跑通过（Up#1 幂等 / Up#2 / Down / Up#3）
+- ✅ **BE-01 第 1 步**：`core/validators.mjs` 17 个纯校验函数 + 15 个用例
+- ✅ **BE-01 第 2 步**：`server/db/pool.mjs` + `server/repositories/base.mjs`（withTransaction / 乐观锁工具 / SQLSTATE 映射 / buildUpdateSet），29 个 fake-pool 单测 + 4 条 PG smoke
+- ✅ **BE-01 第 3 步**：四表仓储（`exam_profiles` / `subjects` / `knowledge_nodes` / `capability_layers`）+ 28 条 PG 集成测试（含并发查重竞态），CI 加 `node-tests` job 并防「假绿」
+- ⏳ BE-01 第 4 步：切 `POST /exam-profiles` 到 PG 仓储，补 subjects / knowledge_nodes / capability_layers 端点
+- ⏳ BE-03 / BE-04 → FE-09 / BE-08 → FE-11 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
+
+---
+
+## 7. 一键提交（`git acp`）
+
+仓库不用 husky/lefthook，也不提供 `scripts/acp.sh`——alias 只影响本机、不占仓库、CI 也不依赖它（CI 直接 `npm ci && npm test`）。
+
+**Git Bash** 执行一次：
+
+```bash
+git config --global alias.acp '!f() { git add -A && git commit -m "${1:-wip}" && git push; }; f'
+```
+
+**PowerShell** 用这条（Windows 的原生参数传递会吃掉裸 `"`，必须写成 `\"`；否则写进配置的是 `-m ${1:-wip}`，引号丢失后 `git acp "四表仓储 + 集成测试"` 会报 `pathspec '四表仓储' did not match`）：
+
+```powershell
+git config --global alias.acp '!f() { git add -A && git commit -m \"${1:-wip}\" && git push; }; f'
+```
+
+之后每个里程碑一条命令即可：
+
+```bash
+git acp "feat(be-01): 四表仓储 + 集成测试 + README 一键提交说明"   # add + commit + push
+git acp                                                         # 不带文案 → commit message 为 wip
+```
+
+装完建议核一下：Git Bash 那条应原样打印 `-m "${1:-wip}"`；PowerShell 那条会多一层反斜杠（`-m \"${1:-wip}\"`）——两者执行效果相同，都正常。
+
+```bash
+git config --get alias.acp   # 关键：必须看到 ${1:-wip}（否则引号已丢失，多词文案会报 pathspec）
+```
+
+> - 本仓已跟踪 `origin/main`，所以裸 `git push` 可用；新克隆若未设上游，先 `git push -u origin main` 一次。
+> - 工作区无改动时 `git acp "x"` 会因「nothing to commit」失败（退出码非 0，`&&` 保证不会误 push）——预期行为。
+> - 提交前建议先跑 `npm test`（当前 74 passed / 32 skipped）。
