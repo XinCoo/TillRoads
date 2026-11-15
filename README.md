@@ -106,6 +106,12 @@ psql -v ON_ERROR_STOP=1 -f migrations/0001_init_down.sql # 回滚
 RUN_PG_INTEGRATION=1 npm test
 ```
 
+> **集成测试必须串行跑**：`npm test` 已内置 `--test-concurrency=1`。
+> 三个 PG 集成测试文件共用同一个数据库（`tillroad_ci`），并行执行时彼此会触发
+> **死锁**（`40P01 deadlock_detected`）—— 仓储层的并发竞态用例会持锁 200ms，
+> 与路由层的建单抢同一行。这是 BE-01 第 4 步 CI 实际踩过的坑，不要把这层保护去掉。
+> 单测（core/ 与 fake 层）不受影响，仍可 `npm run test:core` 并行跑。
+
 > 集成测试的 `before()` 会自行执行整份 `schema.sql`（单一事实来源，无 psql 元命令），
 > 因此 CI 中无需额外跑迁移步骤；本地若已迁移也是幂等的，不冲突。
 
@@ -300,4 +306,4 @@ git config --get alias.acp   # 关键：必须看到 ${1:-wip}（否则引号已
 
 > - 本仓已跟踪 `origin/main`，所以裸 `git push` 可用；新克隆若未设上游，先 `git push -u origin main` 一次。
 > - 工作区无改动时 `git acp "x"` 会因「nothing to commit」失败（退出码非 0，`&&` 保证不会误 push）——预期行为。
-> - 提交前建议先跑 `npm test`（当前 74 passed / 32 skipped）。
+> - 提交前建议先跑 `npm test`（本机无 PG：99 passed / 43 skipped；CI 设 `RUN_PG_INTEGRATION=1` 则全量真跑）。

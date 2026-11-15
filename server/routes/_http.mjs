@@ -82,17 +82,34 @@ export function readBaseVersion(body) {
 /**
  * 带 statusCode 的 Error -> {status, body}。
  *   1. 有 statusCode + body（仓储层构造的 404/409/400）-> 原样采用，**不重新拼**；
- *   2. 有 code 的普通 Error（core/index.mjs 的 assertXxx、路由层自造码）-> 400 {error:code}；
- *   3. 其它（含 PG 连接失败、编程错误）-> 500 {error:'internal'}，不泄漏内部信息。
+ *   2. PG 驱动的 SQLSTATE（5 位、大写字母+数字，如 40P01/23505）-> **500**，
+ *      绝不降成 400：SQLSTATE 是服务端/数据库层错误码，不是客户端输入错。
+ *      尤其 40P01 = deadlock_detected、40001 = serialization_failure 是**可重试**的
+ *      并发故障，把它们的码当成 4xx 回给客户端，会让调用方以为该改请求参数，
+ *      而真正该做的是重试 —— 这是 BE-01 第 4 步 CI 暴露的真实缺陷。
+ *   3. 有 code 的普通 Error（core/index.mjs 的 assertXxx、路由层自造码）-> 400 {error:code}；
+ *   4. 其它（含 PG 连接失败、编程错误）-> 500 {error:'internal'}，不泄漏内部信息。
  */
 export function httpError(e) {
   if (e && typeof e.statusCode === 'number' && e.body && typeof e.body === 'object') {
     return { status: e.statusCode, body: e.body };
   }
+  if (e && isPgSqlState(e.sqlState ?? e.code)) {
+    // 只回一个稳定的内部错误码，不把底层 SQLSTATE 泄漏给客户端（日志里另有原始 err）。
+    return { status: 500, body: { error: 'internal' } };
+  }
   if (e && typeof e.code === 'string' && e.code) {
     return { status: 400, body: { error: e.code } };
   }
   return { status: 500, body: { error: 'internal' } };
+}
+
+/**
+ * pg 把 SQLSTATE 放在 err.code（5 位、[0-9A-Z]）。
+ * 用于把「数据库层错误码」与「应用层业务码」区分开 —— 后者是小写驼峰/大写下划线长字符串。
+ */
+function isPgSqlState(code) {
+  return typeof code === 'string' && /^[0-9A-Z]{5}$/.test(code);
 }
 
 // ---------------------------------------------------------------------------

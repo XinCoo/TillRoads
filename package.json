@@ -5,10 +5,10 @@
   "type": "module",
   "description": "题路 TillRoad · core/ 端无关零依赖规则层 + server/ API 与 PG 仓储骨架（server/ 运行时依赖 pg）",
   "scripts": {
-    "test": "node --test core/*.test.mjs server/*.test.mjs server/*/*.test.mjs",
+    "test": "node --test --test-concurrency=1 core/*.test.mjs server/*.test.mjs server/*/*.test.mjs",
     "test:core": "node --test core/*.test.mjs",
-    "test:server": "node --test server/*.test.mjs server/*/*.test.mjs",
-    "test:integration": "node --test server/db/pg-smoke.integration.test.mjs server/repositories/repositories.integration.test.mjs server/index.integration.test.mjs",
+    "test:server": "node --test --test-concurrency=1 server/*.test.mjs server/*/*.test.mjs",
+    "test:integration": "node --test --test-concurrency=1 server/db/pg-smoke.integration.test.mjs server/repositories/repositories.integration.test.mjs server/index.integration.test.mjs",
     "start": "node server/index.mjs"
   },
   "dependencies": {

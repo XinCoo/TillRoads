@@ -156,3 +156,33 @@ CI `node-tests` 首跑：`106 tests / 98 pass / 8 fail / 0 skipped`。逐类定�
 - **第 5 项（before 包事务）**：BE-01 第 4 步（T7）已完成，本轮跳过，`before()` 现状为 `withTransaction(pool, client => client.query(SCHEMA_SQL))`。
 - **验证**：`npm test` → `tests 141 / pass 98 / fail 0 / skipped 43`。明细：98 pass = core/index 14 + templates 4 + validators 15 + server/index(fake) 29 + pool 9 + base 20 + `_common` 7（新增）；43 skip = pg-smoke 4 + 仓储集成 29（原 28，D 新增 1 条）+ 路由集成 10。本机无 PostgreSQL，**8 条原失败集成用例只有 CI 能转红为绿**。
 - **未变的约束**：未改 `schema.sql` / `core/index.mjs` / `core/validators.mjs` / `server/db/pool.mjs` / `server/repositories/base.mjs`（A 的修复定位在 `_common.mjs`，未触 `buildUpdateSet`）。
+
+---
+
+## 12. BE-01 第 4 步 CI 失败修复（1 fail：40P01 死锁 + SQLSTATE 被降成 400）
+
+推送后 CI：`141 tests / 140 pass / 1 fail / 0 skipped`。上轮 8 条全绿，**剩下的这 1 条属于第 4 步**（`server/index.integration.test.mjs`，本轮修复未触碰该文件）。
+
+### 两个问题（按严重度排序，第二个更隐蔽）
+
+1. **测试基础设施：三个 PG 集成文件并行跑同一个库**
+   - 现象：`级联软删：DELETE /exam-profiles/:id ...` 在**建单**一步返回 400 `{"error":"40P01"}`，耗时 1006.9ms（≈ PG 默认 `deadlock_timeout` 1s）。
+   - 机制：`node --test` 默认按核数并行跑测试**文件**（本机 16 核）。仓储层「并发竞态: B 在 A 持锁期间阻塞」故意让一个事务持锁 200ms，而路由层建单走 `lockParentRow(users FOR UPDATE)` —— 两个文件跨连接抢同一行，PG 判定死锁并牺牲一方。宿主机核数决定是否复现，属于典型 flaky。
+   - 修：`package.json` 的 `test` / `test:server` / `test:integration` 全部加 `--test-concurrency=1`（串行）。单测仍可用 `npm run test:core` 并行。
+2. **`httpError` 把 PG SQLSTATE 当成客户端错误**（真正的代码缺陷，非测试问题）
+   - 现象：响应体直接是 `{"error":"40P01"}` 且 status=400 —— 底层数据库码泄漏给客户端，且把服务端并发故障伪装成用户输入错。
+   - 机制：`server/routes/_http.mjs` 的 `httpError` 第二段是 `if (e.code) return 400 {error:e.code}`，而 pg 把 SQLSTATE 放在 `err.code`。
+   - 影响：同类的 `40001 serialization_failure`、`08xxx` 连接错误同样会被当 400；客户端会误以为该改参数，而实际应该重试。
+   - 修：`httpError` 新增前置判定 `isPgSqlState(code)` = `/^[0-9A-Z]{5}$/`，命中则一律 `500 {error:'internal'}`（不泄漏 SQLSTATE）；应用层业务码（`INVALID_VERIFICATION_STAGE` 等长串）不受影响；`mapPgError` 映射过的错误因带 `statusCode`+`body` 仍走第一分支（404/409/400）。
+
+### 验证
+
+- `npm test` → `tests 142 / pass 99 / fail 0 / skipped 43`（新增 1 条 `httpError：PG SQLSTATE 一律 500`）。
+- 该新测试覆盖：`40P01` → 500；`40001` → 500；`08006` → 500；带 `sqlState:'23503'` 且有 `statusCode:404` 的已映射错误仍 404；`INVALID_VERIFICATION_STAGE` 仍 400。
+- **仍未能本机验证死锁是否真消失**（本机无 PG），只能由 CI 的 `RUN_PG_INTEGRATION=1` 验证；但串行化消除了跨文件锁竞争的成因。
+
+### 教训
+
+- 「先分清是哪个文件的失败」比直接看报错更重要：`logs` 里 `server/index.integration.test.mjs` 与 `server/repositories/*` 是两批改动，混在一起排查会误改已修好的代码。
+- 测试依赖机器核数 = flaky。共用同一数据库的集成测试必须显式串行。
+- 错误码分层：「5 位大写 SQLSTATE」是**基础设施层**，「小写/下划线业务码」是**应用层**，不能共用同一个映射分支。

@@ -258,6 +258,34 @@ test('httpError：404 / 400 / 未知错误三种映射', () => {
   assert.deepEqual(httpError(boom), { status: 500, body: { error: 'internal' } });
 });
 
+test('httpError：PG SQLSTATE 一律 500，绝不当成客户端 400（CI 40P01 死锁事故）', () => {
+  // 40P01 = deadlock_detected（CI 上真实发生过：被 httpError 降成 400 {error:'40P01'}，
+  //   看起来很像是客户端参数错，实际上是并发故障该重试）。
+  const deadlock = Object.assign(new Error('deadlock detected'), { code: '40P01' });
+  assert.deepEqual(httpError(deadlock), { status: 500, body: { error: 'internal' } });
+
+  // 40001 = serialization_failure 同理（可重试的并发失败）
+  const serialization = Object.assign(new Error('could not serialize access'), { code: '40001' });
+  assert.deepEqual(httpError(serialization), { status: 500, body: { error: 'internal' } });
+
+  // 连接类错误（08 类）也不该泄成 400
+  const conn = Object.assign(new Error('connection terminated'), { code: '08006' });
+  assert.deepEqual(httpError(conn), { status: 500, body: { error: 'internal' } });
+
+  // mapPgError 映射过的错误带 sqlState，同时也有 statusCode+body，应优先走 statusCode 分支
+  const mapped = Object.assign(new Error('fk'), {
+    code: 'foreign_key_not_found',
+    sqlState: '23503',
+    statusCode: 404,
+    body: { error: 'not_found', resource: 'subject', id: 'x' },
+  });
+  assert.equal(httpError(mapped).status, 404);
+
+  // 应用层业务码（不是 5 位大写）继续走 400，不能因为上面的规则被误伤
+  const appCode = Object.assign(new Error('bad stage'), { code: 'INVALID_VERIFICATION_STAGE' });
+  assert.deepEqual(httpError(appCode), { status: 400, body: { error: 'INVALID_VERIFICATION_STAGE' } });
+});
+
 test('readBody：非对象顶层 / 坏 JSON 分别 400', async () => {
   function fakeReq(text) {
     return {
