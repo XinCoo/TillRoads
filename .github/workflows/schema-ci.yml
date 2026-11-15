@@ -22,7 +22,7 @@ on:
 jobs:
   schema:
     name: PG15 · up / idempotent / reversible
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04  # 固定 LTS 镜像: ubuntu-latest 自 2026-10-19 起迁移到 Ubuntu 26, 避免 runner 镜像漂移
 
     # 一次性占位凭据(仅用于本次服务容器); 非真实密钥, 不写入仓库 Secrets。
     env:
@@ -52,7 +52,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5  # v5 原生运行在 Node 24, 消除 v4(Node 20) 弃用告警
 
       - name: Ensure psql client is available
         run: |
