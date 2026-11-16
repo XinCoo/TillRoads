@@ -510,10 +510,10 @@ DECLARE
   }'::jsonb;
 BEGIN
   IF OLD.status IS DISTINCT FROM NEW.status THEN
-    -- allowed->OLD.status 取当前态允许的下一态数组(jsonb); 展开后判等
+    -- allowed->(OLD.status::text) 取当前态允许的下一态数组(jsonb); 展开后判等
     -- 注意: 不能用 ->> 后再 ? (text ? text 操作符不存在, 会导致 CREATE FUNCTION 编译失败)
     IF NOT EXISTS (
-      SELECT 1 FROM jsonb_array_elements_text(allowed->OLD.status) v WHERE v = NEW.status
+      SELECT 1 FROM jsonb_array_elements_text(allowed->(OLD.status::text)) v WHERE v = NEW.status::text
     ) THEN
       RAISE EXCEPTION 'ILLEGAL_DEFECT_TRANSITION: % -> %', OLD.status, NEW.status;
     END IF;

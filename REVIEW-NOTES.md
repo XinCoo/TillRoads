@@ -400,3 +400,19 @@ throw importError('EMPTY_CONTENT', 400, '未识别到任何题目：请确认题
 **测试数字**：`npm test` → tests 183 / pass 119 / fail 0 / skipped 64（64 = 4 smoke + 29 仓储 + 11 路由 + 7 导入 + 13 缺陷单集成，本机无 PG 全 skip）。
 
 **遗留项**：13 条缺陷单集成测试只在 CI 真跑（本机未实跑 PG、未提交 GitHub）；AI 生成任务仍在内存（BE-08 再迁）；验证任务列表/临期提醒归 BE-04、模考绑定归 BE-05；`validateAIGenerateRequest` 嵌套返回形统一仍待 BE-02 前评估项（§9）后续处理。
+
+## 18. BE-03 CI 8 失败修复：frozen schema 的 enum/jsonb 硬错误（实测真库）
+
+**触发**：用户提交后 CI 真跑（183 / pass 175 / fail 8 / skipped 0），8 条中 7 条是 `{"error":"internal"}` 500、卡在 `toV1` 的 begin-verification，1 条 `400 !== 200`；本机 `npm test` 全 skip 集成测试故此前未发现。
+
+**根因（PGlite 真库复现，非字符串替换）**：本机无 PG，用 `npm install --no-save @electric-sql/pglite`（真实 Postgres 编译 WASM，支持 plpgsql/触发器）+ 临时 client adapter `{query:(sql,params)=>db.query(sql,params)}` 直接驱动真仓储，报 `code=42883 | operator does not exist: jsonb -> defect_status`。`schema.sql:514` 的 `check_defect_transition()` 里 `jsonb_array_elements_text(allowed->OLD.status) v WHERE v = NEW.status` —— `OLD.status`/`NEW.status` 是 `defect_status` **enum**，jsonb `->` 要 text 左操作、`=` 要 text 右操作，enum 无隐式转 text → 所有 `defect_tickets.status` 的 UPDATE 全挂。
+
+**修复（硬约束「除非发现硬错误，单独说明」授权；唯一改动的 frozen 文件）**：:514 改为 `jsonb_array_elements_text(allowed->(OLD.status::text)) v WHERE v = NEW.status::text`，:513 注释同步。`::text` 显式转换后，`SELECT prosrc FROM pg_proc WHERE proname='check_defect_transition'` 确认两处 cast 都进 loaded fn。注意首次 `.replace()` 只命中注释行、code 行没改仍报 42883 → 改用 replaceAll 同时覆盖注释+code。
+
+**第 8 条失败是测试 bug 非代码 bug**：`server/routes/defect_tickets.integration.test.mjs`「ACTION_DONE 不能直接 CLOSED」用例原来只 `POST /actions` 建 action、未 markDone 就调 begin-verification，门禁正确返回 `400 ACTIONS_NOT_DONE`（测试却断言 200）。已改为统一辅助 `await toV1(id)`（加 action→markDone→begin-verification 全流程）再断言 `POST /close → 400 ILLEGAL_DEFECT_TRANSITION`。
+
+**真库全程验证**：PGlite 驱动真仓储 18 步全 OK——create ANALYZED / toV1 两跳 / V1→V2→V3→CLOSED（closed_at 触发器写、round=1）/ V1→CLOSED 被触发器拒 / V2 fail→REOPENED（reopen_count=1）/ reanalyze→round=2 / round2 重提 V1 / 禁用语被 DB 拒 / DRAFT 建单 / analyze 补齐。
+
+**收尾**：PGlite `npm prune` 移除（package.json 从未写入）、临时脚本 `.tmp_repro.mjs` 删除；回归 `npm test` 183/119/0/64；`git status` 仅 `M schema.sql` + `M server/routes/defect_tickets.integration.test.mjs`（BE-03 其余文件用户已提交）。
+
+**教训**：① enum 列不能当 text 用 jsonb `->`/`=`，必须 `::text`；② frozen schema 也可能藏硬错误，本机集成测试全 skip 让所有 status UPDATE 相关 bug 潜伏到 CI 才爆；③ PGlite 是本机无 PG 时验证真 plpgsql/触发器的有效手段；④ `httpError` 第②分支会把任何 5 位 SQLSTATE 吞成 `internal`，排查须绕过 HTTP 层直接看 `e.code`/`e.message`。

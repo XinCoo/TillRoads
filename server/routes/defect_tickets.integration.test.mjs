@@ -199,13 +199,8 @@ test('全链路：ANALYZED → V1 → V2 → V3 → CLOSED（closed_at 由 DB �
 
 test('ACTION_DONE 不能直接 CLOSED（POST /close -> 400 ILLEGAL_DEFECT_TRANSITION）', skipOpt, async () => {
   const id = await newAnalyzed();
-  const a = await req('POST', `/defect-tickets/${id}/actions`, { action: '重做' });
-  assert.equal(a.status, 201);
-
-  // 手动进入验证后处于 V1，V1 直跳 CLOSED 也应被 core 前置 / 触发器拒绝。
-  const cur = await getTicket(id);
-  const b = await req('PATCH', `/defect-tickets/${id}/begin-verification`, { version: cur.version });
-  assert.equal(b.status, 200);
+  // 用统一辅助：加 action → mark done → begin-verification（手动两跳进入 V1）。
+  await toV1(id);
 
   const r = await req('POST', `/defect-tickets/${id}/close`, {});
   assert.equal(r.status, 400);
