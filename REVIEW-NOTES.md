@@ -255,8 +255,8 @@ CI `node-tests` 首跑：`106 tests / 98 pass / 8 fail / 0 skipped`。逐类定�
 
 ### 验证
 
-- `npm test` → `tests 166 / pass 115 / fail 0 / skipped 51`。
-  - 通过：`core/index` 14 + `core/templates` 4 + `core/validators` 15 + `server/index`(fake) 30 + `server/db/pool` 9 + `server/repositories/base` 20 + `_common` 7 + `server/import/splitter` 8 + `server/import/separate` 8 = 115。
+- `npm test` → `tests 168 / pass 117 / fail 0 / skipped 51`。
+  - 通过：`core/index` 14 + `core/templates` 4 + `core/validators` 15 + `server/index`(fake) 32 + `server/db/pool` 9 + `server/repositories/base` 20 + `_common` 7 + `server/import/splitter` 8 + `server/import/separate` 8 = 117。
   - 跳过（本机无 PG）：smoke 4 + 仓储集成 29 + 路由集成 11 + 导入集成 7 = 51。
 - `node --check` 全部 12 个新模块通过。
 - `git status --short`：`M package.json` / `M package-lock.json` / `M README.md` / `M REVIEW-NOTES.md` / `M server/routes/index.mjs` / `M server/index.integration.test.mjs` / `M server/routes/exam_profiles.mjs` / `?? server/import/` / `?? server/repositories/questions.mjs` / `?? server/repositories/assets.mjs` / `?? server/routes/questions_import.mjs` / `?? tests/`。**未改 `schema.sql`、`core/index.mjs`、`core/validators.mjs`、`server/db/pool.mjs`、`server/repositories/base.mjs`、四表仓储。**
@@ -307,3 +307,79 @@ npm install --package-lock-only --include=optional --no-audit --no-fund
 - 引入带 `optionalDependencies` 的包（`pdfjs-dist`、`esbuild`、`sharp`、`@swc/*` 等都属此类）后，**必须**跑一次 `npm ci` 验证，只跑 `npm test` 不够 —— 本机测试通过不代表 CI 能装上依赖。
 - `npm ci` 的 `EUSAGE ... Missing: X from lock file` 是「lockfile 缺条目」，不是「版本不对」；先看缺的是什么，再决定是重算 lockfile 还是降版本。
 - 可选依赖的 12 个平台包只增加 lockfile 体积（+265 行），**不会**增加 CI 安装体积（只装当前平台匹配的那一个）。
+
+## 16. CI 第二批失败（`npm ci` 修好之后）——两个 EMPTY_CONTENT 缺陷
+
+**现象**：lockfile 修好后 CI 能装依赖、能真跑 PG（`tests 166 / pass 164 / fail 2 / skipped 0`），只剩两条失败，都在 `server/import/import.integration.test.mjs`：
+
+```
+✖ 空文件 -> 400 EMPTY_CONTENT
+  AssertionError: Expected values to be strictly equal:
+  + actual - expected
+  + 'MISSING_CONTENT'
+  - 'EMPTY_CONTENT'
+
+✖ 文字里没有四类题号 -> 400 EMPTY_CONTENT（提示分隔符）
+  AssertionError: message 应列出可用的分隔符：undefined
+```
+
+**这是代码缺陷，不是测试写错。两条都是本机测不到的（本机无 PG，7 条导入集成全 skip），只有 CI 真跑才暴露。**
+
+### 缺陷 ①：空文件被误报成 MISSING_CONTENT
+
+`decodeBase64()` 原来写成 `if (typeof input !== 'string' || input.trim() === '') throw MISSING_CONTENT` —— 把「字段缺失」与「文件是 0 字节」当成同一件事。但 base64 编码空文件的结果就是**空串**，两者在传输层不可区分，只能靠「键在不在」区分。响应里的 `error` 字段直接影响客户端分支（改请求 vs 改文件），混淆会让用户看到「必填项缺失」却明明填了。
+
+修法（`server/routes/questions_import.mjs`）：拆成三段判断
+
+```js
+if (input === undefined || input === null) throw MISSING_CONTENT;   // 调用方漏传
+if (typeof input !== 'string')              throw INVALID_BASE64;   // 类型不对
+if (input.trim() === '')                    throw EMPTY_CONTENT;    // 文件 0 字节
+```
+
+### 缺陷 ②：切不出题时 message 被 `httpError` 丢掉
+
+切不出题的分支原来用**裸 Error**：
+
+```js
+throw Object.assign(new Error('未识别到任何题目：请确认题号以「1.」「（1）」「一、」「第1题」开头，或手动录入'),
+  { code: 'EMPTY_CONTENT', statusCode: 400, status: 400 });
+```
+
+问题：`_http.httpError()` 的第一个分支要求 **`statusCode` + `body` 同时存在**，只有 `statusCode` 而没有 `body` 时会落到「有 code 的普通 Error → `400 {error:code}`」分支，**message 被整个丢弃**。结果用户只看到 `{"error":"EMPTY_CONTENT"}`，不知道该改成什么题号格式 —— 而这恰恰是导入失败时最需要告知的一句话。
+
+修法：改用 `extract.mjs` 的 `importError()`（它会把 message 放进 `body`）：
+
+```js
+throw importError('EMPTY_CONTENT', 400, '未识别到任何题目：请确认题号以「1.」「（1）」「一、」「第1题」开头，或手动录入');
+```
+
+并把文件中间的 import 改为 `import { extractText, importError } from '../import/extract.mjs';`。
+
+### 新增回归用例（fake 层，本轮把「本机测不到」补上）
+
+`server/index.test.mjs` 新增 2 条（fake 层 30 → **32** 条），因为这两个 400 都在碰数据库**之前**返回，不注入 pool 也能验：
+
+1. `POST /questions/import：空文件 -> 400 EMPTY_CONTENT（不是 MISSING_CONTENT）` —— 正向断言空文件拿 `EMPTY_CONTENT` + 非空 message；并加**反向对照**（真缺字段才是 `MISSING_CONTENT`），防止将来把两个码又合回去
+2. `POST /questions/import：切不出题 -> 400 EMPTY_CONTENT，且 message 列出四类分隔符` —— 断言 message 含 `第1题`、`（1）`、`一、`
+
+### 验证
+
+- `node --check server/routes/questions_import.mjs` / `server/index.test.mjs` → SYNTAX_OK
+- 不连库的真实探针（临时脚本，跑完已删）直接调 `runImport` + `httpError`，五组入参结果：
+
+| 入参 | status | body |
+|---|---|---|
+| `content_base64: ''` | 400 | `{error:'EMPTY_CONTENT', message:'文件内容为空（0 字节），没有可导入的题目'}` |
+| 缺 `content_base64` | 400 | `{error:'MISSING_CONTENT'}` |
+| `content_base64: '   '` | 400 | `{error:'EMPTY_CONTENT', message:'…0 字节…'}` |
+| 无题号文本 | 400 | `{error:'EMPTY_CONTENT', message:'未识别到任何题目：请确认题号以「1.」「（1）」「一、」「第1题」开头，或手动录入'}` |
+| 缺 `filename` | 400 | `{error:'MISSING_FILENAME'}` |
+
+- `npm test` → `tests 168 / pass 117 / fail 0 / skipped 51`（117 = 115 + 新增 2 条 fake；skip 仍 51 因本机无 PG）
+
+### 教训
+
+- **`httpError` 的两条分支对 Error 形状要求不同**：想让 message 进响应体，必须带 `body`（用 `importError`/`validationError`/`duplicateError`）；只带 `code` + `statusCode` 会把 message 丢掉。这不是 bug 而是分层约定，但很容易踩。
+- **集成测试跳过率高 = 真实覆盖缺口**：本机 51 条 skip，其中 7 条就是这两个缺陷的归属地。能搬到 fake 层的就该搬（这两个 400 不碰库），否则每次都要等 CI 才能发现问题。
+- 「字段缺失」与「内容为空」是**不同**的客户端处置分支，HTTP 层必须用不同 code 区分，不能合用一个。

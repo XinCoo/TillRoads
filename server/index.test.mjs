@@ -581,3 +581,52 @@ test('规范契约：POST /analyze 与 POST /verifications 可用，PATCH /analy
   assert.equal(v.data.ticket.status, 'V2');
   assert.equal(v.data.verification.round, 1);
 });
+
+// ---------------------------------------------------------------------------
+// 9) 题目导入的请求体/内容错误（fake 层，不需要 PG）
+//
+// 这四个 400 都在碰数据库之前就返回，所以不注入 pool 也能验。
+// 它们是 CI 真跑时才暴露的两条缺陷的回归用例：
+//   ① 空文件被误报成 MISSING_CONTENT（把「字段缺失」与「文件 0 字节」混为一读）
+//   ② 切不出题时 message 在 httpError 里被丢掉（裸 Error 只有 code，没有 body）
+// ---------------------------------------------------------------------------
+
+test('POST /questions/import：空文件 -> 400 EMPTY_CONTENT（不是 MISSING_CONTENT）', async (t) => {
+  const { base, app } = await startServer();
+  t.after(() => app.close());
+
+  const r = await req(base, 'POST', '/questions/import', {
+    filename: 'empty.txt',
+    mime: 'text/plain',
+    content_base64: '',
+  });
+  assert.equal(r.status, 400, JSON.stringify(r.data));
+  assert.equal(r.data.error, 'EMPTY_CONTENT');
+  assert.ok(typeof r.data.message === 'string' && r.data.message.length > 0, '空文件也要带提示文案');
+
+  // 反向对照：字段真的缺了才是 MISSING_CONTENT
+  const missing = await req(base, 'POST', '/questions/import', { filename: 'a.txt', mime: 'text/plain' });
+  assert.equal(missing.status, 400, JSON.stringify(missing.data));
+  assert.equal(missing.data.error, 'MISSING_CONTENT');
+});
+
+test('POST /questions/import：切不出题 -> 400 EMPTY_CONTENT，且 message 列出四类分隔符', async (t) => {
+  const { base, app } = await startServer();
+  t.after(() => app.close());
+
+  const text = '这是一份没有任何题号的说明文档。\n只有几段普通文字，没有编号、没有选项。\n';
+  const r = await req(base, 'POST', '/questions/import', {
+    filename: 'no-separator.txt',
+    mime: 'text/plain',
+    content_base64: Buffer.from(text, 'utf8').toString('base64'),
+  });
+
+  assert.equal(r.status, 400, JSON.stringify(r.data));
+  assert.equal(r.data.error, 'EMPTY_CONTENT');
+  // 关键回归：message 必须出现在响应体里（裸 Error 的 message 会被 httpError 丢掉）
+  assert.ok(
+    typeof r.data.message === 'string' && r.data.message.includes('第1题'),
+    `message 应列出可用的分隔符：${JSON.stringify(r.data.message)}`,
+  );
+  assert.ok(r.data.message.includes('（1）') && r.data.message.includes('一、'), '四类分隔符都要提到');
+});

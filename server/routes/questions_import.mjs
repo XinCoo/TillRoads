@@ -54,7 +54,7 @@
 
 import { withTransaction } from '../repositories/base.mjs';
 import * as questionsRep from '../repositories/questions.mjs';
-import { extractText } from '../import/extract.mjs';
+import { extractText, importError } from '../import/extract.mjs';
 import { splitQuestions } from '../import/splitter.mjs';
 import { dedupe } from '../import/dedupe.mjs';
 import { separateAssets } from '../import/separate.mjs';
@@ -71,8 +71,18 @@ const DEFAULT_TYPE = 'choice';
  * 所以必须回头校验长度：解出来的东西比预期短太多说明内容不是合法 base64。
  */
 function decodeBase64(input) {
-  if (typeof input !== 'string' || input.trim() === '') {
+  // 「字段缺失」与「文件是空的」是两件事，不能都回 MISSING_CONTENT：
+  //   缺失 -> 调用方漏传，改请求参数即可；
+  //   空文件 -> 文件本身 0 字节，属于内容问题（EMPTY_CONTENT）。
+  // base64 里空文件的编码就是空串，所以只能靠「键在不在」区分这两者。
+  if (input === undefined || input === null) {
     throw Object.assign(new Error('content_base64 必填'), { code: 'MISSING_CONTENT' });
+  }
+  if (typeof input !== 'string') {
+    throw Object.assign(new Error('content_base64 必须是字符串'), { code: 'INVALID_BASE64' });
+  }
+  if (input.trim() === '') {
+    throw importError('EMPTY_CONTENT', 400, '文件内容为空（0 字节），没有可导入的题目');
   }
   const cleaned = input.replace(/\s+/g, '');
   const buf = Buffer.from(cleaned, 'base64');
@@ -123,11 +133,13 @@ export async function runImport(pool, body = {}) {
   if (split.questions.length === 0) {
     // 抽到文字但一条题都没切出来：多半是分隔符不在四类里。
     // 明确告诉用户「支持哪四类」，而不是含糊地说「没有可用内容」。
-    throw Object.assign(
-      new Error(
-        '未识别到任何题目：请确认题号以「1.」「（1）」「一、」「第1题」开头，或手动录入',
-      ),
-      { code: 'EMPTY_CONTENT', statusCode: 400, status: 400 },
+    // 用 importError 而不是裸 Error：message 必须进 body，否则 httpError 的
+    // 「有 code 的普通 Error -> 400 {error:code}」分支会把提示文案丢弃，
+    // 用户只看到一个没有下文的 EMPTY_CONTENT（CI 实际踩过）。
+    throw importError(
+      'EMPTY_CONTENT',
+      400,
+      '未识别到任何题目：请确认题号以「1.」「（1）」「一、」「第1题」开头，或手动录入',
     );
   }
 
