@@ -1,4 +1,4 @@
-# 题路 TillRoad · 文档评审与修订记录（进入开发阶段前）
+﻿# 题路 TillRoad · 文档评审与修订记录（进入开发阶段前）
 
 > 评审日期：2026-11-14 ｜ 评审对象：工作文件夹全部文档/DDL ｜ 结论：**可以进入 App 开发阶段，但不宜照原文档直接开工**
 > 本文件是审查结论与「评审→修订」对照表，供后续 BE-00 / FE / QA 派工与回归时查阅。
@@ -414,5 +414,130 @@ throw importError('EMPTY_CONTENT', 400, '未识别到任何题目：请确认题
 **真库全程验证**：PGlite 驱动真仓储 18 步全 OK——create ANALYZED / toV1 两跳 / V1→V2→V3→CLOSED（closed_at 触发器写、round=1）/ V1→CLOSED 被触发器拒 / V2 fail→REOPENED（reopen_count=1）/ reanalyze→round=2 / round2 重提 V1 / 禁用语被 DB 拒 / DRAFT 建单 / analyze 补齐。
 
 **收尾**：PGlite `npm prune` 移除（package.json 从未写入）、临时脚本 `.tmp_repro.mjs` 删除；回归 `npm test` 183/119/0/64；`git status` 仅 `M schema.sql` + `M server/routes/defect_tickets.integration.test.mjs`（BE-03 其余文件用户已提交）。
-
 **教训**：① enum 列不能当 text 用 jsonb `->`/`=`，必须 `::text`；② frozen schema 也可能藏硬错误，本机集成测试全 skip 让所有 status UPDATE 相关 bug 潜伏到 CI 才爆；③ PGlite 是本机无 PG 时验证真 plpgsql/触发器的有效手段；④ `httpError` 第②分支会把任何 5 位 SQLSTATE 吞成 `internal`，排查须绕过 HTTP 层直接看 `e.code`/`e.message`。
+
+---
+
+## 19. BE-04 归档（验证任务列表 + 临期提醒，纯查询层）
+
+**范围**：只做查询。新增 2 个 GET 端点、1 个纯函数模块、2 个仓储查询方法。**不写任何 UPDATE/INSERT/DELETE**，不迁移状态（状态机归 BE-03），不做推送/定时任务/模考绑定（BE-05）/复盘统计（BE-06）。
+
+### schema 硬点核实：进入时间字段**不存在**
+
+`grep 'started_at|changed_at|state_at|entered_at|verified_at'` 全 `schema.sql` 只命中 `:343 verified_at`（在 `verifications` 表）。`defect_tickets` 只有 `created_at` / `closed_at` / `updated_at`，**没有** `v1_started_at` / `v2_started_at` / `v3_started_at`，也没有通用 `status_changed_at`。schema 已冻结，**不为精确性改 schema**。
+
+### 进入时间的**混合取法**（重要，带语义偏差）
+
+| stage | `entered_at` 来源 | 精确度 |
+|---|---|---|
+| `V2` | 本 round 内 **V1 `pass` 记录的 `created_at`** | 精确 |
+| `V3` | 本 round 内 **V2 `pass` 记录的 `created_at`** | 精确 |
+| `V1` | `defect_tickets.updated_at`（退化） | **近似** |
+
+SQL 用 `LEFT JOIN LATERAL` 取「同 `(defect_ticket_id, round)` 下、`result='pass'`、`stage` 为上一阶段」的最近一条 `created_at`，再 `COALESCE(..., dt.updated_at)`。限定 `round = dt.verification_round` 是必须的——重开后旧 round 的 pass 记录不能当成本轮进入时间。
+
+**V1 为何只能近似**：`begin-verification` 只把 `status` 写成 `V1`，**不落 `verifications` 行**（验证记录是提交结果时才写），所以没有「刚进 V1」的时间戳可查。
+
+**语义偏差（必须记录）**：`updated_at` 被 `set_updated()` 在**任何** `UPDATE` 时刷新，包括与状态无关的 `patch`（改 priority / 改归因）。后果：V1 的 `entered_at` 往后漂移 → 已过天数**少算** → **晚报而非误报逾期**。方向上刻意选安全侧（宁可晚提醒，不能冤枉用户）。集成测试里有一条用例专门锁住这个行为（patch priority 后 `entered_at` 必须后移），防止将来有人误以为它是精确值而拿去算别的。
+
+**对 BE-06 的连带影响**：复盘统计若要算「V1 停留时长」，同样只有这个近似值，需在统计口径里注明；V2/V3 的停留时长可用相邻 pass 记录的 `created_at` 差值，是精确的。
+
+### 窗口值与 urgency（配置化，不进 SQL）
+
+`server/verify_window.mjs`：`VERIFY_WINDOWS = {V1:7, V2:14, V3:21}`（开发文档 3–7 天 / 1–2 周取上限，V3 给更宽松观察期）、`DUE_SOON_DAYS = 3`。`computeUrgency(enteredAt, windowDays, now)` 纯函数，`elapsedDays = floor((now-enteredAt)/1天)`、`daysLeft = windowDays - elapsedDays`、`<=0 → overdue`、`<=3 → due_soon`、否则 normal。**窗口值一律不经 SQL**，urgency 在 JS 层算。
+
+模块加载时断言 `VERIFY_WINDOWS` 的键覆盖 `core` 的 `VERIFY_STAGES`，新增 stage 忘配窗口会直接启动失败（fail loud）。
+
+### 设计取舍
+
+- **summary 直接复用 list 再内存聚合**（`limit:200`），而不是写第二份 `GROUP BY` SQL——保证两个端点数字**永不漂移**。代价是用户单量 >200 时聚合会截断，MVP 可接受（已在代码注释标明）。
+- **不查 `COUNT(*)`**：urgency 过滤在应用层，`total` 必须基于过滤后的全量，故一次性取回再算。
+- **端点只读**：`match()` 只认 `GET`，POST/PATCH/DELETE 落到 404（有专门用例锁定），避免将来误加成写入口。
+
+### 验证数字
+
+- 纯函数单测 13 条（`server/verify_window.test.mjs`）：三态边界 `daysLeft=0/3/4`、负数、向下取整（23 小时不算 1 天）、同一 enteredAt 不同窗口、时间入参三形态等价、非法入参抛 TypeError、原型链键防护。
+- fake 路由 11 条（并入 `server/index.test.mjs`）：非法 stage/urgency → 400、逗号多值去重、只读 404、空结果、V1 单子的 `window_days=7`、ANALYZED 不进列表、stage 过滤、summary 与列表一致。
+- 真 PG 集成 19 条（`server/routes/verification_tasks.integration.test.mjs`，仅 CI 跑）：数据源过滤（ACTION_DONE/REOPENED/ANALYZED 都不出）、V2/V3 entered_at 精确取法（用 backdate 改 `verifications.created_at` 造场景）、V1 近似取法会漂移、urgency 三态同时成立、urgency 过滤单值/多值、stage 过滤、排序、summary 逐项对账、JOIN 展示字段、LEFT JOIN 不丢无考点单、软删排除、分页、空用户、字段形态（ISO 字符串 + number）、用户隔离。
+- 本机 `npm test`：226 tests / **143 pass** / 0 fail / **83 skipped**（83 = 既有 64 + 新增 19 条集成，本机无 PG 全 skip）。
+
+### 遗留
+
+- `verificationSummary` 的 `limit:200` 截断（单用户 >200 张待验证单时聚合偏小）。
+- V1 进入时间近似（见上）。
+- 未做推送：前端需轮询这两个端点；若将来要做真推送，需先增加后台服务与通知偏好存储。
+
+---
+
+## 20. BE-05 归档（限时模考 + 报告生成）
+
+**范围**：两态生命周期（创建即 `in_progress`，提交即出报告），不做四态、不做后台任务、不做智能组卷/难度配比/错题优先、不做边答边存、不做排行榜。**不触发任何状态迁移**——`v3_candidates` 只负责指路，迁移仍走 BE-03 的 `POST /defect-tickets/:id/verifications`。
+
+### `strategy_execution` 为什么返回 `null`（拍板项 4）
+
+开发文档把它定义为「该跳的题是否跳了」。MVP 里**没有任何「跳过」行为的记录源**：
+
+- 前端提交的 `answers` 数组只含作答过的题；未作答题在服务端表现为「缺项」。
+- 「没时间做而空着」与「判断该跳主动空着」在数据上**完全不可区分**。
+- 若强行把「未作答」当跳题，会把超时收卷的漏答也算成「策略正确」，指标方向性错误。
+
+所以返回 `null` 并在 README 里明说跳过。等 V1 有「跳过」显式动作记录（如 `question_skipped` 事件）再实现，属独立议题。
+
+### 组卷为何不复用 `questions.listBySubject/listByKnowledgeNode`
+
+这两个方法按 `created_at ASC` 分页、`limit` 封顶 200，既不随机也抽不满卷。组卷在 `mock_exams.mjs` 内自写：
+
+```sql
+SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_subjective, tags
+  FROM questions
+ WHERE deleted_at IS NULL AND subject_id = $1     -- 或 knowledge_node_id = $1
+ ORDER BY random() LIMIT $2;
+```
+
+先 `SELECT count(*)::int` 探可用量：不足直接抛 `INSUFFICIENT_QUESTIONS`（400，body 带 `available`/`requested`），**不静默给少数题**。抽题只取 `PUBLIC_QUESTION_COLUMNS`，**刻意不含 `answer`/`analysis`**——提交前不许泄题，路由层还有 `sanitizeQuestion()` 二次剔除作防线。
+
+### 报告四项计算（`server/mock_report.mjs`，纯函数零依赖）
+
+- **`module_accuracy`**：按 `knowledge_node_id` 直接分组（「模块」= 考点树某层，不引入新概念），`accuracy` 分母只算已判分（`is_correct` 为 true/false），`ungraded` 单独计数；无考点归 `__ungrouped__`。
+- **`avg_duration_ms`**：`overall` + `by_knowledge_node`，`Math.round`。
+- **`stability`**：`[本次准确率, ...近 2 次同 mode+同 profile 已提交模考]` 截前 3，样本 <2 → `null`；否则**总体口径变异系数**（`std/mean`，分母 n 而非 n-1），`mean===0` 时 `null`（避免除零把「三次全 0 分」报成完美稳定）。
+- **`defect_repeat_rate`**：只统计**错题**里 `question_id` 命中该用户 `CLOSED` 缺陷单的；`rate = total_wrong>0 ? repeat/total_wrong : 0`（分母 0 给 0 而不是 NaN）。
+- **`v3_candidates`**：错题的 `knowledge_node_id` 命中该用户 `status='V3'` 缺陷单，输出 `[{defect_ticket_id, question_id, knowledge_node_id}]`，按 `defectId::qid` 去重。
+
+### 判分口径（与 `is_correct` 的三态一一对应）
+
+| 情形 | `is_correct` | 是否进准确率分母 |
+|---|---|---|
+| 客观题，答对 | `true` | 是 |
+| 客观题，答错 / 未作答 | `false` | 是 |
+| 主观题（`is_subjective=true` 或 `essay`/`short_answer`） | `null` | **否** |
+| 题库标准答案为空（数据缺失） | `null` | **否** |
+
+关键点：**「题库没答案」不能算用户答错**，否则脏数据会污染用户准确率。归一比较 = `NFKC` + 去空白/全半角标点 + `toUpperCase`，与 `core.normalizeQuestionText()` 同口径（但用途不同：这里比对答案，那里算去重 hash）。
+
+### 超时收卷
+
+`elapsedMs = submitted_at - mock_exams.created_at`；`elapsedMs > duration_limit_ms + 60_000` → `timed_out=true`，**未作答一律计错**，报告按已作答部分出。60s 宽限吸收网络与渲染抖动。`duration_limit_ms` 为 `null` 时不判超时。
+
+### 发现并修掉的两个真 bug（真库实测才暴露）
+
+1. **`v3_candidates` 恒为 0**：`userDefects` 查询带了 `AND question_id IS NOT NULL`，把「无 `question_id` 的 V3 缺陷单」全过滤掉；而 `v3_candidates` 是按 **`knowledge_node_id`** 匹配的（只有 `defect_repeat_rate` 才按 `question_id`）。两类键不同，不能共用同一个非空约束。已删该条件并在 SQL 内留注释。
+2. **`dispatch` 少 `await` 导致整片 404**：新加的 `mock_exams.match` 是 async，原 `dispatch` 同步地把返回的 Promise 当真值返回，**静默遮蔽后面所有模块**，缺陷单路由全变 `404 not_found`（fake 层 28 条测试瞬间从绿变红）。已把 `dispatch` 改成 `async` 且逐个 `await mod.match(...)`。
+
+第 2 个尤其值得记：**只要有一个路由模块的 `match` 变成 async，同步 dispatch 就会静默吞掉后续所有模块**，且失败表现是「404 而不是 500」，极易误判成路由没注册。
+
+### 验证数字
+
+- `server/mock_report.test.mjs` 22 条纯函数单测（含 cv 精确值 `[0.5,0.6,0.7]→0.136083`、`[1,0.5,0]→0.816497`、全对/全错、首次 `stability=null`、分母 0 的 `rate=0`、`v3_candidates` 去重）。
+- fake 层（并入 `server/index.test.mjs`）：组卷参数校验、`INSUFFICIENT_QUESTIONS`、超时、`already_submitted`、`not_submitted` 404。
+- 真 PG 集成 20 条（`server/routes/mock_exams.integration.test.mjs`，仅 CI 跑）：组卷 full/module、题量不足、提交全链路（attempts 落库 + `attempt_id` 回填 + report 落库 + `GET /report` 对账）、重复提交 409、超时收卷、宽限内不超时、stability 跨三次、`defect_repeat_rate`、`v3_candidates`、列表排序与 mode 过滤、用户隔离、软删、主观题不进分母。
+- 因组卷是 `ORDER BY random()`，**断言必须按 `knowledge_node_id` 构造答案**，不能依赖抽题下标（否则 CI 随机翻红）。
+- 本机 `npm test`：268 tests / **165 pass** / 0 fail / **103 skipped**（103 = 既有 83 + 新增 20 条集成，本机无 PG 全 skip）。
+- 另外用 PGlite（真实 Postgres WASM，`npm install --no-save` 后 `npm prune` 移除，未写入 package.json）在本地跑了 19 项真库验证，**正是它抓到了 `v3_candidates` 那个 bug**——这条经验来自 BE-03 的 8 条 CI 失败代价：本机集成全 skip 时，SQL 真库错误只会在 CI 暴露。
+
+### 遗留
+
+- `stability` 只看近 3 次，样本少时波动大；且不含「难度」权重（MVP 不做难度配比，无从归一）。
+- `module_accuracy` 的「模块」直接等于考点，若一个科目考点树很深，报告会过细；产品上可能需要「按指定层级聚合」，属 BE-06/前端议题。
+- `v3_candidates` 不去重跨模考（每次模考独立算），前端需自行合并同 `defect_ticket_id`。
+- 组卷 `ORDER BY random()` 在题库极大时是全表排序，MVP 题量下可接受，后续需换 `TABLESAMPLE` 或预抽样。

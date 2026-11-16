@@ -561,7 +561,7 @@ test('POST /ai/questions:generate 校验 count 1..20 且返回 provider/model �
   assert.equal(alias.data.error, 'INVALID_COUNT');
 });
 
-test('GET /review-cycles 与 GET /mock-exams/:id/report 字段完整（读 fake 缺陷单）', async (t) => {
+test('GET /review-cycles 字段完整，GET /mock-exams/:id/report 未提交 -> 404 not_submitted', async (t) => {
   const base = await startDefectServer(t);
   const id = await newAnalyzed(base);
 
@@ -573,12 +573,13 @@ test('GET /review-cycles 与 GET /mock-exams/:id/report 字段完整（读 fake 
   assert.equal(rc.data.new_defects, 1);
   assert.ok(Array.isArray(rc.data.timeline));
 
-  const rep = await req(base, 'GET', '/mock-exams/me-1/report');
-  assert.equal(rep.status, 200);
-  assert.equal(rep.data.mock_exam_id, 'me-1');
-  assert.ok(Array.isArray(rep.data.by_knowledge_node));
-  assert.ok(rep.data.defect_links.some((x) => x.defect_ticket_id === id));
-  assert.equal(typeof rep.data.stability_index, 'number');
+  // BE-05：模考报告已改为真实现（不再是假数据常量）。
+  // 本用例只验证「不存在的模考 -> 404」，真报告的字段形状由
+  // mock_report.test.mjs（纯函数 22 条）与 mock_exams.integration.test.mjs（真 PG）覆盖。
+  const rep = await req(base, 'GET', '/mock-exams/me-does-not-exist/report');
+  assert.equal(rep.status, 404);
+  assert.equal(rep.data.error, 'not_found');
+  void id;
 });
 
 // ---------------------------------------------------------------------------
@@ -663,4 +664,335 @@ test('POST /questions/import：切不出题 -> 400 EMPTY_CONTENT，且 message �
     `message 应列出可用的分隔符：${JSON.stringify(r.data.message)}`,
   );
   assert.ok(r.data.message.includes('（1）') && r.data.message.includes('一、'), '四类分隔符都要提到');
+});
+
+// ---------------------------------------------------------------------------
+// BE-04：验证任务查询端点（纯读，fake 层验参数解析与 400）
+// ---------------------------------------------------------------------------
+// 窗口值 / urgency 三态的**数学**已由 server/verify_window.test.mjs 的 13 条纯函数单测覆盖；
+// 这里只验「路由层有没有把脏参数拦下来」与「注入 fake 后能否正确转发」。
+// 真库的 JOIN / 进入时间推断放集成层（routes/verification_tasks.integration.test.mjs）。
+
+test('GET /users/:id/verification-tasks：非法 stage -> 400 INVALID_STAGE', async (t) => {
+  const base = await startDefectServer(t);
+  for (const bad of ['V4', 'v1', 'V9']) {
+    const r = await req(base, 'GET', `/users/u-1/verification-tasks?status=${bad}`);
+    assert.equal(r.status, 400, `status=${bad} 应 400`);
+    assert.equal(r.data.error, 'INVALID_STAGE');
+    assert.ok(typeof r.data.message === 'string' && r.data.message.includes('V1'), 'message 应列出合法值');
+  }
+});
+
+test('GET /users/:id/verification-tasks：非法 urgency -> 400 INVALID_URGENCY', async (t) => {
+  const base = await startDefectServer(t);
+  for (const bad of ['urgent', 'OVERDUE', 'late']) {
+    const r = await req(base, 'GET', `/users/u-1/verification-tasks?urgency=${bad}`);
+    assert.equal(r.status, 400, `urgency=${bad} 应 400`);
+    assert.equal(r.data.error, 'INVALID_URGENCY');
+    assert.ok(r.data.message.includes('overdue'), 'message 应列出合法值');
+  }
+});
+
+test('GET /users/:id/verification-tasks：合法参数 -> 200，返回 items/total/limit/offset', async (t) => {
+  const base = await startDefectServer(t);
+  const r = await req(base, 'GET', '/users/u-1/verification-tasks');
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.ok(Array.isArray(r.data.items));
+  assert.equal(typeof r.data.total, 'number');
+  assert.equal(typeof r.data.limit, 'number');
+  assert.equal(typeof r.data.offset, 'number');
+});
+
+test('GET /users/:id/verification-tasks：逗号分隔多值可接受、重复值去重不报错', async (t) => {
+  const base = await startDefectServer(t);
+  const r = await req(base, 'GET', '/users/u-1/verification-tasks?status=V1,V2,V1&urgency=overdue,due_soon');
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+});
+
+test('GET /users/:id/verification-summary：返回 by_stage / by_urgency / 三个计数', async (t) => {
+  const base = await startDefectServer(t);
+  const r = await req(base, 'GET', '/users/u-1/verification-summary');
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(typeof r.data.total, 'number');
+  assert.deepEqual(Object.keys(r.data.by_stage).sort(), ['V1', 'V2', 'V3']);
+  assert.deepEqual(Object.keys(r.data.by_urgency).sort(), ['due_soon', 'normal', 'overdue']);
+  assert.equal(typeof r.data.overdue, 'number');
+  assert.equal(typeof r.data.due_soon, 'number');
+  assert.equal(typeof r.data.normal, 'number');
+});
+
+test('BE-04 端点只读：POST/PATCH/DELETE 一律落 404（不暴露写入口）', async (t) => {
+  const base = await startDefectServer(t);
+  for (const method of ['POST', 'PATCH', 'DELETE']) {
+    const r = await req(base, method, '/users/u-1/verification-tasks', {});
+    assert.equal(r.status, 404, `${method} 应 404（BE-04 纯查询）`);
+    assert.equal(r.data.error, 'not_found');
+  }
+});
+
+test('GET /users/:id/verification-tasks：空结果时 items 为空数组且 total=0', async (t) => {
+  const base = await startDefectServer(t);
+  const r = await req(base, 'GET', '/users/u-9/verification-tasks');
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.data.items, []);
+  assert.equal(r.data.total, 0);
+});
+
+test('GET /users/:id/verification-tasks：V1 单子出现在列表中且带 urgency 字段', async (t) => {
+  const base = await startDefectServer(t);
+  const id = await newAnalyzed(base);
+  await toV1(base, id);
+
+  const r = await req(base, 'GET', '/users/u-1/verification-tasks');
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.total, 1, '只有一张 V1 单');
+  const row = r.data.items[0];
+  assert.equal(row.id, id);
+  assert.equal(row.stage, 'V1');
+  assert.equal(row.window_days, 7, 'V1 窗口 7 天');
+  assert.equal(row.urgency, 'normal', '刚进入 V1 不临期');
+  assert.equal(typeof row.days_left, 'number');
+  assert.equal(typeof row.entered_at, 'string');
+  assert.equal(typeof row.due_at, 'string');
+});
+
+test('GET /users/:id/verification-tasks：尚未进入验证的 ANALYZED 不进列表', async (t) => {
+  const base = await startDefectServer(t);
+  const analyzed = await newAnalyzed(base);
+  const act = await req(base, 'POST', `/defect-tickets/${analyzed}/actions`, { action: '重做' });
+  await req(base, 'PATCH', `/defect-tickets/${analyzed}/actions/${act.data.id}`, { version: act.data.version });
+
+  const r = await req(base, 'GET', '/users/u-1/verification-tasks');
+  assert.equal(r.status, 200);
+  assert.equal(r.data.total, 0, 'ANALYZED（尚未 begin-verification）不应出现');
+});
+
+test('GET /users/:id/verification-tasks：stage 过滤只返回指定 stage', async (t) => {
+  const base = await startDefectServer(t);
+  const id1 = await newAnalyzed(base);
+  await toV1(base, id1);
+  const id2 = await newAnalyzed(base);
+  await toV1(base, id2);
+
+  const t2 = await getTicket(base, id2);
+  const v2 = await req(base, 'POST', `/defect-tickets/${id2}/verifications`, {
+    stage: 'V1', result: 'pass', verify_type: 'redo_hidden', version: t2.version,
+  });
+  assert.equal(v2.status, 201, JSON.stringify(v2.data));
+
+  const all = await req(base, 'GET', '/users/u-1/verification-tasks');
+  assert.equal(all.data.total, 2);
+
+  const onlyV2 = await req(base, 'GET', '/users/u-1/verification-tasks?status=V2');
+  assert.equal(onlyV2.data.total, 1);
+  assert.equal(onlyV2.data.items[0].id, id2);
+  assert.equal(onlyV2.data.items[0].stage, 'V2');
+});
+
+test('GET /users/:id/verification-summary：聚合数字与列表一致', async (t) => {
+  const base = await startDefectServer(t);
+  const id1 = await newAnalyzed(base);
+  await toV1(base, id1);
+  const id2 = await newAnalyzed(base);
+  await toV1(base, id2);
+
+  const s = await req(base, 'GET', '/users/u-1/verification-summary');
+  assert.equal(s.status, 200, JSON.stringify(s.data));
+  assert.equal(s.data.total, 2);
+  assert.equal(s.data.by_stage.V1, 2);
+  assert.equal(s.data.by_urgency.normal, 2);
+  assert.equal(s.data.overdue, 0);
+});
+
+// ---------- BE-05：限时模考 fake 层 ----------
+
+/** 起一个注入了 fake 仓储、且题库已灌好若干题的 app。 */
+async function startMockServer(t, { questions = 5 } = {}) {
+  const repos = createFakeRepos();
+  const rows = [];
+  for (let i = 0; i < questions; i += 1) {
+    rows.push({
+      id: `q-${i + 1}`,
+      subject_id: 'sub-1',
+      knowledge_node_id: 'kn-1',
+      type: 'choice',
+      stem: `题干 ${i + 1}`,
+      options: [{ key: 'A', text: 'a' }, { key: 'B', text: 'b' }],
+      answer: 'A',
+      analysis: '解析不应出现在组卷响应里',
+      is_subjective: false,
+      difficulty: 0.5,
+      tags: [],
+      deleted_at: null,
+    });
+  }
+  repos.questions.seedRows(rows);
+  const { base, app } = await startServer({ repos });
+  t.after(() => app.close());
+  return base;
+}
+
+async function createMock(base, body) {
+  const r = await req(base, 'POST', '/mock-exams', {
+    exam_profile_id: 'ep-1',
+    mode: 'full',
+    subject_id: 'sub-1',
+    question_count: 3,
+    ...body,
+  });
+  return r;
+}
+
+test('POST /mock-exams：组卷成功且不泄题', async (t) => {
+  const base = await startMockServer(t);
+  const r = await createMock(base);
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  assert.equal(r.data.question_count, 3);
+  assert.equal(r.data.questions.length, 3);
+  // 提交前绝不返回标准答案与解析
+  for (const q of r.data.questions) {
+    assert.equal(q.answer, undefined);
+    assert.equal(q.analysis, undefined);
+  }
+  // questions jsonb 初始 attempt_id 为 null
+  for (const e of r.data.mock_exam.questions) {
+    assert.equal(e.attempt_id, null);
+    assert.equal(e.is_correct, null);
+  }
+});
+
+test('POST /mock-exams：题量不足 -> 400 INSUFFICIENT_QUESTIONS 带 available', async (t) => {
+  const base = await startMockServer(t, { questions: 2 });
+  const r = await createMock(base, { question_count: 5 });
+  assert.equal(r.status, 400, JSON.stringify(r.data));
+  assert.equal(r.data.error, 'INSUFFICIENT_QUESTIONS');
+  assert.equal(r.data.available, 2);
+  assert.equal(r.data.requested, 5);
+});
+
+test('POST /mock-exams：full 缺 subject_id / module 缺 knowledge_node_id -> 400', async (t) => {
+  const base = await startMockServer(t);
+
+  const noSubject = await req(base, 'POST', '/mock-exams', {
+    exam_profile_id: 'ep-1',
+    mode: 'full',
+    question_count: 3,
+  });
+  assert.equal(noSubject.status, 400, JSON.stringify(noSubject.data));
+  assert.equal(noSubject.data.error, 'MISSING_SUBJECT_ID');
+
+  const noNode = await req(base, 'POST', '/mock-exams', {
+    exam_profile_id: 'ep-1',
+    mode: 'module',
+    question_count: 3,
+  });
+  assert.equal(noNode.status, 400, JSON.stringify(noNode.data));
+  assert.equal(noNode.data.error, 'MISSING_KNOWLEDGE_NODE_ID');
+});
+
+test('POST /mock-exams/:id/submit：缺 base_version -> 400', async (t) => {
+  const base = await startMockServer(t);
+  const created = await createMock(base);
+  const r = await req(base, 'POST', `/mock-exams/${created.data.mock_exam.id}/submit`, {
+    answers: [],
+  });
+  assert.equal(r.status, 400, JSON.stringify(r.data));
+  assert.equal(r.data.error, 'INVALID_BASE_VERSION');
+});
+
+test('POST /mock-exams/:id/submit：提交出报告，未提交时读报告 404', async (t) => {
+  const base = await startMockServer(t);
+  const created = await createMock(base);
+  const id = created.data.mock_exam.id;
+
+  const before = await req(base, 'GET', `/mock-exams/${id}/report`);
+  assert.equal(before.status, 404, JSON.stringify(before.data));
+  assert.equal(before.data.error, 'not_submitted');
+
+  const answers = created.data.questions.map((q) => ({
+    question_id: q.id,
+    answer_text: 'A',
+    duration_ms: 1200,
+  }));
+  const sub = await req(base, 'POST', `/mock-exams/${id}/submit`, {
+    version: created.data.mock_exam.version,
+    answers,
+  });
+  assert.equal(sub.status, 200, JSON.stringify(sub.data));
+  assert.equal(sub.data.timed_out, false);
+  assert.equal(sub.data.report.strategy_execution, null);
+  assert.equal(sub.data.report.overall.total, 3);
+  assert.equal(sub.data.report.overall.correct, 3);
+
+  const after = await req(base, 'GET', `/mock-exams/${id}/report`);
+  assert.equal(after.status, 200, JSON.stringify(after.data));
+  assert.equal(after.data.report.overall.total, 3);
+});
+
+test('POST /mock-exams/:id/submit：重复提交 -> 409 already_submitted', async (t) => {
+  const base = await startMockServer(t);
+  const created = await createMock(base);
+  const id = created.data.mock_exam.id;
+  const answers = created.data.questions.map((q) => ({ question_id: q.id, answer_text: 'A' }));
+
+  const first = await req(base, 'POST', `/mock-exams/${id}/submit`, {
+    version: created.data.mock_exam.version,
+    answers,
+  });
+  assert.equal(first.status, 200, JSON.stringify(first.data));
+
+  const second = await req(base, 'POST', `/mock-exams/${id}/submit`, {
+    version: first.data.mock_exam.version,
+    answers,
+  });
+  assert.equal(second.status, 409, JSON.stringify(second.data));
+  assert.equal(second.data.error, 'already_submitted');
+});
+
+test('POST /mock-exams/:id/submit：超时收卷，未答计错', async (t) => {
+  const base = await startMockServer(t);
+  const created = await createMock(base, { duration_limit_ms: 60_000 });
+  const id = created.data.mock_exam.id;
+
+  // 只答一题，且 submitted_at 推到限时 + 60s 宽限之后
+  const late = new Date(Date.now() + 60_000 + 61_000).toISOString();
+  const sub = await req(base, 'POST', `/mock-exams/${id}/submit`, {
+    version: created.data.mock_exam.version,
+    submitted_at: late,
+    answers: [{ question_id: created.data.questions[0].id, answer_text: 'A', duration_ms: 1000 }],
+  });
+  assert.equal(sub.status, 200, JSON.stringify(sub.data));
+  assert.equal(sub.data.timed_out, true);
+  assert.equal(sub.data.report.overall.total, 3);
+  assert.equal(sub.data.report.overall.correct, 1);
+});
+
+test('GET /exam-profiles/:id/mock-exams：列表与 mode 过滤', async (t) => {
+  const base = await startMockServer(t);
+  await createMock(base, { mode: 'full' });
+  await createMock(base, { mode: 'module', knowledge_node_id: 'kn-1', subject_id: undefined });
+
+  const all = await req(base, 'GET', '/exam-profiles/ep-1/mock-exams');
+  assert.equal(all.status, 200, JSON.stringify(all.data));
+  assert.equal(all.data.total, 2);
+
+  const onlyModule = await req(base, 'GET', '/exam-profiles/ep-1/mock-exams?mode=module');
+  assert.equal(onlyModule.data.total, 1);
+  assert.equal(onlyModule.data.items[0].mode, 'module');
+});
+
+test('DELETE /mock-exams/:id：需 base_version，软删后 404', async (t) => {
+  const base = await startMockServer(t);
+  const created = await createMock(base);
+  const id = created.data.mock_exam.id;
+
+  const noVer = await req(base, 'DELETE', `/mock-exams/${id}`);
+  assert.equal(noVer.status, 400, JSON.stringify(noVer.data));
+  assert.equal(noVer.data.error, 'INVALID_BASE_VERSION');
+
+  const ok = await req(base, 'DELETE', `/mock-exams/${id}`, { version: created.data.mock_exam.version });
+  assert.equal(ok.status, 200, JSON.stringify(ok.data));
+
+  const gone = await req(base, 'GET', `/mock-exams/${id}`);
+  assert.equal(gone.status, 404, JSON.stringify(gone.data));
 });

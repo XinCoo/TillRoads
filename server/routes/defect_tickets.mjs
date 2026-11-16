@@ -287,26 +287,10 @@ async function listTicketsForStats(ctx) {
 }
 
 // ---------------------------------------------------------------------------
-// 模考报告 / 复盘（读 PG 缺陷单；AI 任务仍走内存）
 // ---------------------------------------------------------------------------
-async function mockExamReport(ctx, id) {
-  const tickets = await listTicketsForStats(ctx);
-  const links = tickets.slice(0, 5).map((t) => ({
-    defect_ticket_id: t.id,
-    knowledge_node_id: t.knowledge_node_id,
-    status: t.status,
-  }));
-  return ok({
-    mock_exam_id: id,
-    total_score: 78.5,
-    by_knowledge_node: [
-      { knowledge_node_id: 'kn-1', title: '函数与导数', accuracy: 0.82, avg_duration_ms: 45000 },
-      { knowledge_node_id: 'kn-2', title: '立体几何', accuracy: 0.65, avg_duration_ms: 62000 },
-    ],
-    defect_links: links,
-    stability_index: 0.87,
-  });
-}
+// 复盘（读 PG 缺陷单；AI 任务仍走内存）
+// 模考报告已移到 server/routes/mock_exams.mjs（BE-05）：原来的假数据端点已删除
+// ---------------------------------------------------------------------------
 
 async function reviewCycles(ctx) {
   const tickets = await listTicketsForStats(ctx);
@@ -363,10 +347,6 @@ export function match(method, seg, ctx) {
     return listTicketsByUser(ctx, seg[1]);
   }
 
-  // GET /mock-exams/:id/report
-  if (method === 'GET' && seg.length === 3 && seg[0] === 'mock-exams' && seg[2] === 'report') {
-    return mockExamReport(ctx, seg[1]);
-  }
 
   // GET /review-cycles?type=weekly
   if (method === 'GET' && seg.length === 1 && seg[0] === 'review-cycles') {

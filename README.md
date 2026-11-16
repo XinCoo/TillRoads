@@ -1,4 +1,4 @@
-# 题路 TillRoad
+﻿# 题路 TillRoad
 
 > 一款「不追刷题量、追缺陷闭环」的成人考试备考管理 App。
 > 核心闭环：**目标配置 → 能力层级 → 缺陷单 → 三次验证关闭 → 周期复盘**。
@@ -39,6 +39,11 @@ TillRoads/
 ├── server/                    # HTTP API 骨架 + PG 仓储
 │   ├── index.mjs              #   启动 + pool/state 注入 + 交给 dispatch()（已瘦身至 ~150 行）
 │   ├── index.test.mjs         #   30 个 fake 层用例（路由分发 / 入参 / base_version / 409，不连 PG）
+│   ├── verify_window.mjs       #   BE-04 窗口常量 + computeUrgency（纯函数，零依赖）
+│   ├── verify_window.test.mjs  #   13 个用例（urgency 三态边界）
+│   ├── _fake_repos.mjs         #   内存 fake 仓储（供 fake 层测试注入，不 import pg）
+│   ├── mock_report.mjs         #   BE-05 报告纯函数 reportGenerator（零依赖，可单测）
+│   ├── mock_report.test.mjs    #   22 个用例（四项计算 + cv + v3_candidates + 边界）
 │   ├── index.integration.test.mjs  # 11 条路由层 PG 集成（AC-KM-01/02 + 级联软删，仅 CI 跑）
 │   ├── routes/
 │   │   ├── _http.mjs          #   ok/fail/assertValid/readBaseVersion/httpError/readBody/pagination
@@ -47,8 +52,10 @@ TillRoads/
 │   │   ├── subjects.mjs       #   科目 + AC-KM-02 层级副本事务
 │   │   ├── knowledge_nodes.mjs#   考点树（含扁平/嵌套两种 GET）
 │   │   ├── capability_layers.mjs # 层级模板 + customizable gate
-│   │   ├── defect_tickets.mjs #   缺陷单/模考/复盘/AI（暂为内存实现，BE-03 重写）
-│   │   └── questions_import.mjs   # POST /questions/import（BE-02 导入端点，JSON+base64）
+│   │   ├── defect_tickets.mjs #   缺陷单状态机全链（BE-03：PG 仓储 + begin-verification 两跳）
+│   │   ├── questions_import.mjs   # POST /questions/import（BE-02 导入端点，JSON+base64）
+│   │   ├── mock_exams.mjs      #   BE-05 组卷 / 提交收卷 / 报告 / 列表（5 个端点）
+│   │   └── verification_tasks.mjs  # BE-04：验证任务列表 + 看板聚合（纯 GET，不写库）
 
 │   ├── db/
 │   │   ├── pool.mjs           #   createPool() + 7 个 OID 类型解析器（numeric→number 等）
@@ -65,6 +72,11 @@ TillRoads/
 │   │   ├── capability_layers.mjs # 能力层级模板 + customizable gate
 │   │   ├── questions.mjs      #   题库 CRUD + content_hash 查重（BE-02）
 │   │   ├── assets.mjs         #   多态资产附件（owner_type/owner_id，不走乐观锁）
+│   │   ├── defect_tickets.mjs    #   缺陷单 CRUD + 状态机 + 验证任务查询（BE-04）
+│   │   ├── actions.mjs           #   处理动作（markDone / assertAllDone）
+│   │   ├── verifications.mjs     #   三次验证记录（按 stage+round 唯一）
+│   │   ├── mock_exams.mjs      #   BE-05 组卷 / 提交收卷 / 报告 / 列表
+│   │   ├── attempts.mjs        #   BE-05 作答记录（is_correct 三态保留）
 │   │   └── repositories.integration.test.mjs # 29 条 PG 集成测试
 │   └── import/                # BE-02 导入管线（抽取→切题→去重→入库）
 │       ├── splitter.mjs       #   规则切题（四类分隔符，纯函数零依赖）
@@ -278,13 +290,20 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 | `PATCH /defect-tickets/:id/reanalyze` | REOPENED→ANALYZED，DB 触发器 `verification_round+1`（`base_version` 必填） |
 | `PATCH /defect-tickets/:id` | 通用字段更新（priority/q_type 等；`base_version` 必填；不接受 status） |
 | `DELETE /defect-tickets/:id` | 软删（`base_version` 必填） |
-| `GET /mock-exams/:id/report` | 模考报告（BE-03 起读 PG） |
+| `POST /mock-exams` | **BE-05** 组卷建模考（`{exam_profile_id, mode:'module'\|'full', subject_id?, knowledge_node_id?, question_count, duration_limit_ms?}`）→ `201 {mock_exam, questions, question_count}`；题量不足 → `400 INSUFFICIENT_QUESTIONS`（body 带 `available`/`requested`）；**响应不含 `answer`/`analysis`**（提交前不泄题） |
+| `GET /mock-exams/:id` | 取单个模考（含 `questions` jsonb 与 `report`） |
+| `POST /mock-exams/:id/submit` | **BE-05** 提交收卷（`base_version` 必填）→ `200 {mock_exam, report, timed_out, elapsed_ms}`；同事务写 attempts + 回填 `questions[].attempt_id` + 生成 `report`；重复提交 → `409 already_submitted` |
+| `GET /mock-exams/:id/report` | 读已生成报告；未提交 → `404 not_submitted` |
+| `GET /exam-profiles/:id/mock-exams` | 某目标下模考列表（`mode` 过滤 + 分页，最新在前） |
+| `DELETE /mock-exams/:id` | 软删模考（`base_version` 必填） |
 | `GET /review-cycles?type=weekly` | 周期复盘（BE-03 起读 PG） |
+| `GET /users/:userId/verification-tasks` | **BE-04** 验证任务列表（只出 `V1/V2/V3`；可按 `status` / `urgency` 过滤，分页；每行带回 `entered_at` / `window_days` / `days_left` / `urgency`） |
+| `GET /users/:userId/verification-summary` | **BE-04** 验证看板聚合（各 stage 数量 + 逾期/临期/正常计数） |
 | `POST /ai/questions:generate` | BYOK 生成题（count 1–20 校验） |
 | 乐观锁 | 版本冲突 → `409` |
 > 契约收敛（详见 REVIEW-NOTES.md §4 附带修正）：`analyze` 规范方法为 `POST`（`PATCH` 为兼容别名），缺归因错误码统一为 `missing_error_layer_or_cause`（废弃自造的 `missing_analysis`），`POST /verifications` 为规范路径、嵌套路径为等价别名。
 > BE-03 完成：缺陷单 / actions / verifications 全部迁到 `server/repositories/` + 真 PG。四表 + 三张缺陷单相关表都已走仓储层；**仅 AI 生成任务仍在内存**（BE-08 同步服务时再迁）。
-
+> BE-04 是**纯查询层**：两个 `GET` 端点，不写 `UPDATE`/`INSERT`/`DELETE`，也不做状态迁移（状态机归 BE-03）。
 ### 缺陷单状态机与 round 机制（BE-03）
 
 状态迁移图（每步均经 `core/index.mjs` 纯函数前置校验 → 400 可读码；DB 触发器 `check_defect_transition` 兜底 → 防绕过）：
@@ -303,6 +322,128 @@ DRAFT ──analyze(补全归因)──▶ ANALYZED ──begin-verification─�
 - **进入验证必须手动**：`PATCH /:id/begin-verification` 要求至少一条 action 且全 done，同事务两跳 `ANALYZED→ACTION_DONE→V1`（直接跳 V1 会被 DB 触发器拒绝）。
 - **`verification_round` 机制**：`REOPENED→ANALYZED` 时由 DB 触发器 `+1`；`verifications` 唯一索引为 `(defect_ticket_id, stage, round)`，故新 round 可重新提交 V1/V2/V3，**历史验证记录全部保留**。应用层只读取 `verification_round` 当 round 值，绝不写回（派生列由触发器维护）。
 - **base_version 强制**：所有 PATCH/DELETE 与 `POST /verifications` 必填 `version`；冲突 → `409 client_merge`（当前行 + incoming）。
+### 验证任务列表与临期提醒（BE-04）
+
+纯查询层：只读、不写状态。两个端点都按 `user_id` 隔离。
+
+**窗口值**（`server/verify_window.mjs` 的 `VERIFY_WINDOWS`，**不硬编码在 SQL**）：
+
+| stage | 窗口 | 取值依据 |
+|---|---|---|
+| `V1` | 7 天 | 开发文档「3–7 天」取上限 |
+| `V2` | 14 天 | 开发文档「1–2 周」取上限 |
+| `V3` | 21 天 | 限时模考给更宽松的观察期 |
+
+**urgency 三态**（`computeUrgency(enteredAt, windowDays, now)`）：
+
+| 值 | 条件 | 含义 |
+|---|---|---|
+| `overdue` | `daysLeft <= 0` | 已逾期（`daysLeft = 0` 即今天到期，也算逾期） |
+| `due_soon` | `1 <= daysLeft <= 3` | 临期，3 天内要做 |
+| `normal` | `daysLeft > 3` | 正常 |
+
+计算口径：`elapsedDays = floor((now - enteredAt) / 1天)`、`daysLeft = windowDays - elapsedDays`、`overdueDays = max(0, -daysLeft)`。**不足一天向下取整**，避免刚进入不到 24 小时就被算成「已过 1 天」。
+
+#### `GET /users/:userId/verification-tasks`
+
+Query：`status`（逗号分隔 `V1,V2,V3`，非法 → `400 INVALID_STAGE`）、`urgency`（逗号分隔 `overdue,due_soon,normal`，非法 → `400 INVALID_URGENCY`）、`limit`、`offset`。
+
+数据源：`defect_tickets.status IN ('V1','V2','V3') AND deleted_at IS NULL`。**不查 `REOPENED`**（那需要重新归因，不属于待验证）、**不查 `ACTION_DONE`**（还没进验证窗口）。
+
+响应：
+
+```json
+{
+  "items": [
+    {
+      "id": "...", "stage": "V2",
+      "entered_at": "2026-11-11T02:00:00.000Z",
+      "window_days": 14, "days_left": 9, "overdue_days": 0, "elapsed_days": 5,
+      "due_at": "2026-11-25T02:00:00.000Z",
+      "urgency": "normal",
+      "verification_round": 1, "reopen_count": 0,
+      "knowledge_node_id": "...", "knowledge_node_title": "极限与连续",
+      "knowledge_node_freq_tag": "high",
+      "subject_id": "...", "subject_name": "数学一"
+    }
+  ],
+  "total": 1, "limit": 50, "offset": 0
+}
+```
+
+`total` 是 **urgency 过滤后的总数**（因为 urgency 在应用层算，无法下推到 SQL 计数），不随 `limit/offset` 变化。排序：`entered_at ASC, id ASC`（越早进入越靠前）。
+
+#### `GET /users/:userId/verification-summary`
+
+```json
+{
+  "total": 7,
+  "by_stage":   { "V1": 3, "V2": 2, "V3": 2 },
+  "by_urgency": { "overdue": 1, "due_soon": 2, "normal": 4 },
+  "overdue": 1, "due_soon": 2, "normal": 4
+}
+```
+
+实现上**直接复用 `listVerificationTasks` 再内存聚合**，保证两个端点的数字永不因两份 SQL 漂移而不一致。
+
+#### ⚠️ 「进入当前阶段的时间」是混合取法
+
+`schema.sql` **没有** `v1_started_at` / `status_changed_at` 之类字段（已冻结，本轮不改）。取法如下：
+
+| stage | `entered_at` 来源 | 精确度 |
+|---|---|---|
+| `V2` | 本 round 内 **V1 `pass` 记录的 `created_at`** | 精确 |
+| `V3` | 本 round 内 **V2 `pass` 记录的 `created_at`** | 精确 |
+| `V1` | `defect_tickets.updated_at`（退化） | **近似** |
+
+V1 为什么只能近似：`begin-verification` 只把 `status` 写成 `V1`，**不落 `verifications` 行**（验证记录是提交结果时才写的），所以没有「刚进入 V1」的时间戳可查。
+
+**语义偏差**：`updated_at` 会被 `set_updated()` 在任何 `UPDATE` 时刷新，包括与状态无关的 `patch`（改 priority / 改归因等）。结果是 V1 的 `entered_at` **往后漂移 → 已过天数少算 → 晚报而非误报逾期**。方向上是刻意选的安全侧（宁可晚提醒，不能冤枉用户）。影响面：仅 V1 阶段；BE-06 复盘统计若要算「V1 待了多久」，同样只有这个近似值，需在统计口径里注明。
+
+### 限时模考与报告（BE-05）
+
+生命周期只有**两态**：创建即 `in_progress`（组卷完成、计时开始），提交即生成报告。没有「created→in_progress→submitted→analyzed」四态，也没有后台任务——报告同步算出。
+
+**组卷抽题**（`server/repositories/mock_exams.mjs`）：
+
+```sql
+-- 1) 先探可用量（不足则 400 INSUFFICIENT_QUESTIONS，body 带 available/requested）
+SELECT count(*)::int AS available FROM questions
+ WHERE deleted_at IS NULL AND subject_id = $1;
+
+-- 2) 真抽题：随机 + 只取公开列（不含 answer/analysis）
+SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_subjective, tags
+  FROM questions
+ WHERE deleted_at IS NULL AND subject_id = $1
+ ORDER BY random() LIMIT $2;
+```
+
+不复用 `questions.listBySubject/listByKnowledgeNode`：它们按 `created_at` 排序（不随机）且 `limit` 封顶 200。
+
+**报告字段**（`server/mock_report.mjs` 的 `reportGenerator`，纯函数零依赖）：
+
+| 字段 | 内容 | 说明 |
+|---|---|---|
+| `module_accuracy` | `{[knowledge_node_id]: {title, correct, total, accuracy, ungraded}}` | 按考点直接分组（MVP 不引入「模块」新概念）；无考点的题归 `__ungrouped__`；`accuracy` 分母只算已判分 |
+| `avg_duration_ms` | `{overall, by_knowledge_node:{[id]:{title, count, avg_duration_ms}}}` | 四舍五入到毫秒 |
+| `stability` | 近 3 次同 mode + 同 profile 模考总正确率的**变异系数**（总体口径，除以 n） | 首次模考返回 `null`；<2 个有效样本也 `null` |
+| `defect_repeat_rate` | `{repeat_count, total_wrong, rate}` | 只统计**错题**中 `question_id` 命中 `CLOSED` 缺陷单的；分母 0 时 `rate=0`（非 NaN） |
+| `strategy_execution` | **恒 `null`** | 跳过的理由见 REVIEW-NOTES §20 |
+| `v3_candidates` | `[{defect_ticket_id, question_id, knowledge_node_id}]` | 错题的考点命中该用户 `status='V3'` 缺陷单 |
+| `overall` | `{correct, total, accuracy, ungraded}` | `total` 含未判分；`accuracy` 只按已判分算 |
+
+**判分口径**：主观题（`is_subjective=true` 或 `type` 为 `essay`/`short_answer`）与非空标准答案缺失 → `is_correct=null`（**未判分，不进准确率分母**）；有标准答案但用户未作答 → `false`（计错）。归一比较 = `NFKC` + 去空白/全半角标点 + `toUpperCase`，与 `normalizeQuestionText()` 同口径。
+
+**超时收卷**（拍板项 1）：创建时记 `duration_limit_ms`，计时在前端；提交时后端算 `elapsedMs = submitted_at - created_at`，`elapsedMs > duration_limit_ms + 60_000`（60s 宽限）即判 `timed_out=true`，**未作答题一律计错**，并按已作答部分出报告。
+
+**V3 绑定流程**（BE-05 不直接触发状态迁移）：
+
+1. 模考提交 → 报告里出现 `v3_candidates`（每项含 `defect_ticket_id`）；
+2. 前端展示引导：「这道错题对应的缺陷单正在 V3 验证」；
+3. 用户点确认 → 走 **BE-03 已有**的 `POST /defect-tickets/:id/verifications`（`verify_type='timed_mock'`，`base_version` 必填）；
+4. 状态迁移由 BE-03 状态机负责，BE-05 只负责「指出该做哪道」。
+
+**事务边界**：`POST /mock-exams/:id/submit` **整段 `withTransaction`**——写 attempts 多行 + 回填 `mock_exams.questions[].attempt_id` + 写 `report` jsonb，全成或全败。组卷 `POST /mock-exams` 也是单事务（查量 + 抽题 + 插行）。
 
 ### 题目导入（BE-02：`POST /questions/import`）
 
@@ -373,7 +514,9 @@ DRAFT ──analyze(补全归因)──▶ ANALYZED ──begin-verification─�
 - ✅ **BE-01 第 4 步**：路由层拆分为 `server/routes/`（四表端点全部接 PG、AC-KM-01 模板预置事务、AC-KM-02 层级副本事务、级联软删事务、`base_version` 强制）+ `core/templates.mjs` 模板数据 + 测试改造成 fake 层 32 条 / PG 集成层 11 条
 - ✅ **BE-02**：题目导入管线（`server/import/` 四阶段 + `POST /questions/import`）+ `questions`/`assets` 仓储（`content_hash` 查重）+ 3 份切题样本与 `pdfjs-dist` 依赖（8 条切题单测 + 7 条导入集成）
 - ✅ **BE-03**：缺陷单完整状态机迁 PG（DRAFT→ANALYZED→ACTION_DONE→V1→V2→V3→CLOSED/REOPENED + `verification_round` + 应用层/DB 触发器双层防线）+ `defect_tickets`/`actions`/`verifications` 三仓储 + `begin-verification` 手动门禁 + fake 层改造；13 条真 PG 集成测试留在 CI
-- ⏳ BE-04（验证任务列表 + 临期提醒，不做状态迁移）/ BE-05 模考绑定 → FE-09 / BE-08 → FE-11 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
+- ✅ **BE-04**：验证任务列表 + 临期提醒（**纯查询层**）：`server/verify_window.mjs` 窗口常量与 `computeUrgency` 纯函数（13 条单测）+ `listVerificationTasks` / `verificationSummary` 两仓储查询 + 2 个 GET 端点（fake 层 11 条、真 PG 集成 19 条）；进入时间采用 V2/V3 精确 + V1 近似（`updated_at`）混合取法
+- ✅ **BE-05**：限时模考 + 报告生成（两态生命周期）：`server/mock_report.mjs` 四项报告纯函数（22 条单测）+ `mock_exams`/`attempts` 两仓储（随机组卷 + 同事务收卷）+ 5 个端点（组卷/详情/提交/报告/列表/软删）；`v3_candidates` 只指路不当迁移，`strategy_execution` 返回 `null`
+- ⏳ BE-06 复盘统计 / 缺陷分布看板 → FE-09 / BE-08 → FE-11 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
 
 ---

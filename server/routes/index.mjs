@@ -22,8 +22,10 @@ import * as examProfiles from './exam_profiles.mjs';
 import * as knowledgeNodes from './knowledge_nodes.mjs';
 import * as subjects from './subjects.mjs';
 import * as capabilityLayers from './capability_layers.mjs';
+import * as mockExams from './mock_exams.mjs';
 import * as defectTickets from './defect_tickets.mjs';
 import * as questionsImport from './questions_import.mjs';
+import * as verificationTasks from './verification_tasks.mjs';
 
 /**
  * 挂载顺序即匹配优先级。长路径模块在前，短路径在后。
@@ -34,8 +36,15 @@ export const ROUTE_MODULES = Object.freeze([
   { name: 'knowledge_nodes', match: knowledgeNodes.match },
   { name: 'subjects', match: subjects.match },
   { name: 'capability_layers', match: capabilityLayers.match },
+  // BE-05：模考端点。必须排在 defect_tickets 之前 ——
+  // BE-03 遗留的 GET /mock-exams/:id/report 假数据端点已从 defect_tickets 删除，
+  // 但保留顺序约束可避免将来回退时被旧分支截胡。
+  { name: 'mock_exams', match: mockExams.match },
   { name: 'defect_tickets', match: defectTickets.match },
   { name: 'questions_import', match: questionsImport.match },
+  // BE-04：纯查询端点（GET /users/:id/verification-tasks|verification-summary）。
+  // 放最后是因为它只认 seg.length===3 且 seg[2] 是固定字面量，不会遮蔽任何已有路径。
+  { name: 'verification_tasks', match: verificationTasks.match },
 ]);
 
 /**
@@ -47,8 +56,12 @@ export const ROUTE_MODULES = Object.freeze([
  * @returns {{status:number, body:any}|null}  未命中原样返回 null
  *
  * 返回值可能是 Promise（接了 PG 的模块都是 async）；调用方统一 await。
+ *
+ * ★ 必须逐个 await：match() 可以是 async（BE-05 的 mock_exams 就是）。
+ *   如果在循环里直接 `if (out !== null) return out`，async 模块返回的 Promise
+ *   永远是真值，会把后面所有模块静默遮蔽 —— 整个缺陷单路由变成 404。
  */
-export function dispatch(method, seg, ctx) {
+export async function dispatch(method, seg, ctx) {
   // 健康检查放在最前：它不依赖任何模块，也不该被将来的路径前缀意外遮蔽。
   // 与 BE-00 的 Schema CI 无关，纯粹是「进程活着」的探针。
   if (method === 'GET' && seg.length === 1 && seg[0] === 'health') {
@@ -56,7 +69,7 @@ export function dispatch(method, seg, ctx) {
   }
 
   for (const mod of ROUTE_MODULES) {
-    const out = mod.match(method, seg, ctx);
+    const out = await mod.match(method, seg, ctx);
     if (out !== null && out !== undefined) return out;
   }
   return null;

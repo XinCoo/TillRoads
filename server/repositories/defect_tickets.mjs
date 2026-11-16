@@ -23,11 +23,13 @@ import {
   insertRow,
   listRows,
   pageParams,
+  queryMany,
   requireRow,
   selectRow,
   toJsonbParam,
   updateWithVersion,
 } from './_common.mjs';
+import { computeUrgency, isVerifyStage, windowDaysFor } from '../verify_window.mjs';
 import * as actions from './actions.mjs';
 import * as verifications from './verifications.mjs';
 
@@ -129,6 +131,164 @@ export async function listByUser(client, userId, opts = {}) {
 /** 全表列表（供模考报告 / 复盘统计这类跨用户聚合端点使用）。 */
 export async function listAll(client, opts = {}) {
   return listRows(client, TABLE, [], [], opts);
+}
+
+/**
+ * 进入当前验证状态的时间（BE-04 核心难点，schema 无专用列）。
+ *
+ * schema.sql 的 defect_tickets **没有** v1/v2/v3_started_at，也没有通用 status_changed_at，
+ * 只有 created_at / closed_at / updated_at。因此分而治之：
+ *
+ *   · **V2 可精确推断**：进入 V2 的时刻就是「本 round 内 V1 pass」那一刻，verifications
+ *     有该行的 stage/round/created_at（V1 → V2 迁移与写 V1 记录在同一事务，见 submitVerification）。
+ *   · **V3 可精确推断**：同理，V2 pass 那条记录。
+ *   · **V1 不能精确推断**：begin-verification 只写 status，不落任何 verifications 行，
+ *     所以 V1 只能用 updated_at 近似。
+ *
+ * 近似语义偏差（必须写进文档）：updated_at 被 set_updated() 在**任何** UPDATE 时刷新，
+ * 包括非状态变更的 patch（改 q_type/priority 等）。因此某个 V1 单子如果被 patch 过，
+ * 它的「已过天数」会被**少算**（进入时间看起来更晚），可能导致应逾期显示为临期。
+ * 方向是「宁可晚报，不误报逾期」，对学习提醒场景是可接受的退化。
+ *
+ * SQL 取法：一次 LEFT JOIN LATERAL 拿「上一 stage 在当前 round 的 pass 时间」，
+ * 避免 N+1（列表 50 条时逐条查会变 51 次往返）。
+ */
+const ENTERED_AT_SQL = `
+  COALESCE(
+    CASE dt.status
+      WHEN 'V2' THEN prev.created_at
+      WHEN 'V3' THEN prev.created_at
+    END,
+    dt.updated_at
+  ) AS entered_at
+`;
+
+/**
+ * 「上一 stage pass 时间」的 LATERAL 子查询。
+ * - status='V2' 时上一 stage 是 V1；status='V3' 时是 V2。
+ * - 限定 round = dt.verification_round：重开后旧 round 的历史记录不能当成本轮的进入时间。
+ * - result='pass' 才算迁移发生过（fail 走的是 →REOPENED，不会进 V2/V3）。
+ * - 软删的行不参与。
+ */
+const PREV_STAGE_LATERAL = `
+  LEFT JOIN LATERAL (
+    SELECT v.created_at
+    FROM verifications v
+    WHERE v.defect_ticket_id = dt.id
+      AND v.round = dt.verification_round
+      AND v.deleted_at IS NULL
+      AND v.result = 'pass'
+      AND v.stage = CASE dt.status WHEN 'V2' THEN 'V1'::verify_stage WHEN 'V3' THEN 'V2'::verify_stage END
+    ORDER BY v.created_at DESC, v.id DESC
+    LIMIT 1
+  ) prev ON true
+`;
+
+/**
+ * 验证任务列表（拍板项 1：只查 status IN (V1,V2,V3) 且未软删；不含 REOPENED / ACTION_DONE）。
+ *
+ * @param {object} client pg client / pool（鸭子类型，只需 query）
+ * @param {string} userId 必填
+ * @param {{stages?: string[], urgency?: string[], limit?: number, offset?: number}} opts
+ * @returns {Promise<{items: object[], total: number, limit: number, offset: number}>}
+ */
+export async function listVerificationTasks(client, userId, opts = {}) {
+  if (!userId) throw new TypeError('defect_tickets.listVerificationTasks: userId 必填');
+
+  // stage 过滤：默认全部三态；给了就必须是合法 stage。
+  const stages = Array.isArray(opts.stages) && opts.stages.length > 0 ? opts.stages : C.VERIFY_STAGES.slice();
+  for (const s of stages) {
+    if (!isVerifyStage(s)) throw new TypeError(`defect_tickets.listVerificationTasks: 非法 stage ${String(s)}`);
+  }
+  const urgencies = Array.isArray(opts.urgency) && opts.urgency.length > 0 ? opts.urgency : null;
+
+  const params = [userId, stages];
+  const where = [
+    'dt.user_id = $1',
+    'dt.deleted_at IS NULL',
+    // 拍板项 1：只看正在验证中的三态。
+    `dt.status::text = ANY($2::text[])`,
+  ];
+
+  // JOIN 展示信息：考点（knowledge_nodes）与科目（subjects）都可能为空，用 LEFT JOIN。
+  const fromSql = `
+    FROM defect_tickets dt
+    LEFT JOIN knowledge_nodes kn ON kn.id = dt.knowledge_node_id AND kn.deleted_at IS NULL
+    LEFT JOIN subjects sub ON sub.id = kn.subject_id AND sub.deleted_at IS NULL
+    ${PREV_STAGE_LATERAL}
+  `;
+
+  const selectSql = `
+    SELECT
+      dt.id, dt.user_id, dt.exam_profile_id, dt.knowledge_node_id, dt.question_id,
+      dt.q_type, dt.priority, dt.status::text AS stage,
+      dt.verification_round, dt.reopen_count,
+      dt.created_at, dt.updated_at, dt.version,
+      kn.title AS knowledge_node_title,
+      kn.freq_tag AS knowledge_node_freq_tag,
+      sub.id AS subject_id, sub.name AS subject_name,
+      ${ENTERED_AT_SQL}
+    ${fromSql}
+    WHERE ${where.join(' AND ')}
+    ORDER BY entered_at ASC, dt.id ASC
+  `;
+
+  // 注意：不单独查 count()。因为 urgency 过滤发生在 JS（窗口值不进 SQL），
+  // 过滤后的 total 只能在全量行上算，否则 total 与 items 会对不上。
+  const allRows = await queryMany(client, selectSql, params);
+  const now = opts.now ?? new Date();
+
+  // urgency 在 JS 里算（拍板项：窗口值不进 SQL），所以必须先算完再过滤、再分页。
+  const enriched = allRows.map((row) => {
+    const windowDays = windowDaysFor(row.stage);
+    const u = computeUrgency(row.entered_at, windowDays, now);
+    return {
+      ...row,
+      entered_at: u.enteredAt,
+      window_days: u.windowDays,
+      days_left: u.daysLeft,
+      overdue_days: u.overdueDays,
+      elapsed_days: u.elapsedDays,
+      due_at: u.dueAt,
+      urgency: u.urgency,
+    };
+  });
+
+  const filtered = urgencies ? enriched.filter((r) => urgencies.includes(r.urgency)) : enriched;
+  const { limit, offset } = pageParams(opts);
+  const items = filtered.slice(offset, offset + limit);
+
+  return { items, total: filtered.length, limit, offset };
+}
+
+/**
+ * 验证看板聚合（拍板项 4 第二个端点）。
+ *
+ * 与 listVerificationTasks 同源，因此直接复用它（stages 全量、urgency 不过滤）再在内存聚合，
+ * 保证两个端点的数字**永远不会因为两份 SQL 漂移而不一致**。
+ * 规模上：一个用户的验证中缺陷单是十数量级，全量取回再聚合是合理的。
+ *
+ * @returns {Promise<{total:number, by_stage:object, by_urgency:object, overdue:number, due_soon:number, normal:number}>}
+ */
+export async function verificationSummary(client, userId, opts = {}) {
+  if (!userId) throw new TypeError('defect_tickets.verificationSummary: userId 必填');
+  const { items } = await listVerificationTasks(client, userId, { now: opts.now, limit: 200, offset: 0 });
+
+  const by_stage = { V1: 0, V2: 0, V3: 0 };
+  const by_urgency = { overdue: 0, due_soon: 0, normal: 0 };
+  for (const row of items) {
+    if (Object.prototype.hasOwnProperty.call(by_stage, row.stage)) by_stage[row.stage] += 1;
+    if (Object.prototype.hasOwnProperty.call(by_urgency, row.urgency)) by_urgency[row.urgency] += 1;
+  }
+
+  return {
+    total: items.length,
+    by_stage,
+    by_urgency,
+    overdue: by_urgency.overdue,
+    due_soon: by_urgency.due_soon,
+    normal: by_urgency.normal,
+  };
 }
 
 /**

@@ -12,6 +12,8 @@
 // 注入方式：createApp({ repos: createFakeRepos() })。
 
 import * as C from '../core/index.mjs';
+import { computeUrgency, isVerifyStage, windowDaysFor } from './verify_window.mjs';
+import { reportGenerator } from './mock_report.mjs';
 
 function appError(code, message, extra = {}) {
   return Object.assign(new Error(message || code), { code, ...extra });
@@ -330,7 +332,345 @@ export function createFakeRepos() {
     async actionList(_client, id, opts = {}) {
       return actions.listByDefect(null, id, opts);
     },
+
+    /**
+     * BE-04：验证任务列表（fake 复刻真仓储的语义，含进入时间取法与 urgency 计算）。
+     *
+     * 进入时间与真库同规则：
+     *   · V2 → 本 round 内 V1 pass 的 created_at
+     *   · V3 → 本 round 内 V2 pass 的 created_at
+     *   · V1 → updated_at（近似）
+     * 这样 fake 层与真库对同一条数据给出一致的 entered_at，测试才有意义。
+     */
+    async listVerificationTasks(_client, userId, opts = {}) {
+      if (!userId) throw new TypeError('defect_tickets.listVerificationTasks: userId 必填');
+      const stages = Array.isArray(opts.stages) && opts.stages.length > 0 ? opts.stages : C.VERIFY_STAGES.slice();
+      for (const s of stages) {
+        if (!isVerifyStage(s)) throw new TypeError(`非法 stage ${String(s)}`);
+      }
+      const urgencies = Array.isArray(opts.urgency) && opts.urgency.length > 0 ? opts.urgency : null;
+
+      const rows = [...tickets.values()]
+        .filter((t) => t.user_id === userId && !t.deleted_at && stages.includes(t.status));
+
+      const now = opts.now ?? new Date();
+      const enriched = rows.map((t) => {
+        const prevStage = t.status === 'V2' ? 'V1' : t.status === 'V3' ? 'V2' : null;
+        let enteredAt = t.updated_at;
+        if (prevStage) {
+          const rec = [...verRows.values()]
+            .filter((v) => v.defect_ticket_id === t.id && v.stage === prevStage &&
+              Number(v.round) === Number(t.verification_round) &&
+              v.result === 'pass' && !v.deleted_at)
+            .sort((a, b) => String(b.created_at).localeCompare(String(a.created_at)))[0];
+          if (rec) enteredAt = rec.created_at;
+        }
+        const u = computeUrgency(enteredAt, windowDaysFor(t.status), now);
+        return {
+          id: t.id,
+          user_id: t.user_id,
+          exam_profile_id: t.exam_profile_id,
+          knowledge_node_id: t.knowledge_node_id,
+          question_id: t.question_id,
+          q_type: t.q_type,
+          priority: t.priority,
+          stage: t.status,
+          verification_round: t.verification_round,
+          reopen_count: t.reopen_count,
+          created_at: t.created_at,
+          updated_at: t.updated_at,
+          version: t.version,
+          knowledge_node_title: null,
+          knowledge_node_freq_tag: null,
+          subject_id: null,
+          subject_name: null,
+          entered_at: u.enteredAt,
+          window_days: u.windowDays,
+          days_left: u.daysLeft,
+          overdue_days: u.overdueDays,
+          elapsed_days: u.elapsedDays,
+          due_at: u.dueAt,
+          urgency: u.urgency,
+        };
+      }).sort((a, b) => String(a.entered_at).localeCompare(String(b.entered_at)) || a.id.localeCompare(b.id));
+
+      const filtered = urgencies ? enriched.filter((r) => urgencies.includes(r.urgency)) : enriched;
+      const limit = Number.isInteger(opts.limit) && opts.limit > 0 ? Math.min(opts.limit, 200) : 50;
+      const offset = Number.isInteger(opts.offset) && opts.offset > 0 ? opts.offset : 0;
+      return { items: filtered.slice(offset, offset + limit), total: filtered.length, limit, offset };
+    },
+
+    /** BE-04：看板聚合（与列表同源，保证数字不漂移）。 */
+    async verificationSummary(_client, userId, opts = {}) {
+      if (!userId) throw new TypeError('defect_tickets.verificationSummary: userId 必填');
+      const { items } = await this.listVerificationTasks(null, userId, { now: opts.now, limit: 200, offset: 0 });
+      const by_stage = { V1: 0, V2: 0, V3: 0 };
+      const by_urgency = { overdue: 0, due_soon: 0, normal: 0 };
+      for (const row of items) {
+        if (Object.prototype.hasOwnProperty.call(by_stage, row.stage)) by_stage[row.stage] += 1;
+        if (Object.prototype.hasOwnProperty.call(by_urgency, row.urgency)) by_urgency[row.urgency] += 1;
+      }
+      return { total: items.length, by_stage, by_urgency, overdue: by_urgency.overdue, due_soon: by_urgency.due_soon, normal: by_urgency.normal };
+    },
   };
 
-  return { client: null, defectTickets, actions, verifications };
+  // -------------------------------------------------------------------------
+  // BE-05：模考 + 作答（内存 fake）
+  // -------------------------------------------------------------------------
+  const mockRows = new Map();
+  const attemptRows = new Map();
+  // 题库 fake：测试用 seedQuestions([...]) 注入，create() 从中抽样。
+  let questionPool = [];
+
+  const questions = {
+    seedRows(rows) {
+      questionPool = rows.map((r) => ({ ...r }));
+      return questionPool.length;
+    },
+    rows() {
+      return questionPool.map((r) => ({ ...r }));
+    },
+  };
+
+  const attempts = {
+    async create(_client, input = {}) {
+      if (!input.question_id) throw new TypeError('attempts.create: question_id 必填');
+      if (!input.user_id) throw new TypeError('attempts.create: user_id 必填');
+      const now = new Date().toISOString();
+      const row = {
+        id: newId('att'),
+        question_id: input.question_id,
+        user_id: input.user_id,
+        is_correct: input.is_correct === true ? true : input.is_correct === false ? false : null,
+        duration_ms: input.duration_ms ?? null,
+        answer_text: input.answer_text ?? null,
+        mock_exam_id: input.mock_exam_id ?? null,
+        created_at: now,
+        updated_at: now,
+        version: 1,
+        deleted_at: null,
+      };
+      attemptRows.set(row.id, row);
+      return { ...row };
+    },
+    async getById(_client, id) {
+      const row = attemptRows.get(id);
+      if (!row || row.deleted_at) throw notFound('attempts', id);
+      return { ...row };
+    },
+    async listByMock(_client, mockExamId, opts = {}) {
+      const rows = [...attemptRows.values()]
+        .filter((r) => r.mock_exam_id === mockExamId && !r.deleted_at)
+        .map((r) => ({ ...r }));
+      const limit = opts.limit ?? 200;
+      const offset = opts.offset ?? 0;
+      return rows.slice(offset, offset + limit);
+    },
+  };
+
+  const mockExams = {
+    async create(_client, input = {}) {
+      if (!input.exam_profile_id) throw new TypeError('mock_exams.create: exam_profile_id 必填');
+      if (input.mode !== 'module' && input.mode !== 'full') {
+        const e = new TypeError('mock_exams.create: 非法 mode');
+        e.code = 'INVALID_MODE';
+        throw e;
+      }
+      const count = Number(input.question_count);
+      if (!Number.isInteger(count) || count < 1 || count > 200) {
+        const e = new TypeError('mock_exams.create: question_count 必须是 1..200 的整数');
+        e.code = 'INVALID_QUESTION_COUNT';
+        throw e;
+      }
+      if (input.mode === 'full' && !input.subject_id) {
+        const e = new TypeError('mock_exams.create: full 模式必须提供 subject_id');
+        e.code = 'MISSING_SUBJECT_ID';
+        throw e;
+      }
+      if (input.mode === 'module' && !input.knowledge_node_id) {
+        const e = new TypeError('mock_exams.create: module 模式必须提供 knowledge_node_id');
+        e.code = 'MISSING_KNOWLEDGE_NODE_ID';
+        throw e;
+      }
+      const scope = input.mode === 'full' ? input.subject_id : input.knowledge_node_id;
+      const field = input.mode === 'full' ? 'subject_id' : 'knowledge_node_id';
+      const available = questionPool.filter((q) => !q.deleted_at && q[field] === scope);
+      if (available.length < count) {
+        const e = new Error('INSUFFICIENT_QUESTIONS');
+        e.code = 'INSUFFICIENT_QUESTIONS';
+        e.statusCode = 400;
+        e.body = { error: 'INSUFFICIENT_QUESTIONS', available: available.length, requested: count };
+        throw e;
+      }
+      const picked = available.slice(0, count);
+      const now = new Date().toISOString();
+      const row = {
+        id: newId('me'),
+        exam_profile_id: input.exam_profile_id,
+        mode: input.mode,
+        duration_limit_ms: input.duration_limit_ms ?? null,
+        questions: picked.map((q) => ({
+          question_id: q.id,
+          attempt_id: null,
+          is_correct: null,
+          duration_ms: null,
+        })),
+        report: null,
+        created_at: now,
+        updated_at: now,
+        version: 1,
+        deleted_at: null,
+      };
+      mockRows.set(row.id, row);
+      return {
+        mock_exam: { ...row },
+        questions: picked.map((q) => {
+          const { answer: _a, analysis: _b, ...rest } = q;
+          return { ...rest };
+        }),
+        available: available.length,
+      };
+    },
+    async getById(_client, id) {
+      const row = mockRows.get(id);
+      if (!row || row.deleted_at) throw notFound('mock_exams', id);
+      return { ...row };
+    },
+    async listByProfile(_client, examProfileId, opts = {}) {
+      let rows = [...mockRows.values()].filter(
+        (r) => r.exam_profile_id === examProfileId && !r.deleted_at,
+      );
+      if (opts.mode) rows = rows.filter((r) => r.mode === opts.mode);
+      if (opts.submittedOnly === true) rows = rows.filter((r) => r.report != null);
+      rows.sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0));
+      const limit = opts.limit ?? 20;
+      const offset = opts.offset ?? 0;
+      return rows.slice(offset, offset + limit).map((r) => ({ ...r }));
+    },
+    async submit(_client, id, input = {}) {
+      const row = mockRows.get(id);
+      if (!row || row.deleted_at) throw notFound('mock_exams', id);
+      if (row.report) {
+        const e = new Error('already_submitted');
+        e.code = 'already_submitted';
+        e.statusCode = 409;
+        e.body = { error: 'already_submitted', mock_exam_id: id };
+        throw e;
+      }
+      const baseVersion = input.baseVersion;
+      if (!Number.isInteger(baseVersion) || baseVersion < 1) {
+        throw new TypeError('mock_exams.submit: baseVersion 必填');
+      }
+      if (Number(baseVersion) !== Number(row.version)) throw conflict(row, baseVersion);
+
+      const answers = Array.isArray(input.answers) ? input.answers : [];
+      const byQ = new Map(answers.filter((a) => a && a.question_id).map((a) => [a.question_id, a]));
+      const byId = new Map(questionPool.map((q) => [q.id, q]));
+
+      const submittedMs = input.submitted_at ? new Date(input.submitted_at).getTime() : Date.now();
+      const startedMs = new Date(row.created_at).getTime();
+      const elapsedMs = submittedMs - startedMs;
+      const timedOut =
+        row.duration_limit_ms != null && elapsedMs > Number(row.duration_limit_ms) + 60000;
+
+      const filled = [];
+      for (const entry of row.questions) {
+        const q = byId.get(entry.question_id) ?? null;
+        const ans = byQ.get(entry.question_id) ?? null;
+        const answered = Boolean(ans && String(ans.answer_text ?? '').trim() !== '');
+        let isCorrect = null;
+        if (q && q.is_subjective !== true && q.type !== 'essay' && q.type !== 'short_answer') {
+          const expected = q.answer == null ? '' : String(q.answer).trim();
+          if (expected !== '') {
+            isCorrect = norm(answered ? ans.answer_text : '') === norm(expected);
+          }
+        }
+        if (timedOut && !answered) isCorrect = false;
+        const att = await attempts.create(null, {
+          question_id: entry.question_id,
+          user_id: input.userId ?? 'u-1',
+          is_correct: isCorrect,
+          duration_ms: Number.isFinite(Number(ans?.duration_ms)) ? Number(ans.duration_ms) : null,
+          answer_text: answered ? String(ans.answer_text) : null,
+          mock_exam_id: id,
+        });
+        filled.push({
+          question_id: entry.question_id,
+          attempt_id: att.id,
+          is_correct: isCorrect,
+          duration_ms: att.duration_ms,
+        });
+      }
+
+      const closedDefects = [...tickets.values()]
+        .filter(
+          (t) => !t.deleted_at && (t.status === 'CLOSED' || t.status === 'V3') && t.question_id,
+        )
+        .map((t) => ({
+          id: t.id,
+          question_id: t.question_id,
+          knowledge_node_id: t.knowledge_node_id,
+          status: t.status,
+        }));
+
+      // 近 3 次同 mode 已提交模考（不含本次）
+      const recentMocks = [...mockRows.values()]
+        .filter(
+          (r) =>
+            r.id !== id &&
+            !r.deleted_at &&
+            r.exam_profile_id === row.exam_profile_id &&
+            r.mode === row.mode &&
+            r.report != null,
+        )
+        .sort((a, b) => (a.created_at < b.created_at ? 1 : a.created_at > b.created_at ? -1 : 0))
+        .slice(0, 3)
+        .map((r) => ({ ...r }));
+
+      const report = reportGenerator({
+        questions: row.questions.map((e) => {
+          const q = byId.get(e.question_id);
+          return {
+            question_id: e.question_id,
+            knowledge_node_id: q?.knowledge_node_id ?? null,
+            title: q?.knowledge_node_title ?? null,
+          };
+        }),
+        attempts: filled,
+        closedDefects,
+        recentMocks,
+      });
+
+      row.questions = filled;
+      row.report = report;
+      row.version += 1;
+      row.updated_at = new Date().toISOString();
+      mockRows.set(id, row);
+
+      return { mock_exam: { ...row }, report, timed_out: timedOut, elapsed_ms: Math.max(0, elapsedMs) };
+    },
+    async getReport(_client, id) {
+      const row = mockRows.get(id);
+      if (!row || row.deleted_at) throw notFound('mock_exams', id);
+      return row.report ?? null;
+    },
+    async archive(_client, id, baseVersion) {
+      const row = mockRows.get(id);
+      if (!row || row.deleted_at) throw notFound('mock_exams', id);
+      if (Number(baseVersion) !== Number(row.version)) throw conflict(row, baseVersion);
+      row.deleted_at = new Date().toISOString();
+      row.version += 1;
+      mockRows.set(id, row);
+      return { ...row };
+    },
+  };
+
+  function norm(value) {
+    return String(value ?? '')
+      .normalize('NFKC')
+      .replace(/[\s\u3000，。！？；：（）【】《》、,.!?;:()[\]<>"'`]/g, '')
+      .toUpperCase();
+  }
+
+  return { client: null, defectTickets, actions, verifications, mockExams, attempts, questions };
 }
