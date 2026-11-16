@@ -92,6 +92,8 @@ TillRoads/
 
 环境要求：**Node.js ≥ 20**（本机实测 v24.19.0）。运行时依赖两个：`pg`（BE-01 第 2 步引入，PG 访问）与 `pdfjs-dist`（BE-02 引入，文字型 PDF 抽文本），需先 `npm install` / `npm ci`。
 
+> **改动依赖后必须验一次 `npm ci`**：`pdfjs-dist` 带 `optionalDependencies`（`@napi-rs/canvas`，渲染用，我们只抽文本从不用它）。若新增/升级带可选依赖的包后只跑 `npm test` 而不跑 `npm ci`，lockfile 可能缺可选子树，CI 会在 `npm ci` 报 `EUSAGE ... Missing: X from lock file`。修法：`npm install --package-lock-only --include=optional`（详见 `REVIEW-NOTES.md` §15）。
+
 ```bash
 npm ci            # 按 package-lock.json 安装（含 pg@8.23.x + pdfjs-dist@6.5.x）
 

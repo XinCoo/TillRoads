@@ -268,3 +268,42 @@ CI `node-tests` 首跑：`106 tests / 98 pass / 8 fail / 0 skipped`。逐类定�
 - `import_jobs` 异步任务表 + multipart 上传。
 - AI 切题（替换规则切题的已知局限）。
 
+## 15. CI `npm ci` 失败（BE-02 提交后）——lockfile 缺 optional 依赖
+
+**现象**：push 后 Actions 在 `npm ci` 步骤失败，`EUSAGE`：
+
+```
+`npm ci` can only install packages when your package.json and package-lock.json
+or npm-shrinkwrap.json are in sync.
+Missing: @napi-rs/canvas@1.1.1 from lock file
+Missing: @napi-rs/canvas-linux-x64-gnu@1.1.1 from lock file
+...（共 12 条，含 android/darwin/linux/win32 全平台二进制包）
+```
+
+**根因**：`pdfjs-dist@6.5.438` 声明了 `optionalDependencies: {"@napi-rs/canvas": "^1.0.13"}`（用于浏览器外渲染 PDF，我们只抽文本从不用它）。本机 `npm install pdfjs-dist` 时因 `node_modules/@napi-rs` 从未落地（可选依赖在本机装不上，或安装时被跳过），`package-lock.json` 只写了 `pdfjs-dist` 自身条目，**没有展开这 12 个可选二进制包**。CI 的 `npm ci` 要求 lockfile 与 package.json 的依赖图完全一致，于是报 Missing。
+
+注意：这不是版本冲突、也不是 `package.json` 写错 —— lockfile 里 `node_modules/pdfjs-dist` 条目本身是对的（version 6.5.438 + 同一组 optionalDependencies），缺的是**它的可选依赖子树**。本机 `npm test` 也一直是绿的，因为抽文本路径根本不加载 `@napi-rs/canvas`（只会在 stderr 打一条 `Cannot load "@napi-rs/canvas" package` 告警）。
+
+**修法**（只动 lockfile，不动任何源码）：
+
+```bash
+npm install --package-lock-only --include=optional --no-audit --no-fund
+```
+
+- `--package-lock-only`：只重算 lockfile，不重新下载 10MB+ 的二进制。
+- `--include=optional`：显式让可选依赖进入依赖图（本机 `npm config get optional` 为 `null`，`omit` 为空，本应默认包含；但 `pdfjs-dist` 的可选子树在首次安装时没被展开，需显式重算一次）。
+- 结果：`package-lock.json` +265 行，新增 12 条 `node_modules/@napi-rs/canvas*`（均标 `"optional": true`，版本 1.1.1）。
+
+**验证（本机真跑，不是推断）**：
+
+1. `npm ci --dry-run` → `add @napi-rs/canvas-win32-x64-msvc 1.1.1` / `add @napi-rs/canvas 1.1.1` / `added 2 packages`（Windows 只装本平台的 2 个，其余 10 个平台包只写进 lockfile 不下载）。
+2. `npm ci`（真实执行）→ `added 17 packages, and audited 18 packages in 2s` / `found 0 vulnerabilities`。**lockfile 与 package.json 已同步。**
+3. `npm test`（在 `npm ci` 干净安装之后）→ `tests 166 / pass 115 / fail 0 / skipped 51`，与修复前完全一致。
+
+**为什么不能靠 `npm install` 了事**：本机 `npm install` 装完再提交 lockfile 也可能仍然不展开可选子树（取决于本机能否装上该平台的 napi 二进制）。`--package-lock-only --include=optional` 是确定性的做法，且不会因平台差异漏条目。
+
+**教训**：
+
+- 引入带 `optionalDependencies` 的包（`pdfjs-dist`、`esbuild`、`sharp`、`@swc/*` 等都属此类）后，**必须**跑一次 `npm ci` 验证，只跑 `npm test` 不够 —— 本机测试通过不代表 CI 能装上依赖。
+- `npm ci` 的 `EUSAGE ... Missing: X from lock file` 是「lockfile 缺条目」，不是「版本不对」；先看缺的是什么，再决定是重算 lockfile 还是降版本。
+- 可选依赖的 12 个平台包只增加 lockfile 体积（+265 行），**不会**增加 CI 安装体积（只装当前平台匹配的那一个）。
