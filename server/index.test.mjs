@@ -1,15 +1,17 @@
 // server/index.test.mjs
-// 题路 TillRoad · BE-01 第 4 步：路由层「本机可跑」的 fake 层测试（决策 13）
+// 题路 TillRoad · BE-01 第 4 步 / BE-03 T6：路由层「本机可跑」的 fake 层测试
 //
 // 为什么要有这一份：
-//   四表端点接 PG 后，它们的**成功路径**只能连真库验证（见 index.integration.test.mjs）。
-//   但「路由分发对不对、入参解析对不对、base_version 缺失是否 400、409 body 是否两种形状」
-//   这些逻辑与数据库无关 —— 用 fake 就能验，且 CI 与本机都能跑。
-//   决策 13 的底线：不能因为切 PG 就让本机测试从 74 条掉到 58 条。
+//   四表与缺陷单端点接 PG 后，它们的**成功路径**只能连真库验证
+//   （index.integration.test.mjs / routes/defect_tickets.integration.test.mjs）。
+//   但「路由分发对不对、入参解析对不对、base_version 缺失是否 400、409 body 是否两种形状、
+//   actor=ai 是否 403、状态机能否按 core 流转」这些逻辑与数据库无关 —— 用 fake 就能验，
+//   且 CI 与本机都能跑。决策 13 的底线：不能因为切 PG 就让本机测试从 74 条掉下来。
 //
-// 这一份**不连 PG**（不设 RUN_PG_INTEGRATION 也能跑），因此：
-//   - 需要 DB 的成功路径（建目标/建科目/查树）只做「参数没走到 DB 就被拒」的负向断言；
-//   - 正向断言留给 integration 那份。
+// BE-03：缺陷单注入内存 fake 仓储（server/_fake_repos.mjs），忠实复刻三个 PG 仓储的语义
+//   （core 纯函数前置校验 + 触发器派生列模拟 + 乐观锁）。全链路的真库验证放集成层。
+//
+// 这一份**不连 PG**（不设 RUN_PG_INTEGRATION 也能跑）。
 
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,6 +20,7 @@ import { createApp } from './index.mjs';
 import { httpError, readBody } from './routes/_http.mjs';
 import { conflictError } from './repositories/base.mjs';
 import { duplicateError, notFoundError, validationError } from './repositories/_common.mjs';
+import { createFakeRepos } from './_fake_repos.mjs';
 
 /** 起一个监听 0 端口的 app，返回 { base, app }。 */
 async function startServer(options) {
@@ -45,7 +48,14 @@ async function req(base, method, path, body) {
   return { status: res.status, data, headers: res.headers };
 }
 
-/** 建一张 ANALYZED 缺陷单（内存态，无需 PG）。 */
+/** 起一个注入了 fake 缺陷单仓储的 app。 */
+async function startDefectServer(t) {
+  const { base, app } = await startServer({ repos: createFakeRepos() });
+  t.after(() => app.close());
+  return base;
+}
+
+/** 建一张 ANALYZED 缺陷单（fake 仓储）。 */
 async function newAnalyzed(base, extra = {}) {
   const r = await req(base, 'POST', '/defect-tickets', {
     user_id: 'u-1',
@@ -58,10 +68,33 @@ async function newAnalyzed(base, extra = {}) {
   return r.data.id;
 }
 
-async function toActionDone(base, id, extra = {}) {
-  const r = await req(base, 'POST', `/defect-tickets/${id}/action`, { action: '重做同类题 10 道', ...extra });
+/** 读当前缺陷单（回带 verifications/actions）。 */
+async function getTicket(base, id) {
+  const r = await req(base, 'GET', `/defect-tickets/${id}`);
   assert.equal(r.status, 200, JSON.stringify(r.data));
   return r.data;
+}
+
+/**
+ * 走拍板项 4 的手动「进入验证」流程：
+ *   ANALYZED --加 action--> mark done --> PATCH begin-verification --> V1
+ * 返回推进后的 ticket（status='V1'）。
+ */
+async function toV1(base, id, { action = '重做同类题 10 道' } = {}) {
+  const a = await req(base, 'POST', `/defect-tickets/${id}/actions`, { action });
+  assert.equal(a.status, 201, JSON.stringify(a.data));
+  const m = await req(base, 'PATCH', `/defect-tickets/${id}/actions/${a.data.id}`, { version: a.data.version });
+  assert.equal(m.status, 200, JSON.stringify(m.data));
+  const t = await getTicket(base, id);
+  const b = await req(base, 'PATCH', `/defect-tickets/${id}/begin-verification`, { version: t.version });
+  assert.equal(b.status, 200, JSON.stringify(b.data));
+  return b.data;
+}
+
+/** 提交验证（自动带上当前 ticket version，满足拍板项 5 的 base_version 强制）。 */
+async function submitVer(base, id, body) {
+  const t = await getTicket(base, id);
+  return req(base, 'POST', `/defect-tickets/${id}/verifications`, { ...body, version: t.version });
 }
 
 // ---------------------------------------------------------------------------
@@ -86,19 +119,17 @@ test('未知路由 -> 404 {error:not_found}；尾部斜杠等价', async (t) => 
   assert.equal(r1.status, 404);
   assert.deepEqual(r1.data, { error: 'not_found' });
 
-  // 第 4 步 index.mjs 新增：/health/ 与 /health 等价
   const r2 = await req(base, 'GET', '/health/');
   assert.equal(r2.status, 200);
 });
 
 // ---------------------------------------------------------------------------
-// 2) 路由分发：长路径优先（第 4 步新增的挂载顺序约束）
+// 2) 路由分发：长路径优先
 // ---------------------------------------------------------------------------
 
 test('路由分发：/subjects/:id/knowledge-tree 归 knowledge_nodes 模块，不被 subjects 抢走', async (t) => {
   const fakePool = {
     async query() {
-      // 只验证「打到哪条 SQL 形状」，不验证内容
       return { rows: [], rowCount: 0 };
     },
   };
@@ -111,12 +142,10 @@ test('路由分发：/subjects/:id/knowledge-tree 归 knowledge_nodes 模块，�
 });
 
 // ---------------------------------------------------------------------------
-// 3) base_version 强制（决策 8）—— 四表 PATCH/DELETE 缺失即 400，且不触达 DB
+// 3) base_version 强制（决策 8 / 拍板项 5）—— 缺失即 400，且不触达 DB
 // ---------------------------------------------------------------------------
 
 test('base_version 缺失 -> 400 INVALID_BASE_VERSION（四表 PATCH，不触达 DB）', async (t) => {
-  // pool 故意设为 undefined：若这些请求真的走到 DB，会 500 而不是 400，
-  // 从而证明 400 是在路由层就给出的。
   const { base, app } = await startServer();
   t.after(() => app.close());
 
@@ -152,6 +181,24 @@ test('base_version 缺失 -> DELETE 也 400（四表）', async (t) => {
     const r = await req(base, 'DELETE', path, {});
     assert.equal(r.status, 400, `DELETE ${path}`);
     assert.equal(r.data.error, 'INVALID_BASE_VERSION');
+  }
+});
+
+test('缺陷单 PATCH/DELETE/迁移端点 base_version 缺失 -> 400 INVALID_BASE_VERSION', async (t) => {
+  const base = await startDefectServer(t);
+  const id = await newAnalyzed(base);
+
+  const cases = [
+    ['PATCH', `/defect-tickets/${id}`, { q_type: 'choice' }],
+    ['DELETE', `/defect-tickets/${id}`, {}],
+    ['POST', `/defect-tickets/${id}/analyze`, { error_layer: 'concept', error_cause: '归因' }],
+    ['PATCH', `/defect-tickets/${id}/reanalyze`, { error_layer: 'concept', error_cause: '归因' }],
+    ['POST', `/defect-tickets/${id}/verifications`, { stage: 'V1', result: 'pass' }],
+  ];
+  for (const [method, path, body] of cases) {
+    const r = await req(base, method, path, body);
+    assert.equal(r.status, 400, `${method} ${path} 应为 400，实际 ${r.status} ${JSON.stringify(r.data)}`);
+    assert.equal(r.data.error, 'INVALID_BASE_VERSION', `${method} ${path}`);
   }
 });
 
@@ -194,7 +241,6 @@ test('POST /exam-profiles 缺 exam_date/daily_minutes -> 400 MISSING_REQUIRED_FI
     user_id: 'u-1',
     exam_type: 'postgrad',
     target_score: 80,
-    // 故意不给 exam_date / daily_minutes
   });
   assert.equal(r.status, 400);
   assert.equal(r.data.error, 'MISSING_REQUIRED_FIELD');
@@ -259,20 +305,15 @@ test('httpError：404 / 400 / 未知错误三种映射', () => {
 });
 
 test('httpError：PG SQLSTATE 一律 500，绝不当成客户端 400（CI 40P01 死锁事故）', () => {
-  // 40P01 = deadlock_detected（CI 上真实发生过：被 httpError 降成 400 {error:'40P01'}，
-  //   看起来很像是客户端参数错，实际上是并发故障该重试）。
   const deadlock = Object.assign(new Error('deadlock detected'), { code: '40P01' });
   assert.deepEqual(httpError(deadlock), { status: 500, body: { error: 'internal' } });
 
-  // 40001 = serialization_failure 同理（可重试的并发失败）
   const serialization = Object.assign(new Error('could not serialize access'), { code: '40001' });
   assert.deepEqual(httpError(serialization), { status: 500, body: { error: 'internal' } });
 
-  // 连接类错误（08 类）也不该泄成 400
   const conn = Object.assign(new Error('connection terminated'), { code: '08006' });
   assert.deepEqual(httpError(conn), { status: 500, body: { error: 'internal' } });
 
-  // mapPgError 映射过的错误带 sqlState，同时也有 statusCode+body，应优先走 statusCode 分支
   const mapped = Object.assign(new Error('fk'), {
     code: 'foreign_key_not_found',
     sqlState: '23503',
@@ -281,7 +322,6 @@ test('httpError：PG SQLSTATE 一律 500，绝不当成客户端 400（CI 40P01 
   });
   assert.equal(httpError(mapped).status, 404);
 
-  // 应用层业务码（不是 5 位大写）继续走 400，不能因为上面的规则被误伤
   const appCode = Object.assign(new Error('bad stage'), { code: 'INVALID_VERIFICATION_STAGE' });
   assert.deepEqual(httpError(appCode), { status: 400, body: { error: 'INVALID_VERIFICATION_STAGE' } });
 });
@@ -303,110 +343,101 @@ test('readBody：非对象顶层 / 坏 JSON 分别 400', async () => {
 });
 
 // ---------------------------------------------------------------------------
-// 6) 缺陷单状态机（BE-03/04 范围，当前内存态）—— 保持既有契约不被第 4 步破坏
+// 6) 缺陷单状态机（BE-03：fake repository 注入，验证路由层逻辑 + core 流转）
 // ---------------------------------------------------------------------------
 
-test('缺陷单全链路：ANALYZED -> ACTION_DONE -> V1 -> V2 -> V3 -> CLOSED', async (t) => {
-  const { base, app } = await startServer();
-  t.after(() => app.close());
-
+test('缺陷单全链路：ANALYZED -> V1 -> V2 -> V3 -> CLOSED', async (t) => {
+  const base = await startDefectServer(t);
   const id = await newAnalyzed(base);
-  let tk = await toActionDone(base, id);
-  assert.equal(tk.status, 'ACTION_DONE');
 
-  let r = await req(base, 'POST', `/defect-tickets/${id}/verifications`, { stage: 'V1', result: 'pass', type: 'redo_hidden' });
-  assert.equal(r.status, 201);
+  const v1 = await toV1(base, id);
+  assert.equal(v1.status, 'V1');
+
+  let r = await submitVer(base, id, { stage: 'V1', result: 'pass', type: 'redo_hidden' });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
   assert.equal(r.data.ticket.status, 'V2');
 
-  r = await req(base, 'POST', `/defect-tickets/${id}/verifications`, { stage: 'V2', result: 'pass', type: 'variant' });
+  r = await submitVer(base, id, { stage: 'V2', result: 'pass', type: 'variant' });
   assert.equal(r.status, 201);
   assert.equal(r.data.ticket.status, 'V3');
 
-  r = await req(base, 'POST', `/defect-tickets/${id}/verifications`, { stage: 'V3', result: 'pass', type: 'timed_mock' });
+  r = await submitVer(base, id, { stage: 'V3', result: 'pass', type: 'timed_mock' });
   assert.equal(r.status, 201);
   assert.equal(r.data.ticket.status, 'CLOSED');
   assert.ok(r.data.ticket.closed_at);
 });
 
-test('ACTION_DONE 不能直接 CLOSED（非法迁移 400）', async (t) => {
-  const { base, app } = await startServer();
-  t.after(() => app.close());
-
+test('ACTION_DONE 不能直接 CLOSED（POST /close 守卫 400；通用 PATCH 忽略 status 不迁移）', async (t) => {
+  const base = await startDefectServer(t);
   const id = await newAnalyzed(base);
-  await toActionDone(base, id);
 
   const r1 = await req(base, 'POST', `/defect-tickets/${id}/close`, {});
   assert.equal(r1.status, 400);
   assert.equal(r1.data.error, 'ILLEGAL_DEFECT_TRANSITION');
 
-  const r2 = await req(base, 'PATCH', `/defect-tickets/${id}`, { status: 'CLOSED' });
-  assert.equal(r2.status, 400);
-  assert.equal(r2.data.error, 'ILLEGAL_DEFECT_TRANSITION');
+  // 通用 PATCH 不接受 status 字段（被忽略），状态保持不变——证明不能绕过状态机。
+  const cur = await getTicket(base, id);
+  const r2 = await req(base, 'PATCH', `/defect-tickets/${id}`, { status: 'CLOSED', version: cur.version });
+  assert.equal(r2.status, 200);
+  assert.equal((await getTicket(base, id)).status, 'ANALYZED');
 });
 
 test('验证 fail -> REOPENED 且 reopen_count +1', async (t) => {
-  const { base, app } = await startServer();
-  t.after(() => app.close());
-
+  const base = await startDefectServer(t);
   const id = await newAnalyzed(base);
-  await toActionDone(base, id);
+  await toV1(base, id);
 
-  // 注意：fail 只能在「正处于该 stage」时提交 —— ACTION_DONE 不是 V1。
-  // 所以走 V1 pass（->V2）再在 V2 上 fail（->REOPENED），这才是真实用户路径。
-  const v1 = await req(base, 'POST', `/defect-tickets/${id}/verifications`, { stage: 'V1', result: 'pass' });
+  // fail 只能在「正处于该 stage」提交：先 V1 pass（->V2）再在 V2 上 fail（->REOPENED）。
+  const v1 = await submitVer(base, id, { stage: 'V1', result: 'pass' });
   assert.equal(v1.status, 201);
   assert.equal(v1.data.ticket.status, 'V2');
 
-  const r = await req(base, 'POST', `/defect-tickets/${id}/verifications`, { stage: 'V2', result: 'fail' });
+  const r = await submitVer(base, id, { stage: 'V2', result: 'fail' });
   assert.equal(r.status, 201);
   assert.equal(r.data.ticket.status, 'REOPENED');
   assert.equal(r.data.ticket.reopen_count, 1);
 });
 
-test('ACTION_DONE 直接提交 V1 fail -> 400（阶段不匹配，必须先 beginVerification）', async (t) => {
-  const { base, app } = await startServer();
-  t.after(() => app.close());
-
+test('非当前阶段直接提交 V1 fail -> 400（阶段不匹配）', async (t) => {
+  const base = await startDefectServer(t);
   const id = await newAnalyzed(base);
-  await toActionDone(base, id);
 
-  const r = await req(base, 'POST', `/defect-tickets/${id}/verifications`, { stage: 'V1', result: 'fail' });
+  // ANALYZED 尚未进入 V1，直接提交 V1 fail 应被 core 判定阶段不匹配。
+  const r = await submitVer(base, id, { stage: 'V1', result: 'fail' });
   assert.equal(r.status, 400);
   assert.equal(r.data.error, 'INVALID_VERIFICATION_STAGE');
 });
 
 test('REOPENED 再 analyze -> verification_round 2，且新 round 可重新提交 V1', async (t) => {
-  const { base, app } = await startServer();
-  t.after(() => app.close());
-
+  const base = await startDefectServer(t);
   const id = await newAnalyzed(base);
-  await toActionDone(base, id);
-  // 先 V1 pass 进入 V2，才能在 V2 上 fail -> REOPENED（ACTION_DONE 不能直接 fail）。
-  await req(base, 'POST', `/defect-tickets/${id}/verifications`, { stage: 'V1', result: 'pass' });
-  const failed = await req(base, 'POST', `/defect-tickets/${id}/verifications`, { stage: 'V2', result: 'fail' });
+  await toV1(base, id);
+  await submitVer(base, id, { stage: 'V1', result: 'pass' });
+  const failed = await submitVer(base, id, { stage: 'V2', result: 'fail' });
   assert.equal(failed.status, 201);
   assert.equal(failed.data.ticket.status, 'REOPENED');
 
+  const cur = await getTicket(base, id);
   const a = await req(base, 'POST', `/defect-tickets/${id}/analyze`, {
     error_layer: 'method',
     error_cause: '解题步骤缺少边界条件检查',
+    version: cur.version,
   });
   assert.equal(a.status, 200, JSON.stringify(a.data));
   assert.equal(a.data.status, 'ANALYZED');
   assert.equal(a.data.verification_round, 2);
 
-  await toActionDone(base, id);
-  const v = await req(base, 'POST', `/defect-tickets/${id}/verifications`, { stage: 'V1', result: 'pass' });
+  await toV1(base, id);
+  const v = await submitVer(base, id, { stage: 'V1', result: 'pass' });
   assert.equal(v.status, 201, JSON.stringify(v.data));
   assert.equal(v.data.verification.round, 2);
 });
 
 test('禁用语 -> 400 forbidden_phrase', async (t) => {
-  const { base, app } = await startServer();
-  t.after(() => app.close());
-
+  const base = await startDefectServer(t);
   const r = await req(base, 'POST', '/defect-tickets', {
     user_id: 'u-1',
+    exam_profile_id: 'ep-1',
     error_layer: 'concept',
     error_cause: '我粗心了',
   });
@@ -415,67 +446,74 @@ test('禁用语 -> 400 forbidden_phrase', async (t) => {
 });
 
 test('缺 error_layer/error_cause -> 400 missing_error_layer_or_cause', async (t) => {
-  const { base, app } = await startServer();
-  t.after(() => app.close());
-
-  const r = await req(base, 'POST', '/defect-tickets', { user_id: 'u-1', error_cause: '边界条件没检查' });
+  const base = await startDefectServer(t);
+  const r = await req(base, 'POST', '/defect-tickets', { user_id: 'u-1', exam_profile_id: 'ep-1', error_cause: '边界条件没检查' });
   assert.equal(r.status, 400);
   assert.equal(r.data.error, 'missing_error_layer_or_cause');
 });
 
 test('DRAFT 草稿可未归因建单，再 analyze 补齐', async (t) => {
-  const { base, app } = await startServer();
-  t.after(() => app.close());
-
-  const d = await req(base, 'POST', '/defect-tickets', { user_id: 'u-1', draft: true });
+  const base = await startDefectServer(t);
+  const d = await req(base, 'POST', '/defect-tickets', { user_id: 'u-1', exam_profile_id: 'ep-1', draft: true });
   assert.equal(d.status, 201);
   assert.equal(d.data.status, 'DRAFT');
 
   const a = await req(base, 'POST', `/defect-tickets/${d.data.id}/analyze`, {
     error_layer: 'concept',
     error_cause: '把充分条件当成必要条件',
+    version: d.data.version,
   });
   assert.equal(a.status, 200);
   assert.equal(a.data.status, 'ANALYZED');
 });
 
+test('begin-verification 前置：无 action -> 400 NO_ACTIONS；有未完成 -> 400 ACTIONS_NOT_DONE', async (t) => {
+  const base = await startDefectServer(t);
+
+  // 无 action
+  const id1 = await newAnalyzed(base);
+  let t1 = await getTicket(base, id1);
+  let r = await req(base, 'PATCH', `/defect-tickets/${id1}/begin-verification`, { version: t1.version });
+  assert.equal(r.status, 400);
+  assert.equal(r.data.error, 'NO_ACTIONS');
+
+  // 有未完成 action
+  const id2 = await newAnalyzed(base);
+  await req(base, 'POST', `/defect-tickets/${id2}/actions`, { action: '重做同类题' });
+  let t2 = await getTicket(base, id2);
+  r = await req(base, 'PATCH', `/defect-tickets/${id2}/begin-verification`, { version: t2.version });
+  assert.equal(r.status, 400);
+  assert.equal(r.data.error, 'ACTIONS_NOT_DONE');
+});
+
 test('actor=ai + pass -> 403 ai_cannot_close（仅用户可关单）', async (t) => {
-  const { base, app } = await startServer();
-  t.after(() => app.close());
-
+  const base = await startDefectServer(t);
   const id = await newAnalyzed(base);
-  await toActionDone(base, id);
+  await toV1(base, id);
 
-  const r = await req(base, 'POST', `/defect-tickets/${id}/verifications`, {
-    stage: 'V1',
-    result: 'pass',
-    actor: 'ai',
-  });
+  const r = await submitVer(base, id, { stage: 'V1', result: 'pass', actor: 'ai' });
   assert.equal(r.status, 403);
   assert.equal(r.data.error, 'ai_cannot_close');
 });
 
 test('非法阶段/结果 -> 400', async (t) => {
-  const { base, app } = await startServer();
-  t.after(() => app.close());
-
+  const base = await startDefectServer(t);
   const id = await newAnalyzed(base);
-  await toActionDone(base, id);
+  await toV1(base, id);
 
-  const r1 = await req(base, 'POST', `/defect-tickets/${id}/verifications`, { stage: 'V9', result: 'pass' });
+  const r1 = await submitVer(base, id, { stage: 'V9', result: 'pass' });
   assert.equal(r1.status, 400);
   assert.equal(r1.data.error, 'INVALID_VERIFICATION_STAGE');
 
-  const r2 = await req(base, 'POST', `/defect-tickets/${id}/verifications`, { stage: 'V1', result: 'maybe' });
+  const r2 = await submitVer(base, id, { stage: 'V1', result: 'maybe' });
   assert.equal(r2.status, 400);
   assert.equal(r2.data.error, 'INVALID_VERIFICATION_RESULT');
 });
 
 test('缺陷单乐观锁：version 显式不符 -> 409 client_merge', async (t) => {
-  const { base, app } = await startServer();
-  t.after(() => app.close());
-
+  const base = await startDefectServer(t);
   const id = await newAnalyzed(base);
+
   const r1 = await req(base, 'PATCH', `/defect-tickets/${id}`, { version: 1, reopen_reason: '先记一笔' });
   assert.equal(r1.status, 200);
   assert.equal(r1.data.version, 2);
@@ -484,14 +522,16 @@ test('缺陷单乐观锁：version 显式不符 -> 409 client_merge', async (t) 
   assert.equal(r2.status, 409);
   assert.deepEqual(r2.data, { error: 'conflict', current: 2, incoming: 1, resolution: 'client_merge' });
 
-  // action 端点同样受乐观锁保护
-  await toActionDone(base, id, { version: 2 });
-  const r3 = await req(base, 'POST', `/defect-tickets/${id}/action`, { version: 999, action: 'x' });
-  assert.equal(r3.status, 409);
+  // action 的 markDone 同样受乐观锁保护
+  const a = await req(base, 'POST', `/defect-tickets/${id}/actions`, { action: '重做' });
+  assert.equal(a.status, 201);
+  const wrong = await req(base, 'PATCH', `/defect-tickets/${id}/actions/${a.data.id}`, { version: 999 });
+  assert.equal(wrong.status, 409);
+  assert.equal(wrong.data.error, 'conflict');
 });
 
 // ---------------------------------------------------------------------------
-// 7) AI 生成 / 模考报告 / 复盘（内存态，保持既有契约）
+// 7) AI 生成 / 模考报告 / 复盘（AI 仍内存；报告/复盘读 fake 缺陷单）
 // ---------------------------------------------------------------------------
 
 test('POST /ai/questions:generate 校验 count 1..20 且返回 provider/model 快照；/ai-jobs 别名同校验', async (t) => {
@@ -521,10 +561,8 @@ test('POST /ai/questions:generate 校验 count 1..20 且返回 provider/model �
   assert.equal(alias.data.error, 'INVALID_COUNT');
 });
 
-test('GET /review-cycles 与 GET /mock-exams/:id/report 字段完整', async (t) => {
-  const { base, app } = await startServer();
-  t.after(() => app.close());
-
+test('GET /review-cycles 与 GET /mock-exams/:id/report 字段完整（读 fake 缺陷单）', async (t) => {
+  const base = await startDefectServer(t);
   const id = await newAnalyzed(base);
 
   const rc = await req(base, 'GET', '/review-cycles?type=weekly');
@@ -535,7 +573,7 @@ test('GET /review-cycles 与 GET /mock-exams/:id/report 字段完整', async (t)
   assert.equal(rc.data.new_defects, 1);
   assert.ok(Array.isArray(rc.data.timeline));
 
-  const rep = await req(base, 'GET', `/mock-exams/me-1/report`);
+  const rep = await req(base, 'GET', '/mock-exams/me-1/report');
   assert.equal(rep.status, 200);
   assert.equal(rep.data.mock_exam_id, 'me-1');
   assert.ok(Array.isArray(rep.data.by_knowledge_node));
@@ -547,35 +585,38 @@ test('GET /review-cycles 与 GET /mock-exams/:id/report 字段完整', async (t)
 // 8) 规范契约别名（POST /analyze 与 PATCH /analyze、POST /verifications）
 // ---------------------------------------------------------------------------
 
-test('规范契约：POST /analyze 与 POST /verifications 可用，PATCH /analyze 为兼容别名', async (t) => {
-  const { base, app } = await startServer();
-  t.after(() => app.close());
+test('规范契约：POST /analyze 与 PATCH /analyze 别名可用，POST /verifications 可用', async (t) => {
+  const base = await startDefectServer(t);
 
   // POST /analyze
-  const d1 = await req(base, 'POST', '/defect-tickets', { user_id: 'u-1', draft: true });
+  const d1 = await req(base, 'POST', '/defect-tickets', { user_id: 'u-1', exam_profile_id: 'ep-1', draft: true });
   const a1 = await req(base, 'POST', `/defect-tickets/${d1.data.id}/analyze`, {
     error_layer: 'concept',
     error_cause: '概念混淆',
+    version: d1.data.version,
   });
   assert.equal(a1.status, 200);
   assert.equal(a1.data.status, 'ANALYZED');
 
   // PATCH /analyze 别名
-  const d2 = await req(base, 'POST', '/defect-tickets', { user_id: 'u-1', draft: true });
+  const d2 = await req(base, 'POST', '/defect-tickets', { user_id: 'u-1', exam_profile_id: 'ep-1', draft: true });
   const a2 = await req(base, 'PATCH', `/defect-tickets/${d2.data.id}/analyze`, {
     error_layer: 'method',
     error_cause: '步骤缺失',
+    version: d2.data.version,
   });
   assert.equal(a2.status, 200);
   assert.equal(a2.data.status, 'ANALYZED');
 
   // POST /verifications 规范路径（body 带 defect_ticket_id）
   const id = await newAnalyzed(base);
-  await toActionDone(base, id);
+  await toV1(base, id);
+  const cur = await getTicket(base, id);
   const v = await req(base, 'POST', '/verifications', {
     defect_ticket_id: id,
     stage: 'V1',
     result: 'pass',
+    version: cur.version,
   });
   assert.equal(v.status, 201, JSON.stringify(v.data));
   assert.equal(v.data.ticket.status, 'V2');
@@ -584,11 +625,6 @@ test('规范契约：POST /analyze 与 POST /verifications 可用，PATCH /analy
 
 // ---------------------------------------------------------------------------
 // 9) 题目导入的请求体/内容错误（fake 层，不需要 PG）
-//
-// 这四个 400 都在碰数据库之前就返回，所以不注入 pool 也能验。
-// 它们是 CI 真跑时才暴露的两条缺陷的回归用例：
-//   ① 空文件被误报成 MISSING_CONTENT（把「字段缺失」与「文件 0 字节」混为一读）
-//   ② 切不出题时 message 在 httpError 里被丢掉（裸 Error 只有 code，没有 body）
 // ---------------------------------------------------------------------------
 
 test('POST /questions/import：空文件 -> 400 EMPTY_CONTENT（不是 MISSING_CONTENT）', async (t) => {
@@ -604,7 +640,6 @@ test('POST /questions/import：空文件 -> 400 EMPTY_CONTENT（不是 MISSING_C
   assert.equal(r.data.error, 'EMPTY_CONTENT');
   assert.ok(typeof r.data.message === 'string' && r.data.message.length > 0, '空文件也要带提示文案');
 
-  // 反向对照：字段真的缺了才是 MISSING_CONTENT
   const missing = await req(base, 'POST', '/questions/import', { filename: 'a.txt', mime: 'text/plain' });
   assert.equal(missing.status, 400, JSON.stringify(missing.data));
   assert.equal(missing.data.error, 'MISSING_CONTENT');
@@ -623,7 +658,6 @@ test('POST /questions/import：切不出题 -> 400 EMPTY_CONTENT，且 message �
 
   assert.equal(r.status, 400, JSON.stringify(r.data));
   assert.equal(r.data.error, 'EMPTY_CONTENT');
-  // 关键回归：message 必须出现在响应体里（裸 Error 的 message 会被 httpError 丢掉）
   assert.ok(
     typeof r.data.message === 'string' && r.data.message.includes('第1题'),
     `message 应列出可用的分隔符：${JSON.stringify(r.data.message)}`,

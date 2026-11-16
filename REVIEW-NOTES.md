@@ -383,3 +383,20 @@ throw importError('EMPTY_CONTENT', 400, '未识别到任何题目：请确认题
 - **`httpError` 的两条分支对 Error 形状要求不同**：想让 message 进响应体，必须带 `body`（用 `importError`/`validationError`/`duplicateError`）；只带 `code` + `statusCode` 会把 message 丢掉。这不是 bug 而是分层约定，但很容易踩。
 - **集成测试跳过率高 = 真实覆盖缺口**：本机 51 条 skip，其中 7 条就是这两个缺陷的归属地。能搬到 fake 层的就该搬（这两个 400 不碰库），否则每次都要等 CI 才能发现问题。
 - 「字段缺失」与「内容为空」是**不同**的客户端处置分支，HTTP 层必须用不同 code 区分，不能合用一个。
+
+## 17. BE-03 归档（缺陷单状态机 API 迁 PG）
+
+**范围调整（已执行，无异议）**：原计划 BE-03 只做 `DRAFT→ANALYZED→ACTION_DONE`、BE-04 做 V1/V2/V3。因状态机在 `core/index.mjs` 是连续逻辑单元（`assertTransition`/`applyVerification`/`reanalyze` 共享 `verification_round`），拆分会让 fake 与 PG 两套逻辑并行；本轮一次迁完全链路。**BE-04 改为「验证任务列表 + 临期提醒（不做状态迁移）」，BE-05 模考绑定顺延**。
+
+**schema round 支撑核实（拍板项 3 硬门槛，已通过，无需 issue）**：`defect_tickets.verification_round`@306 与 `verifications.round`@338 均存在；唯一索引 `idx_ver_dt_stage (defect_ticket_id, stage, round)`@351 含 round（前 @350 DROP 幂等）；`check_defect_transition()`@498 在 `REOPENED→ANALYZED` 时 `verification_round+1`@525；`check_defect_forbidden_phrase()`@540 DRAFT 放行、转 ANALYZED 强制归因、禁用语拦截@548-551。**结论：schema 已就绪，直接实现 round+1，未改 schema.sql**。
+
+**交付**：
+- 三仓储 `server/repositories/{defect_tickets,actions,verifications}.mjs`；`defect_tickets` 提供 create/getById/listByUser(status 过滤)/update/analyze/reanalyze/beginVerification/submitVerification/archive + listAll/T5 重算 priority。`actions.assertAllDone()` 供 begin-verification 门禁。
+- **双层防线**：应用层在仓储写操作前调 `core/index.mjs` 纯函数（400 可读码：`assertAnalyzable`→`missing_error_layer_or_cause`/`forbidden_phrase`、`assertTransition`/`applyVerification`/`reanalyze`）；DB 触发器 `check_defect_transition`/`check_defect_forbidden_phrase` 由 schema 提供、不重写、不删除（防绕过）。派生列（verification_round/reopen_count/closed_at/version）全由触发器维护，应用层只写 status+业务字段、绝不写回（否则 double+1）。
+- **关键修复（beginVerification 两跳）**：原路由删掉 `POST /:id/action` 后 `ANALYZED→V1` 无合法路径（触发器只接受逐步跳）。改为同事务两跳 `ANALYZED→ACTION_DONE→V1`，每跳 core 前置校验 + actions 全 done 门禁 + 乐观锁（第二跳用第一跳返回的 version）。
+- 路由 `server/routes/defect_tickets.mjs` 整文件重写为 PG 版；`server/index.mjs` 加 `repos` 注入缝供 fake 测试。所有 PATCH/DELETE + `POST /verifications` 强制 base_version；`actor=ai && pass → 403 ai_cannot_close` 保留。
+- **测试**：`server/_fake_repos.mjs` 内存复刻三仓储（含触发器派生列与乐观锁）；`server/index.test.mjs` 改注入 fake（34/34）；新建 `server/routes/defect_tickets.integration.test.mjs` 13 条真 PG（全链路/fail→REOPENED+round+1/REOPENED 历史保留/门禁/403/base_version 400/乐观锁 409/并发竞态），本机 skip、CI 真跑。`core/index.mjs` 14 条状态机单测保留不动。
+
+**测试数字**：`npm test` → tests 183 / pass 119 / fail 0 / skipped 64（64 = 4 smoke + 29 仓储 + 11 路由 + 7 导入 + 13 缺陷单集成，本机无 PG 全 skip）。
+
+**遗留项**：13 条缺陷单集成测试只在 CI 真跑（本机未实跑 PG、未提交 GitHub）；AI 生成任务仍在内存（BE-08 再迁）；验证任务列表/临期提醒归 BE-04、模考绑定归 BE-05；`validateAIGenerateRequest` 嵌套返回形统一仍待 BE-02 前评估项（§9）后续处理。

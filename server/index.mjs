@@ -45,9 +45,10 @@ function createState() {
  * @returns {{server: import('node:http').Server, listen: Function, close: Function, state: object, pool: object|undefined}}
  */
 export function createApp(options = {}) {
-  const { pool } = options || {};
+  const { pool, repos } = options || {};
   const state = createState();
-
+  // BE-03：仓储可注入（fake 测试用）。真库走 pool + PG 仓储，fake 走注入的 repos。
+  const reposCtx = repos;
   const server = httpCreateServer(async (req, res) => {
     try {
       const body = await readBody(req);
@@ -59,6 +60,7 @@ export function createApp(options = {}) {
       const seg = pathname.split('/').filter(Boolean);
       const out = await dispatch(req.method, seg, {
         pool,
+        repos: reposCtx,
         state,
         searchParams: u.searchParams,
         body,

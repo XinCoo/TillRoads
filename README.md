@@ -266,17 +266,43 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 | `DELETE /capability-layers/:id` | 软删模板（`base_version` 必填；**同样受 gate 拦截**，刻意加严） |
 | `POST /questions/import` | **BE-02** 题库导入（JSON + base64；四阶段：抽取→切题→去重→入库）→ `200 {imported, duplicates, errors, stats}` |
 | `POST /questions-import` | 上一行的路径别名 |
-| `POST /defect-tickets` | 建单（禁用语 → `400 {error:"forbidden_phrase"}`；缺归因 → `400 {error:"missing_error_layer_or_cause"}`；未归因草稿 → `201 DRAFT`；带归因 → `201 ANALYZED`） |
-| `POST /defect-tickets/:id/analyze` | DRAFT→ANALYZED 补齐归因（缺归因 → `400 missing_error_layer_or_cause`） |
-| `POST /defect-tickets/:id/action` | ANALYZED→ACTION_DONE |
-| `POST /verifications` | 三次验证规范路径（开发文档 §11 / schema.sql 附录；`actor=ai` 且 `pass` → `403`；记录带 `round`） |
-| `POST /defect-tickets/:id/verifications` | 上一行的等价别名（骨架实现） |
-| `GET /mock-exams/:id/report` | 模考报告 |
-| `GET /review-cycles?type=weekly` | 周期复盘 |
+| `POST /defect-tickets` | **BE-03** DRAFT 建单（归因列可空）；带完整归因直接 `201 ANALYZED`；禁用语 → `400 forbidden_phrase`；缺归因 → `400 missing_error_layer_or_cause` |
+| `GET /defect-tickets/:id` | 取单个缺陷单（回带 `verifications` + `actions` 历史） |
+| `GET /users/:userId/defect-tickets?status=` | 某人缺陷单列表（可按 status 过滤，分页） |
+| `POST`/`PATCH /defect-tickets/:id/analyze` | DRAFT/REOPENED→ANALYZED 补齐归因（`PATCH` 为兼容别名，`base_version` 必填） |
+| `POST /defect-tickets/:id/actions` | 添加处理动作（一单多动作） |
+| `PATCH /defect-tickets/:id/actions/:actionId` | 标记动作 done（`base_version` 必填） |
+| `PATCH /defect-tickets/:id/begin-verification` | **手动进入验证**：要求至少一条 action 且全 done，同事务两跳 ANALYZED→ACTION_DONE→V1（`base_version` 必填） |
+| `POST /verifications` | **三次验证规范路径**（`base_version` 必填；`actor=ai` 且 `pass` → `403 ai_cannot_close`；记录带 `round`） |
+| `POST /defect-tickets/:id/verifications` | 上一行的等价别名 |
+| `PATCH /defect-tickets/:id/reanalyze` | REOPENED→ANALYZED，DB 触发器 `verification_round+1`（`base_version` 必填） |
+| `PATCH /defect-tickets/:id` | 通用字段更新（priority/q_type 等；`base_version` 必填；不接受 status） |
+| `DELETE /defect-tickets/:id` | 软删（`base_version` 必填） |
+| `GET /mock-exams/:id/report` | 模考报告（BE-03 起读 PG） |
+| `GET /review-cycles?type=weekly` | 周期复盘（BE-03 起读 PG） |
 | `POST /ai/questions:generate` | BYOK 生成题（count 1–20 校验） |
 | 乐观锁 | 版本冲突 → `409` |
-> 契约收敛（详见 REVIEW-NOTES.md §4 附带修正）：`analyze` 规范方法为 `POST`（原骨架的 `PATCH` 保留为兼容别名），缺归因错误码统一为 `missing_error_layer_or_cause`（废弃自造的 `missing_analysis`），`POST /verifications` 为规范路径、嵌套路径为等价别名。
-> 第 4 步已完成接线：`exam_profiles` / `subjects` / `knowledge_nodes` / `capability_layers` 四组端点已走 `server/repositories/` + 真 PG（`POST /exam-profiles` 不再是内存实现）；缺陷单 / 模考 / 复盘 / AI 生成仍是内存 Map，等 BE-03/04、BE-05/06、BE-08 重写。
+> 契约收敛（详见 REVIEW-NOTES.md §4 附带修正）：`analyze` 规范方法为 `POST`（`PATCH` 为兼容别名），缺归因错误码统一为 `missing_error_layer_or_cause`（废弃自造的 `missing_analysis`），`POST /verifications` 为规范路径、嵌套路径为等价别名。
+> BE-03 完成：缺陷单 / actions / verifications 全部迁到 `server/repositories/` + 真 PG。四表 + 三张缺陷单相关表都已走仓储层；**仅 AI 生成任务仍在内存**（BE-08 同步服务时再迁）。
+
+### 缺陷单状态机与 round 机制（BE-03）
+
+状态迁移图（每步均经 `core/index.mjs` 纯函数前置校验 → 400 可读码；DB 触发器 `check_defect_transition` 兜底 → 防绕过）：
+
+```
+DRAFT ──analyze(补全归因)──▶ ANALYZED ──begin-verification──▶ ACTION_DONE ──▶ V1
+                                                                  │
+                              ▲                                  │ 三次验证 pass
+                              │ reanalyze(round+1)               ▼
+                         REOPENED ◀──fail── V1/V2/V3            V2 ──pass──▶ V3 ──pass──▶ CLOSED
+                              ▲                    │
+                              └──────── fail ──────┘
+```
+
+- **不变量**：`ACTION_DONE !== CLOSED`；任一验证 `fail → REOPENED` 且 `reopen_count+1`；连续重开 ≥3 提示抽验；**仅用户可 mark pass**（`actor=ai && pass → 403 ai_cannot_close`）。
+- **进入验证必须手动**：`PATCH /:id/begin-verification` 要求至少一条 action 且全 done，同事务两跳 `ANALYZED→ACTION_DONE→V1`（直接跳 V1 会被 DB 触发器拒绝）。
+- **`verification_round` 机制**：`REOPENED→ANALYZED` 时由 DB 触发器 `+1`；`verifications` 唯一索引为 `(defect_ticket_id, stage, round)`，故新 round 可重新提交 V1/V2/V3，**历史验证记录全部保留**。应用层只读取 `verification_round` 当 round 值，绝不写回（派生列由触发器维护）。
+- **base_version 强制**：所有 PATCH/DELETE 与 `POST /verifications` 必填 `version`；冲突 → `409 client_merge`（当前行 + incoming）。
 
 ### 题目导入（BE-02：`POST /questions/import`）
 
@@ -346,7 +372,8 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 - ✅ **BE-01 第 3 步**：四表仓储（`exam_profiles` / `subjects` / `knowledge_nodes` / `capability_layers`）+ 28 条 PG 集成测试（含并发查重竞态），CI 加 `node-tests` job 并防「假绿」
 - ✅ **BE-01 第 4 步**：路由层拆分为 `server/routes/`（四表端点全部接 PG、AC-KM-01 模板预置事务、AC-KM-02 层级副本事务、级联软删事务、`base_version` 强制）+ `core/templates.mjs` 模板数据 + 测试改造成 fake 层 32 条 / PG 集成层 11 条
 - ✅ **BE-02**：题目导入管线（`server/import/` 四阶段 + `POST /questions/import`）+ `questions`/`assets` 仓储（`content_hash` 查重）+ 3 份切题样本与 `pdfjs-dist` 依赖（8 条切题单测 + 7 条导入集成）
-- ⏳ BE-03 / BE-04 → FE-09 / BE-08 → FE-11 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
+- ✅ **BE-03**：缺陷单完整状态机迁 PG（DRAFT→ANALYZED→ACTION_DONE→V1→V2→V3→CLOSED/REOPENED + `verification_round` + 应用层/DB 触发器双层防线）+ `defect_tickets`/`actions`/`verifications` 三仓储 + `begin-verification` 手动门禁 + fake 层改造；13 条真 PG 集成测试留在 CI
+- ⏳ BE-04（验证任务列表 + 临期提醒，不做状态迁移）/ BE-05 模考绑定 → FE-09 / BE-08 → FE-11 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
 
 ---

@@ -1,314 +1,449 @@
 // server/routes/defect_tickets.mjs
-// 题路 TillRoad · BE-01 第 4 步：缺陷单 / 模考 / 复盘 / AI 生成端点迁移（T3）
+// 题路 TillRoad · BE-03 T4：缺陷单状态机路由（PG）
 //
-// **本轮只搬不改**：这 4 组端点的业务语义属于 BE-03/BE-04（缺陷单状态机）与
-// BE-02/BE-05（AI 生成、模考、复盘），第 4 步的硬约束是「不要实现 BE-03/04」。
-// 因此这里逐字保留 server/index.mjs 原实现的行为与响应形状，只做两件结构调整：
-//   1. 从 index.mjs 的 route() 里搬出来，改成 match(method, seg, ctx) 形状；
-//   2. 内存 state 从「createApp 闭包内变量」改成「由 ctx.state 传入」，
-//      这样 index.mjs 仍持有唯一一份 state，测试也能注入。
+// **本轮重写**：第 4 步这里还是内存 Map 的「只搬不改」版本；BE-03 把整组端点
+// 迁到 PG 仓储（defect_tickets / actions / verifications），并实现拍板项 2/4/5：
+//   · 双层防线：每次状态迁移经仓储层的 core 纯函数前置校验，DB 触发器兜底；
+//   · actions → ACTION_DONE 只能由手动 PATCH /:id/begin-verification 触发；
+//   · 所有写状态迁移的端点强制 base_version（body.version）。
 //
-// 为什么不在这里改 base_version（决策 8 的强制化）：
-//   决策 8 的范围是「PATCH/DELETE 必须带 version」——针对的是第 3 步那四张已经接 PG
-//   的表（exam_profiles / subjects / knowledge_nodes / capability_layers）。
-//   缺陷单现在还在内存 Map 里，它的乐观锁语义（versionConflict 仅在 version 显式
-//   出现时校验）是现有 16 条测试的既定契约，且 BE-03 会把整组端点重写到 PG 上。
-//   此时提前改这里只会让 16 条测试里的 9 条无谓失效，并在 BE-03 再改一遍。
-//   —— 这一点已在交付说明「遗留项」里写明，不是遗漏。
+// 仍然留在内存态的只有 AI 任务（state.aiJobs）——BE-03 不碰 AI/模考/复盘的
+// 持久化（分别属 BE-05/BE-06）。模考报告/复盘统计改为从 PG 读缺陷单，
+// 不再依赖 state.defectTickets。
+//
+// 依赖注入（测试缝）：ctx.repos 可注入 fake 仓储（形如
+//   { client, defectTickets, actions, verifications }，方法首参为 client 可忽略），
+//   此时所有读写走 fake、不经 pool；未注入则走真的 PG 仓储 + withTransaction。
 
 import { randomUUID } from 'node:crypto';
 import * as C from '../../core/index.mjs';
+import { withTransaction } from '../repositories/base.mjs';
+import * as dtRepo from '../repositories/defect_tickets.mjs';
+import * as actionRepo from '../repositories/actions.mjs';
+import * as verRepo from '../repositories/verifications.mjs';
+import { ok, fail, pagination, readBaseVersion } from './_http.mjs';
 
 const now = () => new Date().toISOString();
 
-function num(v) {
-  const n = Number(v);
-  return Number.isFinite(n) ? n : 0;
+/**
+ * core 抛出的业务码 → 对外契约码（保持一致于既有 API，避免客户端改动）。
+ * 仓储层不会改这些码，只是把它们从 Error.code 翻成 HTTP body.error。
+ */
+const PUBLIC_CODE = Object.freeze({
+  FORBIDDEN_PHRASE_IN_ERROR_CAUSE: 'forbidden_phrase',
+  MISSING_ERROR_LAYER: 'missing_error_layer_or_cause',
+  MISSING_ERROR_CAUSE: 'missing_error_layer_or_cause',
+  MISSING_ERROR_LAYER_OR_CAUSE: 'missing_error_layer_or_cause',
+});
+
+/** 把 core/仓储的业务 Error 映射成对外可读的 400；其余原样上抛交给 httpError。 */
+function toHttpError(e) {
+  if (e && typeof e.code === 'string' && PUBLIC_CODE[e.code]) {
+    const out = new Error(e.message || e.code);
+    out.code = PUBLIC_CODE[e.code];
+    out.statusCode = 400;
+    out.body = { error: out.code };
+    return out;
+  }
+  return e;
 }
 
-/** 用 C.computePriority 计算优先级；支持 body 直接带字段或 body.priority 子对象。 */
-function computePriority(body) {
-  const src = body && body.priority && typeof body.priority === 'object' ? body.priority : (body || {});
-  return C.computePriority({
-    frequency: num(src.frequency),
-    loss: num(src.loss),
-    closability: num(src.closability),
-    targetContribution: num(src.targetContribution),
+/**
+ * 解析仓储来源。返回：
+ *   - repos: { defectTickets, actions, verifications }（方法与 PG 仓储同形，首参 client）
+ *   - run(client => Promise)：写操作包装器（真库包事务，fake 直接调）
+ *   - read(client => Promise)：读操作包装器（真库用 pool，fake 用 fake client）
+ */
+function resolve(ctx) {
+  const injected = ctx.repos && ctx.repos.defectTickets;
+  if (injected) {
+    const client = ctx.repos.client ?? null;
+    return {
+      repos: {
+        defectTickets: ctx.repos.defectTickets,
+        actions: ctx.repos.actions,
+        verifications: ctx.repos.verifications,
+      },
+      run: (fn) => fn(client),
+      read: (fn) => fn(client),
+    };
+  }
+  const { pool } = ctx;
+  return {
+    repos: { defectTickets: dtRepo, actions: actionRepo, verifications: verRepo },
+    run: (fn) => withTransaction(pool, fn),
+    read: (fn) => fn(pool),
+  };
+}
+
+// ---------------------------------------------------------------------------
+// 建单
+// ---------------------------------------------------------------------------
+async function createTicket(ctx) {
+  const { body } = ctx;
+  const { repos, run } = resolve(ctx);
+  const wantDraft = body.status === 'DRAFT' || body.draft === true;
+
+  try {
+    // 带完整归因直接建 ANALYZED 时，仓储内会走 C.assertAnalyzable 前置校验；
+    // DRAFT 草稿则允许 error_layer/error_cause 为空（P0-3）。
+    const input = {
+      user_id: body.user_id,
+      exam_profile_id: body.exam_profile_id,
+      knowledge_node_id: body.knowledge_node_id,
+      question_id: body.question_id,
+      q_type: body.q_type,
+      error_layer: body.error_layer,
+      error_cause: body.error_cause,
+      actions: body.actions,
+      // priority 由仓储用 C.computePriority 在事务内计算（T5）
+      frequency: body.frequency,
+      loss: body.loss,
+      closability: body.closability,
+      targetContribution: body.targetContribution,
+      status: wantDraft ? 'DRAFT' : 'ANALYZED',
+    };
+    const ticket = await run((client) => repos.defectTickets.create(client, input));
+    return ok(ticket, 201);
+  } catch (e) {
+    throw toHttpError(e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 状态迁移 handlers（每次都强制 base_version）
+// ---------------------------------------------------------------------------
+async function analyzeTicket(ctx, id) {
+  const { body } = ctx;
+  const baseVersion = readBaseVersion(body); // 拍板项 5：PATCH/POST 迁移都强制
+  const { repos, run } = resolve(ctx);
+  try {
+    const method = body.status === 'REOPENED' ? 'reanalyze' : 'analyze';
+    const ticket = await run((client) =>
+      repos.defectTickets[method](client, id, {
+        error_layer: body.error_layer,
+        error_cause: body.error_cause,
+      }, baseVersion));
+    return ok(ticket);
+  } catch (e) {
+    throw toHttpError(e);
+  }
+}
+
+async function addAction(ctx, id) {
+  const { body } = ctx;
+  const { repos, run } = resolve(ctx);
+  const content = body.action ?? body.content;
+  if (!content || String(content).trim() === '') {
+    throw Object.assign(new Error('action 内容必填'), { code: 'MISSING_ACTION_CONTENT' });
+  }
+  try {
+    const action = await run((client) => repos.actions.create(client, {
+      defect_ticket_id: id,
+      content,
+      done: body.done === undefined ? false : !!body.done,
+      due: body.due,
+    }));
+    return ok(action, 201);
+  } catch (e) {
+    throw toHttpError(e);
+  }
+}
+
+async function markActionDone(ctx, actionId) {
+  const baseVersion = readBaseVersion(ctx.body);
+  const { repos, run } = resolve(ctx);
+  try {
+    const action = await run((client) =>
+      repos.actions.markDone(client, actionId, ctx.body.done === undefined ? true : !!ctx.body.done, baseVersion));
+    return ok(action);
+  } catch (e) {
+    throw toHttpError(e);
+  }
+}
+
+/**
+ * 拍板项 4：ANALYZED → ACTION_DONE 不再由 POST /:id/action 自动推进。
+ * 用户手动点「进入验证」→ PATCH /:id/begin-verification；
+ * 仓储内 C.beginVerification 校验迁移 + actions.assertAllDone 校验前置。
+ */
+async function beginVerification(ctx, id) {
+  const baseVersion = readBaseVersion(ctx.body);
+  const { repos, run } = resolve(ctx);
+  try {
+    const ticket = await run((client) => repos.defectTickets.beginVerification(client, id, baseVersion));
+    return ok(ticket);
+  } catch (e) {
+    throw toHttpError(e);
+  }
+}
+
+async function submitVerification(ctx, id) {
+  const { body } = ctx;
+  const baseVersion = readBaseVersion(body); // 拍板项 5：防并发提交导致状态错乱
+  // 「仅用户可标记 pass」：AI 不得把缺陷单推进/关闭（不变量，保留）。
+  if (body.actor === 'ai' && body.result === 'pass') {
+    return fail('ai_cannot_close', 403, { message: '仅用户可标记验证通过（AI 不能关闭缺陷单）' });
+  }
+  const { repos, run } = resolve(ctx);
+  try {
+    const out = await run((client) =>
+      repos.defectTickets.submitVerification(client, id, {
+        stage: body.stage,
+        result: body.result,
+        verify_type: body.verify_type ?? body.type,
+        question_id: body.question_id,
+        evidence: body.evidence,
+      }, baseVersion));
+    return ok(out, 201);
+  } catch (e) {
+    throw toHttpError(e);
+  }
+}
+
+async function reanalyze(ctx, id) {
+  const baseVersion = readBaseVersion(ctx.body);
+  const { repos, run } = resolve(ctx);
+  try {
+    const ticket = await run((client) => repos.defectTickets.reanalyze(client, id, {
+      error_layer: ctx.body.error_layer,
+      error_cause: ctx.body.error_cause,
+    }, baseVersion));
+    return ok(ticket);
+  } catch (e) {
+    throw toHttpError(e);
+  }
+}
+
+async function patchTicket(ctx, id) {
+  const baseVersion = readBaseVersion(ctx.body);
+  const { repos, run } = resolve(ctx);
+  const { body } = ctx;
+  // 通用 PATCH 只改非状态字段；status 变更必须走上面的专用方法（仓储层已拒绝）。
+  const patch = {};
+  for (const k of ['priority', 'q_type', 'error_layer', 'error_cause', 'knowledge_node_id',
+    'question_id', 'exam_profile_id', 'user_id', 'actions', 'reopen_reason', 'verification_state']) {
+    if (Object.prototype.hasOwnProperty.call(body, k)) patch[k] = body[k];
+  }
+  // T5：q_type / 归因因子变化则重算 priority（未显式传 priority 时）。
+  if (!Object.prototype.hasOwnProperty.call(patch, 'priority') &&
+      (Object.prototype.hasOwnProperty.call(body, 'frequency') ||
+       Object.prototype.hasOwnProperty.call(body, 'loss') ||
+       Object.prototype.hasOwnProperty.call(body, 'closability') ||
+       Object.prototype.hasOwnProperty.call(body, 'targetContribution'))) {
+    patch.priority = dtRepo.recomputePriority(body);
+  }
+  try {
+    const ticket = await run((client) => repos.defectTickets.update(client, id, patch, baseVersion));
+    return ok(ticket);
+  } catch (e) {
+    throw toHttpError(e);
+  }
+}
+
+async function deleteTicket(ctx, id) {
+  const baseVersion = readBaseVersion(ctx.body);
+  const { repos, run } = resolve(ctx);
+  try {
+    const ticket = await run((client) => repos.defectTickets.archive(client, id, baseVersion));
+    return ok(ticket);
+  } catch (e) {
+    throw toHttpError(e);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 读 handlers
+// ---------------------------------------------------------------------------
+async function getTicket(ctx, id) {
+  const { repos, read } = resolve(ctx);
+  try {
+    const ticket = await read((c) => repos.defectTickets.getById(c, id));
+    const [verifications, actions] = await Promise.all([
+      read((c) => repos.verifications.listByDefect(c, id)),
+      read((c) => repos.actions.listByDefect(c, id)),
+    ]);
+    return ok({ ...ticket, verifications, actions });
+  } catch (e) {
+    throw toHttpError(e);
+  }
+}
+
+async function listTicketsByUser(ctx, userId) {
+  const { repos, read } = resolve(ctx);
+  const pg = pagination(ctx.searchParams);
+  const rows = await read((c) => repos.defectTickets.listByUser(c, userId, {
+    ...pg,
+    status: ctx.searchParams.get('status') || undefined,
+  }));
+  return ok({ items: rows, ...pg });
+}
+
+/** 跨用户读全部（模考报告 / 复盘统计用）。fake 层没有 listAll 时回退空数组。 */
+async function listTicketsForStats(ctx) {
+  const { repos, read } = resolve(ctx);
+  if (typeof repos.defectTickets.listAll !== 'function') return [];
+  return read((c) => repos.defectTickets.listAll(c, { limit: 1000, offset: 0 }));
+}
+
+// ---------------------------------------------------------------------------
+// 模考报告 / 复盘（读 PG 缺陷单；AI 任务仍走内存）
+// ---------------------------------------------------------------------------
+async function mockExamReport(ctx, id) {
+  const tickets = await listTicketsForStats(ctx);
+  const links = tickets.slice(0, 5).map((t) => ({
+    defect_ticket_id: t.id,
+    knowledge_node_id: t.knowledge_node_id,
+    status: t.status,
+  }));
+  return ok({
+    mock_exam_id: id,
+    total_score: 78.5,
+    by_knowledge_node: [
+      { knowledge_node_id: 'kn-1', title: '函数与导数', accuracy: 0.82, avg_duration_ms: 45000 },
+      { knowledge_node_id: 'kn-2', title: '立体几何', accuracy: 0.65, avg_duration_ms: 62000 },
+    ],
+    defect_links: links,
+    stability_index: 0.87,
   });
 }
 
-// 乐观锁：仅当请求显式携带 version 且与当前不符时判定冲突（内存态与既有契约一致）。
-function versionConflict(ticket, body) {
-  if (body && body.version !== undefined) {
-    const incoming = Number(body.version);
-    if (!Number.isFinite(incoming) || incoming !== Number(ticket.version)) {
-      return { conflict: true, current: ticket.version, incoming: body.version };
-    }
-  }
-  return { conflict: false };
+async function reviewCycles(ctx) {
+  const tickets = await listTicketsForStats(ctx);
+  const type = ctx.searchParams.get('type') || 'weekly';
+  return ok({
+    type,
+    closed_count: tickets.filter((x) => x.status === 'CLOSED').length,
+    reopened_count: tickets.filter((x) => x.status === 'REOPENED').length,
+    new_defects: tickets.length,
+    timeline: tickets.slice(0, 10).map((x) => ({ id: x.id, status: x.status, created_at: x.created_at })),
+  });
 }
 
-function conflictBody(v) {
-  return {
-    error: 'conflict',
-    current: v.current,
-    incoming: v.incoming,
-    resolution: 'client_merge',
-  };
+// ---------------------------------------------------------------------------
+// AI 生成（仍内存；BE-03 不碰）
+// ---------------------------------------------------------------------------
+function submitAiJob(ctx) {
+  const { body, state } = ctx;
+  const v = C.validateAIGenerateRequest(body);
+  if (!v.ok) return fail(v.error.code, 400, { message: v.error.message });
+  const job_id = randomUUID();
+  const provider_snapshot = body.provider ?? 'deepseek';
+  const model_snapshot = body.model ?? body.model_name ?? 'deepseek-chat';
+  state.aiJobs.set(job_id, {
+    job_id,
+    status: 'pending',
+    provider_snapshot,
+    model_snapshot,
+    count: body.count,
+    payload: { ...body },
+    created_at: now(),
+  });
+  return ok({ job_id, status: 'pending', provider_snapshot, model_snapshot }, 202);
 }
 
-function newTicket(body, status) {
-  const ts = now();
-  return {
-    id: randomUUID(),
-    user_id: body.user_id ?? null,
-    exam_profile_id: body.exam_profile_id ?? null,
-    knowledge_node_id: body.knowledge_node_id ?? null,
-    question_id: body.question_id ?? null,
-    q_type: body.q_type ?? null,
-    error_layer: body.error_layer ?? '',
-    error_cause: body.error_cause ?? '',
-    actions: Array.isArray(body.actions) ? body.actions : [],
-    priority: computePriority(body),
-    status,
-    verification_state: { v1: 'pending', v2: 'pending', v3: 'pending' },
-    reopen_count: 0,
-    reopen_reason: null,
-    verification_round: 1,
-    version: 1,
-    created_at: ts,
-    updated_at: ts,
-    closed_at: null,
-  };
-}
-
+// ---------------------------------------------------------------------------
+// 路由匹配
+// ---------------------------------------------------------------------------
 export function match(method, seg, ctx) {
-  const { searchParams, body, state } = ctx;
+  const { body } = ctx;
 
-  // 6') POST /verifications -> 规范路径（开发文档 §11 / schema.sql 附录）。
-  //     内部委托给 /defect-tickets/:id/verifications，避免逻辑重复；嵌套路径保留为等价别名。
+  // 规范路径 POST /verifications（body.defect_ticket_id）→ 委托给嵌套路径。
   if (method === 'POST' && seg.length === 1 && seg[0] === 'verifications' && body.defect_ticket_id) {
-    return match('POST', ['defect-tickets', encodeURIComponent(String(body.defect_ticket_id)), 'verifications'], ctx);
+    return submitVerification(ctx, String(body.defect_ticket_id));
   }
 
-  // 3) POST /defect-tickets -> 201 建单
+  // POST /defect-tickets -> 201 建单
   if (method === 'POST' && seg.length === 1 && seg[0] === 'defect-tickets') {
-    const wantDraft = body.status === 'DRAFT' || body.draft === true;
-    if (wantDraft) {
-      // P0-3：仅记录错题的 DRAFT 草稿可未归因
-      const t = newTicket(body, 'DRAFT');
-      state.defectTickets.set(t.id, t);
-      return { status: 201, body: t };
-    }
-    // 系统建单即归因：status 固定 ANALYZED；用 DRAFT 作为归因前的来源态校验。
-    try {
-      C.assertAnalyzable({ status: 'DRAFT', error_layer: body.error_layer, error_cause: body.error_cause });
-    } catch (e) {
-      if (e.code === 'FORBIDDEN_PHRASE_IN_ERROR_CAUSE') return { status: 400, body: { error: 'forbidden_phrase' } };
-      if (e.code === 'MISSING_ERROR_LAYER' || e.code === 'MISSING_ERROR_CAUSE') return { status: 400, body: { error: 'missing_error_layer_or_cause' } };
-      throw e;
-    }
-    const t = newTicket(body, 'ANALYZED');
-    state.defectTickets.set(t.id, t);
-    return { status: 201, body: t };
+    return createTicket(ctx);
   }
 
-  // defect-tickets/:id 系列端点
-  if (seg[0] === 'defect-tickets' && seg.length >= 2) {
-    const id = seg[1];
-    const t = state.defectTickets.get(id);
-    if (!t) return { status: 404, body: { error: 'not_found' } };
-
-    // 4) POST /defect-tickets/:id/analyze -> DRAFT/REOPENED -> ANALYZED
-    //    契约权威：开发文档 §11 / schema.sql 附录（POST + missing_error_layer_or_cause）。
-    //    兼容 PATCH 作为旧调用方别名，规范路径为 POST。
-    if ((method === 'POST' || method === 'PATCH') && seg.length === 3 && seg[2] === 'analyze') {
-      const v = versionConflict(t, body);
-      if (v.conflict) return { status: 409, body: conflictBody(v) };
-      try {
-        C.assertAnalyzable({ status: t.status, error_layer: body.error_layer, error_cause: body.error_cause });
-      } catch (e) {
-        if (e.code === 'FORBIDDEN_PHRASE_IN_ERROR_CAUSE') return { status: 400, body: { error: 'forbidden_phrase' } };
-        if (e.code === 'MISSING_ERROR_LAYER' || e.code === 'MISSING_ERROR_CAUSE') return { status: 400, body: { error: 'missing_error_layer_or_cause' } };
-        throw e;
-      }
-      if (t.status === 'REOPENED') {
-        // P0-2：重新归因后开启新一轮验证轮次
-        const r = C.reanalyze(t);
-        t.status = r.status;
-        t.verification_round = r.verification_round;
-        t.reopen_count = r.reopen_count;
-      } else {
-        t.status = 'ANALYZED';
-      }
-      t.error_layer = body.error_layer;
-      t.error_cause = body.error_cause;
-      t.version += 1;
-      t.updated_at = now();
-      return { status: 200, body: t };
-    }
-
-    // 5) POST /defect-tickets/:id/action -> ANALYZED -> ACTION_DONE
-    //    强调「ACTION_DONE 不等于 CLOSED」：此端点只能推进到 ACTION_DONE。
-    if (method === 'POST' && seg.length === 3 && seg[2] === 'action') {
-      const v = versionConflict(t, body);
-      if (v.conflict) return { status: 409, body: conflictBody(v) };
-      C.assertTransition(t.status, 'ACTION_DONE');
-      t.status = 'ACTION_DONE';
-      t.actions.push({ content: body.action ?? body.content ?? '', done: true, created_at: now() });
-      t.version += 1;
-      t.updated_at = now();
-      return { status: 200, body: t };
-    }
-
-    // 直接 close：非法迁移由 C.assertTransition 拒绝 -> 400。
-    if (method === 'POST' && seg.length === 3 && seg[2] === 'close') {
-      const v = versionConflict(t, body);
-      if (v.conflict) return { status: 409, body: conflictBody(v) };
-      C.assertTransition(t.status, 'CLOSED');
-      t.status = 'CLOSED';
-      t.closed_at = now();
-      t.version += 1;
-      t.updated_at = now();
-      return { status: 200, body: t };
-    }
-
-    // 6) POST /defect-tickets/:id/verifications -> 三次验证
-    if (method === 'POST' && seg.length === 3 && seg[2] === 'verifications') {
-      const v = versionConflict(t, body);
-      if (v.conflict) return { status: 409, body: conflictBody(v) };
-      // 「仅用户可标记 pass」：AI 不得把缺陷单推进/关闭。
-      if (body.actor === 'ai' && body.result === 'pass') {
-        return { status: 403, body: { error: 'ai_cannot_close' } };
-      }
-      const stage = body.stage;
-      const result = body.result;
-      const round = t.verification_round;
-      // P0-2：验证记录用 round 维度；同一 (ticket, stage) 在不同 round 可各有一条，
-      // 但同一 round 内重复提交 -> 409（对齐 schema 的重复提交冲突）。
-      const dup = state.verifications.find(
-        (r) => r.defect_ticket_id === id && r.stage === stage && r.round === round,
-      );
-      if (dup) return { status: 409, body: { error: 'conflict', message: 'duplicate verification in this round' } };
-
-      let applied;
-      if (t.status === 'ACTION_DONE' && stage === 'V1' && result === 'pass') {
-        // ACTION_DONE + V1 pass：先 beginVerification 进入 V1，再 applyVerification 推进到 V2。
-        const b = C.beginVerification(t, 'V1');
-        t.status = b.status; // 进入 V1
-        applied = C.applyVerification(t, 'V1', 'pass'); // -> V2
-      } else {
-        // 其余情况：ticket.status 必须 === stage，由 core 校验阶段/结果/状态机。
-        applied = C.applyVerification(t, stage, result);
-      }
-      t.status = applied.status;
-      t.reopen_count = applied.reopen_count;
-      t.version += 1;
-      t.updated_at = now();
-      if (t.status === 'CLOSED') t.closed_at = now();
-
-      const ts = now();
-      const record = {
-        id: randomUUID(),
-        defect_ticket_id: id,
-        stage,
-        result,
-        verify_type: body.type ?? body.verify_type ?? 'redo_hidden',
-        round,
-        evidence: body.evidence ?? null,
-        verified_at: ts,
-        created_at: ts,
-        version: 1,
-      };
-      state.verifications.push(record);
-      return { status: 201, body: { ticket: t, verification: record } };
-    }
-
-    // 10) 通用 PATCH /defect-tickets/:id（乐观锁 + 合法状态迁移 + 字段更新）
-    if (method === 'PATCH' && seg.length === 2) {
-      const v = versionConflict(t, body);
-      if (v.conflict) return { status: 409, body: conflictBody(v) };
-      if (body.status && body.status !== t.status) {
-        C.assertTransition(t.status, body.status);
-        if (body.status === 'REOPENED' && t.status !== 'REOPENED') {
-          t.reopen_count = (Number(t.reopen_count) || 0) + 1;
-        }
-        if (body.status === 'CLOSED') t.closed_at = now();
-        t.status = body.status;
-      }
-      const allowed = ['error_layer', 'error_cause', 'priority', 'q_type',
-        'knowledge_node_id', 'question_id', 'exam_profile_id', 'user_id', 'actions', 'reopen_reason'];
-      for (const k of allowed) {
-        if (Object.prototype.hasOwnProperty.call(body, k)) t[k] = body[k];
-      }
-      t.version += 1;
-      t.updated_at = now();
-      return { status: 200, body: t };
-    }
+  // GET /users/:userId/defect-tickets?status=...
+  if (method === 'GET' && seg.length === 3 && seg[0] === 'users' && seg[2] === 'defect-tickets') {
+    return listTicketsByUser(ctx, seg[1]);
   }
 
-  // 7) GET /mock-exams/:id/report -> 模考报告（内存造合理数据）
+  // GET /mock-exams/:id/report
   if (method === 'GET' && seg.length === 3 && seg[0] === 'mock-exams' && seg[2] === 'report') {
-    const id = seg[1];
-    const links = [...state.defectTickets.values()].slice(0, 5).map((t) => ({
-      defect_ticket_id: t.id,
-      knowledge_node_id: t.knowledge_node_id,
-      status: t.status,
-    }));
-    return {
-      status: 200,
-      body: {
-        mock_exam_id: id,
-        total_score: 78.5,
-        by_knowledge_node: [
-          { knowledge_node_id: 'kn-1', title: '函数与导数', accuracy: 0.82, avg_duration_ms: 45000 },
-          { knowledge_node_id: 'kn-2', title: '立体几何', accuracy: 0.65, avg_duration_ms: 62000 },
-        ],
-        defect_links: links,
-        stability_index: 0.87,
-      },
-    };
+    return mockExamReport(ctx, seg[1]);
   }
 
-  // 8) GET /review-cycles?type=weekly -> 复盘
+  // GET /review-cycles?type=weekly
   if (method === 'GET' && seg.length === 1 && seg[0] === 'review-cycles') {
-    const type = searchParams.get('type') || 'weekly';
-    const tickets = [...state.defectTickets.values()];
-    return {
-      status: 200,
-      body: {
-        type,
-        closed_count: tickets.filter((x) => x.status === 'CLOSED').length,
-        reopened_count: tickets.filter((x) => x.status === 'REOPENED').length,
-        new_defects: tickets.length,
-        timeline: tickets.slice(0, 10).map((x) => ({ id: x.id, status: x.status, created_at: x.created_at })),
-      },
-    };
+    return reviewCycles(ctx);
   }
 
-  // 9) POST /ai/questions:generate 与 POST /ai-jobs -> AI 生成任务
+  // AI 生成（含 /ai-jobs 别名）
   if (method === 'POST' && (
-    seg.length === 2 && seg[0] === 'ai' && seg[1] === 'questions:generate'
-    || seg.length === 1 && seg[0] === 'ai-jobs'
+    (seg.length === 2 && seg[0] === 'ai' && seg[1] === 'questions:generate') ||
+    (seg.length === 1 && seg[0] === 'ai-jobs')
   )) {
-    const v = C.validateAIGenerateRequest(body);
-    if (!v.ok) return { status: 400, body: { error: v.error.code, message: v.error.message } };
-    const job_id = randomUUID();
-    // job 自持 provider/model 快照（对齐 byok-key-lifecycle.md 场景 5）：
-    // 凭证被轮换/撤销/删除后仍可还原执行用的是哪家 provider 与模型。
-    const provider_snapshot = body.provider ?? 'deepseek';
-    const model_snapshot = body.model ?? body.model_name ?? 'deepseek-chat';
-    state.aiJobs.set(job_id, {
-      job_id,
-      status: 'pending',
-      provider_snapshot,
-      model_snapshot,
-      count: body.count,
-      payload: { ...body },
-      created_at: now(),
-    });
-    return { status: 202, body: { job_id, status: 'pending', provider_snapshot, model_snapshot } };
+    return submitAiJob(ctx);
+  }
+
+  if (seg[0] !== 'defect-tickets' || seg.length < 2) return null;
+  const id = seg[1];
+
+  // POST/PATCH /defect-tickets/:id/analyze —— DRAFT/REOPENED → ANALYZED
+  if ((method === 'POST' || method === 'PATCH') && seg.length === 3 && seg[2] === 'analyze') {
+    return analyzeTicket(ctx, id);
+  }
+
+  // POST /defect-tickets/:id/actions —— 添加动作（不自动推进状态）
+  if (method === 'POST' && seg.length === 3 && seg[2] === 'actions') {
+    return addAction(ctx, id);
+  }
+
+  // PATCH /defect-tickets/:id/actions/:actionId —— 标记动作 done（base_version 必填）
+  if (method === 'PATCH' && seg.length === 4 && seg[2] === 'actions') {
+    return markActionDone(ctx, seg[3]);
+  }
+
+  // PATCH /defect-tickets/:id/begin-verification —— 拍板项 4 的手动触发点
+  if (method === 'PATCH' && seg.length === 3 && seg[2] === 'begin-verification') {
+    return beginVerification(ctx, id);
+  }
+
+  // POST /defect-tickets/:id/verifications —— V1/V2/V3 提交
+  if (method === 'POST' && seg.length === 3 && seg[2] === 'verifications') {
+    return submitVerification(ctx, id);
+  }
+
+  // PATCH /defect-tickets/:id/reanalyze —— REOPENED → ANALYZED（round+1）
+  if (method === 'PATCH' && seg.length === 3 && seg[2] === 'reanalyze') {
+    return reanalyze(ctx, id);
+  }
+
+  // POST /defect-tickets/:id/close —— 显式关单入口（不变量：只有 V3 pass 能到 CLOSED）
+  // 保留为「非法迁移 400」的守卫：仓储层 update 拒绝 status，所以这里直接抛。
+  if (method === 'POST' && seg.length === 3 && seg[2] === 'close') {
+    return (async () => {
+      const { repos, read } = resolve(ctx);
+      const cur = await read((c) => repos.defectTickets.getById(c, id));
+      const err = new Error(`ILLEGAL_DEFECT_TRANSITION: ${cur.status} -> CLOSED`);
+      err.code = 'ILLEGAL_DEFECT_TRANSITION';
+      err.statusCode = 400;
+      err.body = { error: 'ILLEGAL_DEFECT_TRANSITION' };
+      throw err;
+    })();
+  }
+
+  // DELETE /defect-tickets/:id —— 软删
+  if (method === 'DELETE' && seg.length === 2) {
+    return deleteTicket(ctx, id);
+  }
+
+  // PATCH /defect-tickets/:id —— 通用字段更新
+  if (method === 'PATCH' && seg.length === 2) {
+    return patchTicket(ctx, id);
+  }
+
+  // GET /defect-tickets/:id
+  if (method === 'GET' && seg.length === 2) {
+    return getTicket(ctx, id);
   }
 
   return null;
 }
+
+export { toHttpError };
