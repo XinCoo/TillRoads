@@ -821,7 +821,7 @@ async function startMockServer(t, { questions = 5 } = {}) {
       answer: 'A',
       analysis: '解析不应出现在组卷响应里',
       is_subjective: false,
-      difficulty: 0.5,
+      difficulty: 'medium', // schema.sql:57 是 ENUM('easy','medium','hard')，不是 numeric
       tags: [],
       deleted_at: null,
     });

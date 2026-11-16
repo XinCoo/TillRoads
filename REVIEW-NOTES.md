@@ -532,7 +532,8 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - fake 层（并入 `server/index.test.mjs`）：组卷参数校验、`INSUFFICIENT_QUESTIONS`、超时、`already_submitted`、`not_submitted` 404。
 - 真 PG 集成 20 条（`server/routes/mock_exams.integration.test.mjs`，仅 CI 跑）：组卷 full/module、题量不足、提交全链路（attempts 落库 + `attempt_id` 回填 + report 落库 + `GET /report` 对账）、重复提交 409、超时收卷、宽限内不超时、stability 跨三次、`defect_repeat_rate`、`v3_candidates`、列表排序与 mode 过滤、用户隔离、软删、主观题不进分母。
 - 因组卷是 `ORDER BY random()`，**断言必须按 `knowledge_node_id` 构造答案**，不能依赖抽题下标（否则 CI 随机翻红）。
-- 本机 `npm test`：268 tests / **165 pass** / 0 fail / **103 skipped**（103 = 既有 83 + 新增 20 条集成，本机无 PG 全 skip）。
+- 本机 `npm test`：277 tests / **174 pass** / 0 fail / **103 skipped**（103 = 既有 83 + 新增 20 条模考集成，本机无 PG 全 skip）。
+- 另用 PGlite 驱动**真实 HTTP 路由层**跑了 47 项端到端场景（组卷/提交/超时/稳定性/重复率/V3/列表/隔离/软删/主观题），全绿后才提交；这条经验来自 BE-03 的 8 条 CI 失败代价。
 - 另外用 PGlite（真实 Postgres WASM，`npm install --no-save` 后 `npm prune` 移除，未写入 package.json）在本地跑了 19 项真库验证，**正是它抓到了 `v3_candidates` 那个 bug**——这条经验来自 BE-03 的 8 条 CI 失败代价：本机集成全 skip 时，SQL 真库错误只会在 CI 暴露。
 
 ### 遗留
@@ -541,3 +542,10 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - `module_accuracy` 的「模块」直接等于考点，若一个科目考点树很深，报告会过细；产品上可能需要「按指定层级聚合」，属 BE-06/前端议题。
 - `v3_candidates` 不去重跨模考（每次模考独立算），前端需自行合并同 `defect_ticket_id`。
 - 组卷 `ORDER BY random()` 在题库极大时是全表排序，MVP 题量下可接受，后续需换 `TABLESAMPLE` 或预抽样。
+
+### 交付后 CI 修复（18 fail → 0）
+
+- **根因单一**：`schema.sql:57` 的 `difficulty` 是 **ENUM `('easy','medium','hard')`**，但集成测试的 `seedQuestions()` 往库里塞了 `0.5`（当 numeric 用）→ `22P02 invalid input value for enum difficulty: "0.5"`，同一根因导致 18 条集成测试全在 `before`/种子阶段崩掉（不是 18 个独立 bug）。
+- **修复**：`server/routes/mock_exams.integration.test.mjs:121` 与 `server/index.test.mjs:824` 的种子值改为 `'medium'`，并各加注释指向 `schema.sql:57` 防回归。
+- **顺带修正文档错误**：README 报告字段表原写「`overall.total` 含未判分」，与 `server/mock_report.mjs:322` 的实际实现（`total: gradedTotal`，只计已判分）矛盾；已改为「`total` 只计已判分，未判分由 `ungraded`/`ungraded_count` 反映」。这条是文档 bug，不是代码 bug——`mock_report.test.mjs:137/139` 与 `:396/397` 早就锁定了正确语义。
+- **教训**：①种子数据也要严格对 schema 的 ENUM/CHECK，测试代码绕过了应用层校验也会被 DB 拒；②一个根因可放大成几十条失败，先看**第一条**失败的错误码，别逐条看；③文档写「含/不含」这类二分口径必须与实现逐字核对。

@@ -430,7 +430,7 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 | `defect_repeat_rate` | `{repeat_count, total_wrong, rate}` | 只统计**错题**中 `question_id` 命中 `CLOSED` 缺陷单的；分母 0 时 `rate=0`（非 NaN） |
 | `strategy_execution` | **恒 `null`** | 跳过的理由见 REVIEW-NOTES §20 |
 | `v3_candidates` | `[{defect_ticket_id, question_id, knowledge_node_id}]` | 错题的考点命中该用户 `status='V3'` 缺陷单 |
-| `overall` | `{correct, total, accuracy, ungraded}` | `total` 含未判分；`accuracy` 只按已判分算 |
+| `overall` | `{correct, total, accuracy, ungraded}` | **`total` 只计已判分**（未判分题不进分母，单独由 `ungraded` / `ungraded_count` 反映）；`accuracy = correct / total` |
 
 **判分口径**：主观题（`is_subjective=true` 或 `type` 为 `essay`/`short_answer`）与非空标准答案缺失 → `is_correct=null`（**未判分，不进准确率分母**）；有标准答案但用户未作答 → `false`（计错）。归一比较 = `NFKC` + 去空白/全半角标点 + `toUpperCase`，与 `normalizeQuestionText()` 同口径。
 

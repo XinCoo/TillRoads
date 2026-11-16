@@ -118,7 +118,7 @@ async function seedQuestions({ subjectId, knowledgeNodeId, count, answer = 'A', 
           JSON.stringify([{ key: 'A', text: '选项 A' }, { key: 'B', text: '选项 B' }]),
           answer,
           '因为这是测试题',
-          0.5,
+          'medium', // schema.sql:57 difficulty 是 ENUM('easy','medium','hard')，不是 numeric
           hash,
           isSubjective,
         ],
