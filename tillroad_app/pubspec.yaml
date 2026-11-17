@@ -51,3 +51,15 @@ flutter:
 
   assets:
     - assets/icons/
+
+  # ── 字体（FE-01 字体接入）───────────────────────────────────────────────
+  # 霞鹜新致宋（LXGW Neo ZhiSong），SIL OFL 1.1，可免费商用与嵌入。
+  # 只有 Regular 一个字重（OS/2.usWeightClass = 400，无 fvar 表，非可变字体），
+  # 因此 fontWeight 500/600/700 会走引擎的合成加粗（faux bold）。
+  # 家族名 'LXGWNeoZhiSong' 是 Flutter 侧的注册名，可任意取；
+  # 字体文件内部族名实为「霞鹜新致宋 简」，与本处不冲突。
+  # 中文文件名用引号包住，YAML 里非 ASCII 路径必须引号才不会踩解析歧义。
+  fonts:
+    - family: LXGWNeoZhiSong
+      fonts:
+        - asset: "assets/fonts/霞鹜新致宋字体.ttf"

@@ -99,10 +99,16 @@ TillRoads/
 ├── .github/workflows/schema-ci.yml  # schema 幂等/可逆 + Node 单测 + PG 集成
 ├── *.md                       # 设计 / 决策 / 评审文档
 ├── package.json               # scripts: test / test:core / test:server / test:integration / start
+├── tillroad_app/              # Flutter 前端（FE-01 已初始化，iOS/Android/Windows 三平台）
+│   ├── lib/                   #   13 个 dart 文件：main / theme / mock / pages×5 / widgets×5
+│   ├── assets/icons/          #   1024 图标源（白底 app_icon + 透明底 foreground）
+│   └── screenshots/           #   FE-01 验收截图（Windows + Android）
 └── REVIEW-NOTES.md / README.md
 ```
 
-> 设计取舍：本机无 Flutter SDK、无 PostgreSQL/Docker，故把「与端无关的核心闭环规则」抽成纯 JS 层，当前环境即可验证，且与 `schema.sql` 的触发器/约束/去重/状态机严格对齐、契约零漂移；后续可直接移植到 Dart（FE）或 NestJS（BE）。
+> 设计取舍：`core/` 把「与端无关的核心规则」抽成纯 JS 层（零依赖、不 import pg），当前环境即可验证，且与 `schema.sql` 的触发器/约束/去重/状态机严格对齐、契约零漂移；后续可直接移植到 Dart（FE）或 NestJS（BE）。
+>
+> **前端**（`tillroad_app/`）已接入 Flutter 3.50.0，但 FE-01 只用 `home_mock.dart` 假数据、**不连后端**——真实数据接入是后续前端里程碑的事。
 
 ---
 
@@ -564,6 +570,38 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 **图片占位**：题干/选项里的 `![alt](asset:...)`、`data:` 内联图、`http(s)://` 外链会被识别并计入 `stats.image_placeholders`，但 **MVP 不下载、不存储、不写 `assets` 行**（入库后 `questions.asset_refs` 仍为 `null`）。真正的图片分离放 V1，与对象存储、OCR 一起做。
 ---
 
+## 5.5 应用界面与字体（`tillroad_app/`）
+
+### 字体
+
+接入第三方中文字体 **霞鹜新致宋（LXGW Neo ZhiSong）**，SIL Open Font License 1.1，可免费商用与嵌入。
+
+| 项 | 值 |
+|---|---|
+| 文件 | `tillroad_app/assets/fonts/霞鹜新致宋字体.ttf` |
+| 体积 | 3,881,858 B（约 3.7 MiB） |
+| Flutter 注册名 | `LXGWNeoZhiSong`（`lib/theme/app_theme.dart` 的 `kFontFamily`） |
+| 字体内部族名 | `霞鹜新致宋 简`（与注册名不同，互不冲突） |
+| 字重 | **仅 Regular**（`OS/2.usWeightClass = 400`，无 `fvar` 表，非可变字体） |
+| 授权 | SIL OFL 1.1（嵌入应用、随包分发、商用均允许；修改后须换名） |
+
+**为什么只在 `textTheme.textStyle` 写一次不够**：`WidgetsApp` 会把 `textTheme.textStyle` 装成全局 `DefaultTextStyle`（`flutter/lib/src/widgets/app.dart` 里 `DefaultTextStyle(style: widget.textStyle!)`），页面里没有显式 `style` 的 `Text` 会继承它。但 `CupertinoNavigationBar` / `CupertinoSliverNavigationBar` / `CupertinoTabBar` / `CupertinoButton` / `CupertinoPicker` 内部各自重新铺 `DefaultTextStyle`，继承链在那里断掉。所以 `CupertinoTextThemeData` 的 **9 个 TextStyle 全部逐个写了 `fontFamily`**：`textStyle` / `navTitleTextStyle` / `navLargeTitleTextStyle` / `tabLabelTextStyle` / `actionTextStyle` / `actionSmallTextStyle` / `navActionTextStyle` / `pickerTextStyle` / `dateTimePickerTextStyle`。
+
+**`CupertinoAlertDialog` 是例外**：它在 `cupertino/dialog.dart` 里把标题/正文/按钮文字**硬编码成 `fontFamily: 'CupertinoSystemText'`**，而构造函数只暴露 `title`/`content`/`actions` 三个 Widget，没有 `titleTextStyle`/`messageTextStyle` 参数 → **无法从主题覆盖**。唯一办法是给每个 `Text` 显式写 `style: TextStyle(fontFamily: kFontFamily, ...)`（`Merge` 时显式值胜出）。参见 `lib/pages/home_page.dart` 的 `_showComingSoon`。
+
+**合成加粗的代价**：字体只有一个字重，所以界面里所有 `fontWeight: 600/700`（大标题、卡片标题、对话框标题）都是引擎的**伪粗体（faux bold）**——把 Regular 字形填充加厚，笔画会略糊。要真正印刷质量的粗宋，需另补 Bold 字重文件到同一 `family` 下（`fonts:` 列表里加第二项 `weight: 700`），本轮未做（用户硬约束：不擅自下载 Bold）。
+
+**体积提示**：一个 3.7 MiB 的字体文件只放单个字重，对 APK 体积影响明显（debug APK 从 143 MB → 约 147 MB）。V1 若引入 Bold 会再增加同等体积，可考虑按需裁剪子集。
+
+### 目录与依赖
+
+- `tillroad_app/lib/` 13 个 dart 文件：`main.dart` / `theme/app_theme.dart` / `mock/home_mock.dart` / `pages/` 5 个 / `widgets/` 5 个。
+- 运行时依赖只有 `cupertino_icons`；dev 依赖 `flutter_lints` + `flutter_launcher_icons`。**无状态管理库、无网络库、无路由库、无图表库**。
+- 兼容平台：`android` / `ios` / `windows`（Windows 仅为本机开发期验证用，交付目标是移动端）。
+- 已知 `flutter analyze` 输出：**0 error / 0 warning / 12 info**，12 条全是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「只加 cupertino_icons」的约束冲突。
+
+---
+
 ## 6. 当前里程碑与后续
 
 - ✅ 文档评审 + 4 项 P0 / 4 项 P1 修订（详见 [REVIEW-NOTES.md](<REVIEW-NOTES.md>)）
@@ -579,7 +617,9 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - ✅ **BE-04**：验证任务列表 + 临期提醒（**纯查询层**）：`server/verify_window.mjs` 窗口常量与 `computeUrgency` 纯函数（13 条单测）+ `listVerificationTasks` / `verificationSummary` 两仓储查询 + 2 个 GET 端点（fake 层 11 条、真 PG 集成 19 条）；进入时间采用 V2/V3 精确 + V1 近似（`updated_at`）混合取法
 - ✅ **BE-05**：限时模考 + 报告生成（两态生命周期）：`server/mock_report.mjs` 四项报告纯函数（22 条单测）+ `mock_exams`/`attempts` 两仓储（随机组卷 + 同事务收卷）+ 5 个端点（组卷/详情/提交/报告/列表/软删）；`v3_candidates` 只指路不当迁移，`strategy_execution` 返回 `null`
 - ✅ **BE-06**：日/周/月复盘统计（**用户触发快照**）：`server/review_period.mjs` 周期起止纯函数（ISO 周 + `Asia/Shanghai` 日界，10 条单测）+ `server/review_stats.mjs` 六项 metrics 全 SQL 层聚合 + `review_cycles` 仓储与 5 个端点（同周期 `409 ALREADY_EXISTS`）+ 删掉 BE-03 遗留的假 `/review-cycles`；fake 层 6 条、真 PG 集成 12 条
-- ⏳ BE-07 缺陷分布看板 / BE-08 同步服务 → FE-09 → FE-11 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
+- ✅ **FE-01**：Flutter 项目初始化 + 首页看板（纯 Cupertino、无第三方状态/网络/路由/图表库）：`tillroad_app/` 13 个 dart 文件 + `home_mock.dart` 假数据；大标题折叠、弹簧按压、倒计时 `AnimatedSwitcher`、Reduce Motion 降级；`flutter analyze` 0 error；Android 17 模拟器真机跑通并截图
+- ✅ **FE-01 字体**：接入霞鹜新致宋（`assets/fonts/霞鹜新致宋字体.ttf`，SIL OFL 1.1），`CupertinoTextThemeData` 九个 TextStyle 逐项覆盖 + `CupertinoAlertDialog` 三处硬编码 `CupertinoSystemText` 的显式覆盖；Android 17 模拟器真机复核四张截图
+- ⏳ FE-02 建题/导入页 → FE-11 审核七态 UI → BE-07 缺陷分布看板 / BE-08 同步服务 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
 
 ---

@@ -633,3 +633,107 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - `open_defects.by_status` 硬编码七个非 CLOSED 状态；若 schema 未来新增状态，需同步改 `DEFECT_STATUSES_OPEN` 白名单（代码里刻意只认白名单键，防静默混进契约）。
 - 复盘端点**无鉴权**（全项目一致，MVP 阶段由 FE 层带 `user_id`）。
 - FE-06 需要的字段：`metrics` 六项已足；图表化建议前端直接用 `by_status` 七键画堆叠柱、`layer_dist` 画饼图、`reopen_hotspots` 画条形。
+
+---
+
+## 22. FE-01 归档（Flutter 项目初始化 + 首页看板）
+
+### 范围
+
+首轮前端里程碑：初始化 `tillroad_app`（Flutter 3.50.0 / Dart 3.14.0）+ 纯 `home_mock.dart` 数据的首页看板。**不连后端、不发 HTTP**，Android/iOS/Windows 三平台工程同时生成（Windows 用于本机无 Android 时的 UI 验证，实际最终在 Android 17 模拟器上验收）。
+
+### 关键决策
+
+- **移除 `material_ui`**：`flutter create` 模板默认写 `material_ui: ^1.1.0`（pub 上的独立包）。为满足「iOS 原生 Cupertino 风格」且用户要求「只加 cupertino_icons」，把整个模板改写成 Cupertino。代价：不能用 Material 的 `Divider`（改用 `SizedBox`+`ColoredBox` 画 0.5px 线）。
+- **`flutter analyze` 的 12 条 info 刻意不修**：全是同一条 `deprecated_member_use`——`package:flutter/cupertino.dart` 自 v3.47 起被标记弃用，官方建议改用 `package:cupertino_ui/cupertino_ui.dart`。改成新包等于引入第二个运行时依赖，直接违反用户约束。这是真实的二选一，已在交付说明中写明。
+- **`SpringDescription.withDampingRatio` 的 `mass` 是 required**：任务书只给了 `stiffness: 220`，代码补 `mass: 1`。且内部算 `sqrt(mass*stiffness)` 不是 const 表达式，只能 `final` 不能 `const`。
+- **`PressableCard` 手写 `AnimationController` + `SpringSimulation`**：`AnimatedScale` 只接受 `Curve`，无法表达 `SpringDescription`。
+- **图标从 12500×12500 源图裁字形再重排**：源图 `D:\1Krint\Guosu\Design\模板_画板 1.png` 字形只占画面约 37.5%×40.5%（bbox `x[3910..8590] y[3720..8770]`），直接用会让桌面图标里 logo 小得看不清。裁 bbox 后居中，白底出 62% 的 `app_icon.png`（iOS 不接受 alpha），透明底出 58% 的 `app_icon_foreground.png`（Android 自适应图标前景，需落在 66% 安全区内）。
+- **`android:label` / `CFBundleDisplayName` 改为「题路」**：模板默认 `tillroad_app` / `Tillroad App`，桌面显示英文名不符产品。
+
+### 验收证据
+
+- `flutter analyze` → **0 error / 0 warning / 12 info**。
+- `flutter test` → 3 个 widget 测试全通过（首屏、滚动后区块、Tab 切换空状态）。
+- `flutter build apk --debug` → `√ Built build\app\outputs\flutter-apk\app-debug.apk`。
+- Android 17（API 37）模拟器真机跑通：`topResumedActivity=...com.tillroad.tillroad_app/.MainActivity`。
+- 截图存于 `tillroad_app/screenshots/`：`fe01-android-home.png`（首屏）、`fe01-android-tab.png`（Tab 切换空状态）、`fe01-android-drawer.png`（应用抽屉图标 + 中文名）、`fe01-android-launcher.png`（桌面 Dock）。
+
+### 环境纠正（重要）
+
+**上轮报告说「缺 JDK、全盘无 java」是错的**——当时只扫了 `C:\Program Files\Java`、`~/.jdks`、`C:\` 浅层，**漏扫 D 盘**。JDK 一直在 `D:\Program Files\Android\Android Studio\jbr\bin\java.exe`（Android Studio 自带 JBR，OpenJDK 25.0.4），Android Studio 本身也早已安装在 `D:\Program Files\Android\Android Studio\`。同理 cmdline-tools 也已装好（`cmdline-tools;23.0`，用原生 `android.exe` 取代了 `sdkmanager`）。`flutter doctor` 除 Chrome 外全绿。
+
+教训：**扫描已安装软件不能只扫系统盘和固定几个路径**，Windows 上用户完全可能把整个工具链放 D 盘。
+
+### Android 桌面图标「浅蓝光晕」的真相
+
+现象：Dock 里图标外围有一圈浅青色。经排查**不是配置问题**：
+
+- `values/colors.xml` 的 `ic_launcher_background = #FFFFFF` 正确；`mipmap-anydpi-v26/launcher_icon.xml` 的 `<background android:drawable="@color/ic_launcher_background"/>` 正确；foreground PNG 角像素 `A=0` 透明正常；无 `values-night` 覆盖。
+- **决定性证据**：清掉启动器缓存后，Dock 第 4 槽换成 Gmail，Gmail 外围出现了同样的粉色光圈。而**应用抽屉里我们的图标是纯白底无光圈**。
+
+结论：那是 **Android 17 启动器给 Dock 热座位图标加的系统级装饰**，对所有图标一视同仁，与我们的 adaptive icon 配置无关。功能与素材都没问题。
+
+### 踩坑与修复
+
+- `SectionHeader` 漏 import → 补 `import '../widgets/common.dart';`。
+- `Divider` 是 Material 组件 → 改 `SizedBox(height: 0.5, child: ColoredBox(...))`。
+- `test/widget_test.dart` 模板残留 `material_ui` 导入与 `MyApp`/`Icons` → 整文件重写为 Cupertino 测试。
+- 测试里 `find.text('快捷入口')` 找不到 → 默认视口 800×600 在折叠线下方，改用 `tester.scrollUntilVisible`。
+- `Scrollable` 未定义 → 补 `import 'package:flutter/widgets.dart';`。
+- **`verify_page.dart` 被误写到 `D:\DSH\tillroad_app\`（少一层 `TillRoads`）** → 复制到正确路径后删除错目录。删除前必须用 `@(Get-ChildItem ...)` 强制数组（PowerShell 单结果会退化为字符串，`$stray[0]` 取到首字符）。
+- 窗口截图被裁：本机 DPI 缩放 1.25（`GetDeviceCaps(LOGPIXELSX)=120`），`CopyFromScreen` 用物理像素而窗口尺寸按逻辑像素 → 改用 `PrintWindow(hwnd, hdc, 2)`（`PW_RENDERFULLCONTENT`）。
+- `flutter build windows` 报 `MSB3073` → App 进程仍占用 exe，`Get-Process tillroad_app | Stop-Process -Force` 后重建成功。
+- `CupertinoSliverNavigationBar` 漏 `alwaysShowMiddle: false` → 截图里「题路」显示两次（大标题 + 中间标题）。
+- `TaskCard` 首版把天数徽标和 urgency 文案叠在右侧两列 → 400px 宽下考点名被截断；重构为右侧只放天数徽标、urgency 移到左侧第二行。
+- `FontWeight.w590` 不存在（只有 w100..w900 九档）→ 改 `w600`。
+- PowerShell 把 Flutter 的 stderr 提示当 `NativeCommandError` 报 `[exit code: 1]`，判据要看 `All tests passed` / `Built` 字样，不能只看退出码。
+
+### 遗留
+
+- **iOS 构建未验证**：需要 macOS + Xcode，本机不可能。工程结构与 `Info.plist` 已配好，但 iOS 侧图标与布局未经真机/模拟器确认。
+- **Chrome 未装**：`flutter doctor` 唯一红项，只影响 web 平台，不影响 Android/iOS。
+- 首页 4 个快捷入口（建题/转缺陷单/开始模考/复盘）目前只弹 `CupertinoAlertDialog` 提示「后续前端里程碑实现」，未接真实页面。
+- 后 4 个 Tab 是空状态占位。
+- 所有数据来自 `home_mock.dart`，**未接后端**（BE-00~BE-06 的 API 尚未被前端调用）。下一前端里程碑应做真实数据接入层。
+- Reduce Motion 降级已实现（`MediaQuery.disableAnimations` → 200ms 纯淡入淡出 + 关掉弹簧/视差），但**未在真机上开系统「移除动画」开关实测**，仅代码路径正确。
+- **字体接入（后续补充，见 §23）**：霞鹜新致宋只提供 Regular 一个字重，因此界面里所有 `fontWeight: w600/w700` 都是引擎的合成加粗（faux bold）。要真粗宋需另补 Bold 字重文件。
+
+---
+
+## 23. FE-01 字体接入（霞鹜新致宋全量替换）
+
+### 范围
+
+把用户提供的 `tillroad_app/assets/fonts/霞鹜新致宋字体.ttf` 接入为全应用字体，并在 Android 17 模拟器上重新验证。**不改后端、不下载其他字体、不拆分中英文字体栈、不擅自下载 Bold、不引入 `cupertino_ui`**。
+
+### 字体事实（全部实测）
+
+| 项 | 值 | 读取方式 |
+|---|---|---|
+| 文件 | `霞鹜新致宋字体.ttf` 3,881,858 B | `Get-Item` |
+| 字重 | **仅 Regular**：`OS/2.usWeightClass = 400`、`OS/2.fsSelection = 0b101000000`（仅 REGULAR 位） | 手写 TTF 表解析 |
+| 可变字体？ | **否**（无 `fvar` 表） | TTF 表标签列表 25 个，无 `fvar` |
+| 内部族名 | `霞鹜新致宋 简` | `System.Drawing.Text.PrivateFontCollection.AddFontFile` |
+| 授权 | SIL OFL 1.1 | 用户提供，字体自带 |
+
+### 关键决策
+
+- **注册名取 `LXGWNeoZhiSong`**：pubspec 的 `family:` 是 Flutter 侧注册名，与 TTF 内部族名 `霞鹜新致宋 简` 无需一致。取 ASCII 名便于在代码里引用（`kFontFamily` 常量）。
+- **中文文件名加引号**：pubspec 的 `asset: "assets/fonts/霞鹜新致宋字体.ttf"` —— YAML 里非 ASCII 路径不引号容易踩解析歧义。实测 `flutter pub get` → `Got dependencies!`。
+- **9 个 `CupertinoTextThemeData` style 全部逐项写 `fontFamily`**：只写 `textStyle` 不够。继承链实测：`WidgetsApp`（`flutter/lib/src/widgets/app.dart:1737` `DefaultTextStyle(style: widget.textStyle!)`）← `CupertinoApp`（`cupertino/app.dart:597/633` 传 `effectiveThemeData.textTheme.textStyle`），`CupertinoPageScaffold` 不截断，所以页面里裸 `Text` 能继承；但 `CupertinoNavigationBar`/`SliverNavigationBar`/`TabBar`/`Button`/`Picker` 内部各自铺 `DefaultTextStyle`，继承链在那些组件断掉。
+- **`CupertinoAlertDialog` 必须逐 `Text` 覆盖**：`cupertino/dialog.dart:36-58` 把标题/正文/按钮硬编码 `fontFamily: 'CupertinoSystemText'`，构造函数（`:233-242`）只暴露 `title`/`content`/`actions`，无 `titleTextStyle`/`messageTextStyle` → **无法从主题覆盖**。已在 `lib/pages/home_page.dart` 的 `_showComingSoon` 给三个 `Text` 显式写 `style: TextStyle(fontFamily: kFontFamily, ...)`。
+
+### 验收证据（Android 17 模拟器，真机实测）
+
+- `flutter analyze` → **0 error / 0 warning / 12 info**（12 条仍全是同一条 cupertino deprecation）。
+- `flutter test` → **3 个测试全通过**。
+- `flutter build apk --debug` → `√ Built build\app\outputs\flutter-apk\app-debug.apk`；`adb install -r` → Success；`topResumedActivity=com.tillroad.tillroad_app/.MainActivity`。
+- 四张截图（`tillroad_app/screenshots/`）：`fe01-font-home.png`(218667 B) / `fe01-font-scrolled.png`(215315 B，大标题折叠) / `fe01-font-tab.png`(85210 B，缺陷单空状态) / `fe01-font-dialog.png`(247304 B，`CupertinoAlertDialog` 字体生效证据)。
+
+### 踩坑（本轮新增）
+
+- **edit 的 anchor 范围吃掉了 `class AppTheme {` 行**，导致新旧两个 `AppTheme` 类同时存在（`flutter analyze` 报 `12 issues` 但其实是编译错误级别）。修复靠 `Select-String -Pattern 'class X'` 数定义次数才发现。教训：大范围替换后必须数一遍类/函数定义次数。
+- **`adb shell input tap` 坐标是物理像素**：预览截图被降采样到 720×1600，实机 1080×2400（420 dpi），比例 1.5。按预览图坐标点对话框按钮会打到空白处。必须按物理像素算（对话框「知道了」预览 y≈850 → 实机 1275）。
+- **`adb exec-out screencap -p` 在 PowerShell 里会把字节流当字符串数组**，`[System.IO.File]::WriteAllBytes` 报 `无法将值“�PNG”转换为类型“System.Byte”`。改用 `adb shell screencap -p /sdcard/x.png` + `adb pull` 两步。
+- **`adb` 不在 PATH**：必须用全路径 `C:\Users\guosu\AppData\Local\Android\Sdk\platform-tools\adb.exe`。

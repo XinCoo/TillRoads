@@ -31,14 +31,45 @@ class _HomePageState extends State<HomePage> {
   void _showComingSoon(String feature) {
     showCupertinoDialog<void>(
       context: context,
+      // CupertinoAlertDialog 在 cupertino/dialog.dart 里把 title/content/action
+      // 三处文字硬编码成 `fontFamily: 'CupertinoSystemText'`
+      // （_kCupertinoDialogTitleStyle / _kCupertinoDialogContentStyle /
+      // _kCupertinoDialogActionStyle），而且对外只暴露 title/content/actions
+      // 三个 Widget，没有 titleTextStyle / messageTextStyle 参数可覆盖。
+      // 所以这里只能给每个 Text 显式写 style —— TextStyle.merge 时显式指定的
+      // fontFamily 胜出，组件内部的 DefaultTextStyle 只负责填充剩余属性。
       builder: (BuildContext ctx) => CupertinoAlertDialog(
-        title: Text(feature),
-        content: const Text('FE-01 只做看板展示，该功能在后续前端里程碑实现。'),
+        title: Text(
+          feature,
+          style: const TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+            color: AppColors.label,
+          ),
+        ),
+        content: const Text(
+          'FE-01 只做看板展示，该功能在后续前端里程碑实现。',
+          style: TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 13,
+            color: AppColors.label,
+            height: 1.35,
+          ),
+        ),
         actions: <Widget>[
           CupertinoDialogAction(
             isDefaultAction: true,
             onPressed: () => Navigator.of(ctx).pop(),
-            child: const Text('知道了'),
+            child: const Text(
+              '知道了',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 17,
+                fontWeight: FontWeight.w400,
+                color: AppColors.accent,
+              ),
+            ),
           ),
         ],
       ),

@@ -80,10 +80,29 @@ final SpringDescription kPressSpring = SpringDescription.withDampingRatio(
   ratio: 0.85,
 );
 
+/// 全局字体族（FE-01 字体接入）
+///
+/// 霞鹜新致宋（LXGW Neo ZhiSong），SIL OFL 1.1，可免费商用与嵌入。
+/// 名字是 Flutter 侧的注册名（见 pubspec.yaml 的 `flutter.fonts`），
+/// 字体文件内部族名是「霞鹜新致宋 简」，两者不必一致。
+///
+/// **只有 Regular 一个字重**（无 fvar 表、OS/2.usWeightClass = 400），
+/// 所以本工程任何 `fontWeight: 600/700` 都是引擎的合成加粗（faux bold），
+/// 不是真实粗体字形。印刷质量的粗宋体需要另补 Bold 字重文件。
+const String kFontFamily = 'LXGWNeoZhiSong';
+
 /// Cupertino 主题
 ///
 /// 只覆盖会真正用到的几项：主色、分组背景、导航栏背景、
 /// 以及大标题/导航标题字号（iOS 大标题 34pt bold，与系统一致）。
+///
+/// **字体必须逐项显式写**，不能只靠 `textStyle` 一项：
+/// `WidgetsApp` 会把 `textTheme.textStyle` 装成全局 `DefaultTextStyle`
+/// （flutter/lib/src/widgets/app.dart 里 `DefaultTextStyle(style: widget.textStyle!)`），
+/// 页面内没有显式 style 的 `Text` 会继承它；
+/// 但 `CupertinoNavigationBar` / `CupertinoSliverNavigationBar` / `CupertinoTabBar`
+/// / `CupertinoButton` / 选择器这些组件内部会自己铺 `DefaultTextStyle`，
+/// 继承链在那里断掉，所以它们各自的 textStyle 必须单独带 fontFamily。
 class AppTheme {
   const AppTheme._();
 
@@ -94,28 +113,78 @@ class AppTheme {
       scaffoldBackgroundColor: AppColors.groupedBackground,
       barBackgroundColor: Color(0xF2F7F7FA),
       textTheme: CupertinoTextThemeData(
+        // 全局默认正文：17pt（iOS body）。fontFamily 在这里一度会通过
+        // DefaultTextStyle 向下继承，是「全量应用」的主要执行点。
         textStyle: TextStyle(
+          fontFamily: kFontFamily,
           fontSize: 17,
           color: AppColors.label,
           decoration: TextDecoration.none,
         ),
+        // 导航栏折叠后的 17pt 标题（CupertinoSliverNavigationBar 收起大标题时用它）
         navTitleTextStyle: TextStyle(
+          fontFamily: kFontFamily,
           fontSize: 17,
           fontWeight: FontWeight.w600,
           color: AppColors.label,
           letterSpacing: -0.4,
           decoration: TextDecoration.none,
         ),
+        // 导航栏展开的 34pt 大标题
         navLargeTitleTextStyle: TextStyle(
+          fontFamily: kFontFamily,
           fontSize: 34,
           fontWeight: FontWeight.w700,
           color: AppColors.label,
           letterSpacing: 0.37,
           decoration: TextDecoration.none,
         ),
+        // 底部 TabBar 的 10pt 标签
         tabLabelTextStyle: TextStyle(
+          fontFamily: kFontFamily,
           fontSize: 10,
           fontWeight: FontWeight.w500,
+          decoration: TextDecoration.none,
+        ),
+        // CupertinoButton 的文字
+        actionTextStyle: TextStyle(
+          fontFamily: kFontFamily,
+          fontSize: 17,
+          fontWeight: FontWeight.w400,
+          color: AppColors.accent,
+          decoration: TextDecoration.none,
+        ),
+        // 小号按钮 / 次要操作
+        actionSmallTextStyle: TextStyle(
+          fontFamily: kFontFamily,
+          fontSize: 15,
+          fontWeight: FontWeight.w400,
+          color: AppColors.accent,
+          decoration: TextDecoration.none,
+        ),
+        // 导航栏右侧动作按钮
+        navActionTextStyle: TextStyle(
+          fontFamily: kFontFamily,
+          fontSize: 17,
+          fontWeight: FontWeight.w400,
+          color: AppColors.accent,
+          letterSpacing: -0.4,
+          decoration: TextDecoration.none,
+        ),
+        // CupertinoPicker 选项
+        pickerTextStyle: TextStyle(
+          fontFamily: kFontFamily,
+          fontSize: 21,
+          fontWeight: FontWeight.w400,
+          color: AppColors.label,
+          decoration: TextDecoration.none,
+        ),
+        // 日期时间选择器
+        dateTimePickerTextStyle: TextStyle(
+          fontFamily: kFontFamily,
+          fontSize: 21,
+          fontWeight: FontWeight.w400,
+          color: AppColors.label,
           decoration: TextDecoration.none,
         ),
       ),
