@@ -279,12 +279,6 @@ async function listTicketsByUser(ctx, userId) {
   return ok({ items: rows, ...pg });
 }
 
-/** 跨用户读全部（模考报告 / 复盘统计用）。fake 层没有 listAll 时回退空数组。 */
-async function listTicketsForStats(ctx) {
-  const { repos, read } = resolve(ctx);
-  if (typeof repos.defectTickets.listAll !== 'function') return [];
-  return read((c) => repos.defectTickets.listAll(c, { limit: 1000, offset: 0 }));
-}
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -292,17 +286,6 @@ async function listTicketsForStats(ctx) {
 // 模考报告已移到 server/routes/mock_exams.mjs（BE-05）：原来的假数据端点已删除
 // ---------------------------------------------------------------------------
 
-async function reviewCycles(ctx) {
-  const tickets = await listTicketsForStats(ctx);
-  const type = ctx.searchParams.get('type') || 'weekly';
-  return ok({
-    type,
-    closed_count: tickets.filter((x) => x.status === 'CLOSED').length,
-    reopened_count: tickets.filter((x) => x.status === 'REOPENED').length,
-    new_defects: tickets.length,
-    timeline: tickets.slice(0, 10).map((x) => ({ id: x.id, status: x.status, created_at: x.created_at })),
-  });
-}
 
 // ---------------------------------------------------------------------------
 // AI 生成（仍内存；BE-03 不碰）
@@ -348,10 +331,9 @@ export function match(method, seg, ctx) {
   }
 
 
-  // GET /review-cycles?type=weekly
-  if (method === 'GET' && seg.length === 1 && seg[0] === 'review-cycles') {
-    return reviewCycles(ctx);
-  }
+  // GET /review-cycles —— 已移到 server/routes/review_cycles.mjs（BE-06）。
+  // 原来这里固定返回 {type,closed_count,reopened_count,new_defects,timeline} 的假聚合，
+  // 不回任何真实 metrics；BE-06 的复盘快照端点完全取代它，故整段删除。
 
   // AI 生成（含 /ai-jobs 别名）
   if (method === 'POST' && (

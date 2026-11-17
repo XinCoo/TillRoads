@@ -664,6 +664,162 @@ export function createFakeRepos() {
       return { ...row };
     },
   };
+  // -------------------------------------------------------------------------
+  // 复盘快照（BE-06）：与真仓储同语义 —— 同周期重复 create 抛 409 ALREADY_EXISTS，
+  // body 带 existing_id + resolution:'delete_then_recreate'（不是 user_choice：
+  // 复盘已经生成过，要重做必须先删，不存在「合并」选项）。
+  // -------------------------------------------------------------------------
+  const reviewRows = new Map();
+
+  function reviewNotFound(id) {
+    return notFound('review_cycles', id);
+  }
+
+  function alreadyExists(row) {
+    const e = new Error(`review_cycles already exists: ${row.cycle_type} ${row.period}`);
+    e.name = 'ConflictError';
+    e.code = 'ALREADY_EXISTS';
+    e.statusCode = 409;
+    e.status = 409;
+    e.body = {
+      error: 'ALREADY_EXISTS',
+      cycle_type: row.cycle_type,
+      period: row.period,
+      existing_id: row.id,
+      resolution: 'delete_then_recreate',
+    };
+    return e;
+  }
+
+  const reviewCycles = {
+    async create(_client, input = {}) {
+      const { user_id, cycle_type, period } = input;
+      if (!user_id) throw new TypeError('review_cycles.create: user_id 必填');
+      if (!cycle_type) throw new TypeError('review_cycles.create: cycle_type 必填');
+      if (!period) throw new TypeError('review_cycles.create: period 必填');
+      if (!input.metrics || typeof input.metrics !== 'object' || Array.isArray(input.metrics)) {
+        throw new TypeError('review_cycles.create: metrics 必须是对象');
+      }
+
+      // 查重：只看未软删的同周期行。软删后允许重新生成（与真仓储一致）。
+      for (const row of reviewRows.values()) {
+        if (
+          !row.deleted_at &&
+          row.user_id === user_id &&
+          row.cycle_type === cycle_type &&
+          row.period === period
+        ) {
+          throw alreadyExists(row);
+        }
+      }
+
+      const nowIso = new Date().toISOString();
+      const row = {
+        id: newId('rc'),
+        user_id,
+        cycle_type,
+        period,
+        metrics: input.metrics,
+        completed: input.completed === true,
+        created_at: nowIso,
+        updated_at: nowIso,
+        version: 1,
+        deleted_at: null,
+      };
+      reviewRows.set(row.id, row);
+      return { ...row };
+    },
+
+    async getById(_client, id) {
+      const row = reviewRows.get(id);
+      if (!row || row.deleted_at) throw reviewNotFound(id);
+      return { ...row };
+    },
+
+    async findByPeriod(_client, userId, cycleType, period, opts = {}) {
+      for (const row of reviewRows.values()) {
+        if (row.deleted_at) continue;
+        if (opts.excludeId && row.id === opts.excludeId) continue;
+        if (row.user_id === userId && row.cycle_type === cycleType && row.period === period) {
+          return { ...row };
+        }
+      }
+      return null;
+    },
+
+    async listByUser(_client, userId, opts = {}) {
+      const limit = Number.isFinite(opts.limit) && opts.limit > 0 ? opts.limit : 50;
+      const offset = Number.isFinite(opts.offset) && opts.offset > 0 ? opts.offset : 0;
+
+      const filtered = [...reviewRows.values()]
+        .filter((row) => !row.deleted_at && row.user_id === userId)
+        .filter((row) => (opts.cycleType ? row.cycle_type === opts.cycleType : true))
+        .filter((row) => (opts.period ? row.period === opts.period : true))
+        .filter((row) => (opts.completed === undefined ? true : row.completed === opts.completed))
+        // period DESC, created_at DESC, id DESC —— 与真仓储 ORDER BY 完全一致
+        .sort((a, b) => {
+          if (a.period !== b.period) return a.period < b.period ? 1 : -1;
+          if (a.created_at !== b.created_at) return a.created_at < b.created_at ? 1 : -1;
+          return a.id < b.id ? 1 : -1;
+        });
+
+      return {
+        items: filtered.slice(offset, offset + limit).map((row) => ({ ...row })),
+        total: filtered.length,
+        limit,
+        offset,
+      };
+    },
+
+    async markCompleted(_client, id, completed, baseVersion) {
+      const row = reviewRows.get(id);
+      if (!row || row.deleted_at) throw reviewNotFound(id);
+      if (Number(baseVersion) !== Number(row.version)) throw conflict(row, baseVersion);
+      row.completed = completed === true;
+      row.version += 1;
+      row.updated_at = new Date().toISOString();
+      reviewRows.set(id, row);
+      return { ...row };
+    },
+
+    async archive(_client, id, baseVersion) {
+      const row = reviewRows.get(id);
+      if (!row || row.deleted_at) throw reviewNotFound(id);
+      if (Number(baseVersion) !== Number(row.version)) throw conflict(row, baseVersion);
+      row.deleted_at = new Date().toISOString();
+      row.version += 1;
+      reviewRows.set(id, row);
+      return { ...row };
+    },
+
+    async findByIdIncludingDeleted(_client, id) {
+      const row = reviewRows.get(id);
+      return row ? { ...row } : null;
+    },
+  };
+
+  // fake 的 metrics 实现：零值骨架，只为让路由层可在无 PG 下单测。
+  // 六项键与 review_stats.computeMetrics 完全一致（契约不漂移），
+  // 真口径由 server/routes/review_cycles.integration.test.mjs 覆盖。
+  reviewCycles.computeMetrics = async (_client, _userId, _bounds) => ({
+    open_defects: {
+      total: 0,
+      by_status: {
+        DRAFT: 0,
+        ANALYZED: 0,
+        ACTION_DONE: 0,
+        V1: 0,
+        V2: 0,
+        V3: 0,
+        REOPENED: 0,
+      },
+    },
+    layer_dist: {},
+    verify_pass_rate: { pass: 0, fail: 0, total: 0, rate: null },
+    mock_stability: null,
+    target_progress: { target_score: null, latest_mock_score: null, rate: null },
+    reopen_hotspots: [],
+  });
 
   function norm(value) {
     return String(value ?? '')
@@ -672,5 +828,5 @@ export function createFakeRepos() {
       .toUpperCase();
   }
 
-  return { client: null, defectTickets, actions, verifications, mockExams, attempts, questions };
+  return { client: null, defectTickets, actions, verifications, mockExams, attempts, questions, reviewCycles };
 }

@@ -561,17 +561,18 @@ test('POST /ai/questions:generate 校验 count 1..20 且返回 provider/model �
   assert.equal(alias.data.error, 'INVALID_COUNT');
 });
 
-test('GET /review-cycles 字段完整，GET /mock-exams/:id/report 未提交 -> 404 not_submitted', async (t) => {
+test('BE-06：假 GET /review-cycles 已被真复盘模块取代；GET /mock-exams/:id/report 未提交 -> 404', async (t) => {
   const base = await startDefectServer(t);
   const id = await newAnalyzed(base);
 
+  // 旧假端点固定返回 {type,closed_count,reopened_count,new_defects,timeline}，
+  // 不查任何真实 metrics。BE-06 已把它从 defect_tickets.mjs 删除，
+  // 改由 server/routes/review_cycles.mjs 接管——该模块要求 user_id 必填，
+  // 所以这里断言「旧形状不再出现」，即拿到 400 missing_user_id。
   const rc = await req(base, 'GET', '/review-cycles?type=weekly');
-  assert.equal(rc.status, 200);
-  assert.equal(rc.data.type, 'weekly');
-  assert.equal(typeof rc.data.closed_count, 'number');
-  assert.equal(typeof rc.data.reopened_count, 'number');
-  assert.equal(rc.data.new_defects, 1);
-  assert.ok(Array.isArray(rc.data.timeline));
+  assert.equal(rc.status, 400);
+  assert.equal(rc.data.error, 'missing_user_id');
+  assert.equal(rc.data.closed_count, undefined);
 
   // BE-05：模考报告已改为真实现（不再是假数据常量）。
   // 本用例只验证「不存在的模考 -> 404」，真报告的字段形状由
@@ -995,4 +996,197 @@ test('DELETE /mock-exams/:id：需 base_version，软删后 404', async (t) => {
 
   const gone = await req(base, 'GET', `/mock-exams/${id}`);
   assert.equal(gone.status, 404, JSON.stringify(gone.data));
+});
+
+// ---------------------------------------------------------------------------
+// BE-06：日/周/月复盘（fake 层）
+// ---------------------------------------------------------------------------
+
+test('POST /review-cycles：weekly 空 period 默认当前周期，201 带 metrics 六项', async (t) => {
+  const base = await startDefectServer(t);
+
+  const r = await req(base, 'POST', '/review-cycles', { user_id: 'u-1', cycle_type: 'weekly' });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+
+  // period 由服务端补全为当前 ISO 周（YYYY-Www，零填充）
+  assert.match(r.data.period, /^\d{4}-W\d{2}$/);
+  assert.equal(r.data.cycle_type, 'weekly');
+  assert.equal(r.data.completed, false);
+  assert.equal(r.data.version, 1);
+
+  // 响应除了落库行，还应回带解析出的周期边界（左闭右开 + 时区）
+  assert.ok(r.data.period_start_at, '应回带 period_start_at');
+  assert.ok(r.data.period_end_at, '应回带 period_end_at');
+  assert.equal(r.data.time_zone, 'Asia/Shanghai');
+
+  // metrics 六项键齐备（契约不因 fake 而漂移）
+  const m = r.data.metrics;
+  assert.ok(m.open_defects && typeof m.open_defects.total === 'number');
+  assert.ok(m.open_defects.by_status && typeof m.open_defects.by_status === 'object');
+  assert.ok(m.layer_dist && typeof m.layer_dist === 'object');
+  assert.ok(m.verify_pass_rate && typeof m.verify_pass_rate.total === 'number');
+  assert.ok('mock_stability' in m, 'mock_stability 键必须存在（首次可为 null）');
+  assert.ok(m.target_progress && 'rate' in m.target_progress);
+  assert.ok(Array.isArray(m.reopen_hotspots));
+});
+
+test('POST /review-cycles：同 user+cycle_type+period 重复 -> 409 ALREADY_EXISTS 带 existing_id', async (t) => {
+  const base = await startDefectServer(t);
+
+  const first = await req(base, 'POST', '/review-cycles', {
+    user_id: 'u-1',
+    cycle_type: 'daily',
+    period: '2026-11-17',
+  });
+  assert.equal(first.status, 201, JSON.stringify(first.data));
+
+  const dup = await req(base, 'POST', '/review-cycles', {
+    user_id: 'u-1',
+    cycle_type: 'daily',
+    period: '2026-11-17',
+  });
+  assert.equal(dup.status, 409, JSON.stringify(dup.data));
+  assert.equal(dup.data.error, 'ALREADY_EXISTS');
+  assert.equal(dup.data.existing_id, first.data.id);
+  assert.equal(dup.data.resolution, 'delete_then_recreate');
+
+  // 不同 cycle_type 同 period 不算重复
+  const other = await req(base, 'POST', '/review-cycles', {
+    user_id: 'u-1',
+    cycle_type: 'weekly',
+    period: '2026-W47',
+  });
+  assert.equal(other.status, 201, JSON.stringify(other.data));
+});
+
+test('POST /review-cycles：非法 period / cycle_type / 缺 user_id 都是 400', async (t) => {
+  const base = await startDefectServer(t);
+
+  const badPeriod = await req(base, 'POST', '/review-cycles', {
+    user_id: 'u-1',
+    cycle_type: 'daily',
+    period: '2026-02-30',
+  });
+  assert.equal(badPeriod.status, 400, JSON.stringify(badPeriod.data));
+  assert.equal(badPeriod.data.error, 'INVALID_PERIOD');
+
+  const badWeek = await req(base, 'POST', '/review-cycles', {
+    user_id: 'u-1',
+    cycle_type: 'weekly',
+    period: '2027-W53', // 2027 只有 52 周
+  });
+  assert.equal(badWeek.status, 400, JSON.stringify(badWeek.data));
+  assert.equal(badWeek.data.error, 'INVALID_PERIOD');
+
+  const badType = await req(base, 'POST', '/review-cycles', {
+    user_id: 'u-1',
+    cycle_type: 'hourly',
+  });
+  assert.equal(badType.status, 400, JSON.stringify(badType.data));
+  assert.equal(badType.data.error, 'INVALID_CYCLE_TYPE');
+
+  const noUser = await req(base, 'POST', '/review-cycles', { cycle_type: 'weekly' });
+  assert.equal(noUser.status, 400, JSON.stringify(noUser.data));
+  assert.equal(noUser.data.error, 'missing_user_id');
+});
+
+test('GET /review-cycles：user_id 必填，列表按 period DESC', async (t) => {
+  const base = await startDefectServer(t);
+
+  const noUser = await req(base, 'GET', '/review-cycles');
+  assert.equal(noUser.status, 400, JSON.stringify(noUser.data));
+  assert.equal(noUser.data.error, 'missing_user_id');
+
+  for (const period of ['2026-11-15', '2026-11-17', '2026-11-16']) {
+    const r = await req(base, 'POST', '/review-cycles', { user_id: 'u-1', cycle_type: 'daily', period });
+    assert.equal(r.status, 201, JSON.stringify(r.data));
+  }
+
+  const list = await req(base, 'GET', '/review-cycles?user_id=u-1');
+  assert.equal(list.status, 200, JSON.stringify(list.data));
+  assert.equal(list.data.total, 3);
+  assert.deepEqual(
+    list.data.items.map((x) => x.period),
+    ['2026-11-17', '2026-11-16', '2026-11-15'],
+  );
+
+  // cycle_type 过滤
+  const weekly = await req(base, 'GET', '/review-cycles?user_id=u-1&cycle_type=weekly');
+  assert.equal(weekly.status, 200);
+  assert.equal(weekly.data.total, 0);
+
+  // 别的用户看不到
+  const other = await req(base, 'GET', '/review-cycles?user_id=u-2');
+  assert.equal(other.data.total, 0);
+});
+
+test('PATCH /review-cycles/:id 只允许 completed，其它键 -> 400 IMMUTABLE_FIELD', async (t) => {
+  const base = await startDefectServer(t);
+
+  const created = await req(base, 'POST', '/review-cycles', { user_id: 'u-1', cycle_type: 'weekly' });
+  assert.equal(created.status, 201);
+  const id = created.data.id;
+
+  // 缺 version -> 400 INVALID_BASE_VERSION
+  const noVer = await req(base, 'PATCH', `/review-cycles/${id}`, { completed: true });
+  assert.equal(noVer.status, 400, JSON.stringify(noVer.data));
+  assert.equal(noVer.data.error, 'INVALID_BASE_VERSION');
+
+  // 改 metrics -> 400 IMMUTABLE_FIELD
+  const immutable = await req(base, 'PATCH', `/review-cycles/${id}`, {
+    version: 1,
+    completed: true,
+    metrics: { open_defects: { total: 999 } },
+  });
+  assert.equal(immutable.status, 400, JSON.stringify(immutable.data));
+  assert.equal(immutable.data.error, 'IMMUTABLE_FIELD');
+  assert.deepEqual(immutable.data.immutable_fields, ['metrics']);
+
+  // completed 非布尔 -> 400 INVALID_COMPLETED
+  const notBool = await req(base, 'PATCH', `/review-cycles/${id}`, { version: 1, completed: 'yes' });
+  assert.equal(notBool.status, 400, JSON.stringify(notBool.data));
+  assert.equal(notBool.data.error, 'INVALID_COMPLETED');
+
+  // 正常标记已读
+  const done = await req(base, 'PATCH', `/review-cycles/${id}`, { version: 1, completed: true });
+  assert.equal(done.status, 200, JSON.stringify(done.data));
+  assert.equal(done.data.completed, true);
+  assert.equal(done.data.version, 2);
+
+  // 旧 version 再提交 -> 409 client_merge
+  const stale = await req(base, 'PATCH', `/review-cycles/${id}`, { version: 1, completed: false });
+  assert.equal(stale.status, 409, JSON.stringify(stale.data));
+  assert.equal(stale.data.error, 'conflict');
+});
+
+test('DELETE /review-cycles/:id：需 base_version，软删后 GET 404，同周期可重新生成', async (t) => {
+  const base = await startDefectServer(t);
+
+  const created = await req(base, 'POST', '/review-cycles', {
+    user_id: 'u-1',
+    cycle_type: 'monthly',
+    period: '2026-11',
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const id = created.data.id;
+
+  const noVer = await req(base, 'DELETE', `/review-cycles/${id}`);
+  assert.equal(noVer.status, 400, JSON.stringify(noVer.data));
+  assert.equal(noVer.data.error, 'INVALID_BASE_VERSION');
+
+  const okDel = await req(base, 'DELETE', `/review-cycles/${id}`, { version: 1 });
+  assert.equal(okDel.status, 200, JSON.stringify(okDel.data));
+
+  const gone = await req(base, 'GET', `/review-cycles/${id}`);
+  assert.equal(gone.status, 404, JSON.stringify(gone.data));
+  assert.equal(gone.data.error, 'not_found');
+
+  // 软删后同周期可再生成（查重只看未软删行）
+  const again = await req(base, 'POST', '/review-cycles', {
+    user_id: 'u-1',
+    cycle_type: 'monthly',
+    period: '2026-11',
+  });
+  assert.equal(again.status, 201, JSON.stringify(again.data));
+  assert.notEqual(again.data.id, id);
 });

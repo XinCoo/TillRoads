@@ -26,6 +26,7 @@ import * as mockExams from './mock_exams.mjs';
 import * as defectTickets from './defect_tickets.mjs';
 import * as questionsImport from './questions_import.mjs';
 import * as verificationTasks from './verification_tasks.mjs';
+import * as reviewCycles from './review_cycles.mjs';
 
 /**
  * 挂载顺序即匹配优先级。长路径模块在前，短路径在后。
@@ -40,6 +41,10 @@ export const ROUTE_MODULES = Object.freeze([
   // BE-03 遗留的 GET /mock-exams/:id/report 假数据端点已从 defect_tickets 删除，
   // 但保留顺序约束可避免将来回退时被旧分支截胡。
   { name: 'mock_exams', match: mockExams.match },
+  // BE-06：复盘快照。必须排在 defect_tickets 之前 ——
+  // BE-03 遗留的假 GET /review-cycles 已从 defect_tickets 删除（T4），
+  // 但前置可保证将来若有模块误认领 /review-cycles 也不被旧路径抢走。
+  { name: 'review_cycles', match: reviewCycles.match },
   { name: 'defect_tickets', match: defectTickets.match },
   { name: 'questions_import', match: questionsImport.match },
   // BE-04：纯查询端点（GET /users/:id/verification-tasks|verification-summary）。

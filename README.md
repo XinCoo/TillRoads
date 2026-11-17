@@ -42,9 +42,13 @@ TillRoads/
 │   ├── verify_window.mjs       #   BE-04 窗口常量 + computeUrgency（纯函数，零依赖）
 │   ├── verify_window.test.mjs  #   13 个用例（urgency 三态边界）
 │   ├── _fake_repos.mjs         #   内存 fake 仓储（供 fake 层测试注入，不 import pg）
-│   ├── mock_report.mjs         #   BE-05 报告纯函数 reportGenerator（零依赖，可单测）
+│   ├── mock_report.mjs         #   BE-05 报告纯函数 reportGenerator + BE-06 computeStability（零依赖）
 │   ├── mock_report.test.mjs    #   22 个用例（四项计算 + cv + v3_candidates + 边界）
+│   ├── review_period.mjs       #   BE-06 周期起止纯函数（ISO 周 + Asia/Shanghai 时区）
+│   ├── review_period.test.mjs  #   10 个用例（跨年周 / 闰年 / 非法 period）
+│   ├── review_stats.mjs        #   BE-06 六项 metrics 聚合（全 SQL 层，不拉全量到 JS）
 │   ├── index.integration.test.mjs  # 11 条路由层 PG 集成（AC-KM-01/02 + 级联软删，仅 CI 跑）
+│   ├── routes/review_cycles.integration.test.mjs # 12 条 BE-06 复盘集成（仅 CI 跑）
 │   ├── routes/
 │   │   ├── _http.mjs          #   ok/fail/assertValid/readBaseVersion/httpError/readBody/pagination
 │   │   ├── index.mjs          #   dispatch()：health 优先，再按 ROUTE_MODULES 顺序问各 match()
@@ -55,7 +59,8 @@ TillRoads/
 │   │   ├── defect_tickets.mjs #   缺陷单状态机全链（BE-03：PG 仓储 + begin-verification 两跳）
 │   │   ├── questions_import.mjs   # POST /questions/import（BE-02 导入端点，JSON+base64）
 │   │   ├── mock_exams.mjs      #   BE-05 组卷 / 提交收卷 / 报告 / 列表（5 个端点）
-│   │   └── verification_tasks.mjs  # BE-04：验证任务列表 + 看板聚合（纯 GET，不写库）
+│   │   ├── verification_tasks.mjs  # BE-04：验证任务列表 + 看板聚合（纯 GET，不写库）
+│   │   └── review_cycles.mjs    #   BE-06：日/周/月复盘快照（5 个端点）
 
 │   ├── db/
 │   │   ├── pool.mjs           #   createPool() + 7 个 OID 类型解析器（numeric→number 等）
@@ -77,6 +82,7 @@ TillRoads/
 │   │   ├── verifications.mjs     #   三次验证记录（按 stage+round 唯一）
 │   │   ├── mock_exams.mjs      #   BE-05 组卷 / 提交收卷 / 报告 / 列表
 │   │   ├── attempts.mjs        #   BE-05 作答记录（is_correct 三态保留）
+│   │   ├── review_cycles.mjs     #   BE-06 复盘快照 CRUD + 同周期查重（ALREADY_EXISTS）
 │   │   └── repositories.integration.test.mjs # 29 条 PG 集成测试
 │   └── import/                # BE-02 导入管线（抽取→切题→去重→入库）
 │       ├── splitter.mjs       #   规则切题（四类分隔符，纯函数零依赖）
@@ -296,7 +302,11 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 | `GET /mock-exams/:id/report` | 读已生成报告；未提交 → `404 not_submitted` |
 | `GET /exam-profiles/:id/mock-exams` | 某目标下模考列表（`mode` 过滤 + 分页，最新在前） |
 | `DELETE /mock-exams/:id` | 软删模考（`base_version` 必填） |
-| `GET /review-cycles?type=weekly` | 周期复盘（BE-03 起读 PG） |
+| `POST /review-cycles` | **BE-06** 生成周期复盘快照（`{user_id, cycle_type:'daily'\|'weekly'\|'monthly', period?}`）→ `201 {id, cycle_type, period, metrics, completed, version, period_start_at, period_end_at, time_zone}`；同 `user_id`+`cycle_type`+`period` 已存在 → `409 ALREADY_EXISTS`（body 带 `existing_id`，**不覆盖**） |
+| `GET /review-cycles?user_id=&cycle_type=&period=&completed=` | **BE-06** 复盘列表（`user_id` 必填，否则 `400 missing_user_id`；按 `period DESC` 排序，分页 `{items,...page}`） |
+| `GET /review-cycles/:id` | **BE-06** 取单份复盘快照 |
+| `PATCH /review-cycles/:id` | **BE-06** 只允许改 `completed`（`base_version` 必填；改 `metrics`/`period` 等 → `400 IMMUTABLE_FIELD` 带 `immutable_fields`） |
+| `DELETE /review-cycles/:id` | **BE-06** 软删（`base_version` 必填） |
 | `GET /users/:userId/verification-tasks` | **BE-04** 验证任务列表（只出 `V1/V2/V3`；可按 `status` / `urgency` 过滤，分页；每行带回 `entered_at` / `window_days` / `days_left` / `urgency`） |
 | `GET /users/:userId/verification-summary` | **BE-04** 验证看板聚合（各 stage 数量 + 逾期/临期/正常计数） |
 | `POST /ai/questions:generate` | BYOK 生成题（count 1–20 校验） |
@@ -445,6 +455,58 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 
 **事务边界**：`POST /mock-exams/:id/submit` **整段 `withTransaction`**——写 attempts 多行 + 回填 `mock_exams.questions[].attempt_id` + 写 `report` jsonb，全成或全败。组卷 `POST /mock-exams` 也是单事务（查量 + 抽题 + 插行）。
 
+### 日/周/月复盘（BE-06）
+
+**用户触发，非定时任务**（拍板项 1）：`POST /review-cycles` 当场算一份快照落库，`GET` 读历史。不跑 cron、不推送、不导 PDF。
+
+周期格式与默认值：
+
+| `cycle_type` | `period` 格式 | 示例 | 不传 `period` 时 | 时区 |
+|---|---|---|---|---|
+| `daily` | `YYYY-MM-DD` | `2026-11-17` | 当前**日历日** | `Asia/Shanghai` |
+| `weekly` | ISO 8601 周 `YYYY-Www` | `2026-W47` | 当前 ISO 周 | `Asia/Shanghai` |
+| `monthly` | `YYYY-MM` | `2026-11` | 当前月 | `Asia/Shanghai` |
+
+> 时区为何是上海而不是 UTC：`users.timezone` 默认 `Asia/Shanghai`，若按 UTC 切日界，中国用户的 daily 复盘会横跨两天（08:00 → 次日 08:00）。周期边界统一用 `Intl.DateTimeFormat` + `timeZone` 求「当地午夜」，转成 UTC 后左闭右开（`startAt <= t < endAt`）。ISO 周用标准算法（第 1 周 = 含 1 月 4 日那周），带回读校验——`2026-W53` 合法（2026 恰有 53 周），`2025-W53`/`2027-W53` 被拒。
+
+**七项 metrics 口径**（存在 `review_cycles.metrics` jsonb）：
+
+| 字段 | 含义 | 关键口径 |
+|---|---|---|
+| `open_defects` | 手中还压着多少单 | `{total, by_status}`，**时点量**：看 `created_at < 周期结束` 且 `status <> CLOSED` 的全部单（历史单仍算）；`by_status` 固定七键（不含 CLOSED） |
+| `layer_dist` | 本周新长了多少 | `{error_layer: count}`，**周期内增量**：只看 `created_at` 落在周期内，**不按 status 过滤**（含已 CLOSED）；空/null 归 `unclassified` |
+| `verify_pass_rate` | 验证通过率 | `{pass, fail, total, rate}`；`total=0 → rate=null`（区分「没做验证」与「全错」） |
+| `mock_stability` | 近 3 次模考稳定度 | 复用 BE-05 `computeStability()`；只取周期结束前的模考；样本 < 2 → `null` |
+| `target_progress` | 离目标分还差多少 | `{target_score, latest_mock_score, rate}`；`latest_mock_score = report.overall.accuracy × 100`；`target_score` 缺失或 0 → `rate=null` |
+| `reopen_hotspots` | 反复重开集中在哪 | 周期内**新建**且 `reopen_count>0` 的单按考点 `SUM(reopen_count)`，`top 5` → `[{knowledge_node_id, title, reopen_count_sum}]` |
+| `strategy_execution` | 策略执行度 | MVP **恒为 `null`**（无「主动跳过」行为记录，强算即伪指标）；不在 `metrics` 里，见 BE-05 报告 |
+
+响应示例：
+
+```json
+{
+  "id": "8f0f...",
+  "cycle_type": "weekly",
+  "period": "2026-W47",
+  "version": 1,
+  "completed": false,
+  "period_start_at": "2026-11-15T16:00:00.000Z",
+  "period_end_at":   "2026-11-22T16:00:00.000Z",
+  "time_zone": "Asia/Shanghai",
+  "metrics": {
+    "open_defects": { "total": 3, "by_status": { "DRAFT": 0, "ANALYZED": 1, "ACTION_DONE": 0, "V1": 1, "V2": 1, "V3": 0, "REOPENED": 0 } },
+    "layer_dist": { "concept": 3, "method": 1 },
+    "verify_pass_rate": { "pass": 1, "fail": 1, "total": 2, "rate": 0.5 },
+    "mock_stability": 0.816497,
+    "target_progress": { "target_score": 400, "latest_mock_score": 50, "rate": 0.125 },
+    "reopen_hotspots": [ { "knowledge_node_id": "...", "title": "资料分析", "reopen_count_sum": 5 } ]
+  }
+}
+```
+
+**为什么同周期重复提交回 409 而不是 upsert**（拍板项 2）：复盘是「点按钮那一刻的快照」，覆盖会让历史数字无法复现。要重算就 `DELETE` 旧的再 `POST`（body 的 `resolution: 'delete_then_recreate'` 就是这个意思）。`schema.sql` 没有 `(user_id, cycle_type, period)` 唯一约束，靠仓储层 `lockParentRow(users)` + `findByPeriod` 同事务查重实现——并发两次只留一条（集成测试覆盖）。
+
+**计算与写入分离**：`POST /review-cycles` 先**在写事务外**算完六项聚合，再开事务落库。理由是聚合要跑 6 条 SQL，若全包进写事务会长时间持有 `users` 行锁；而这个窗口是安全的——复盘本就是快照，读到稍早的数据也算正确。
 ### 题目导入（BE-02：`POST /questions/import`）
 
 管线四阶段：`extractText`（按 mime 分派）→ `splitQuestions`（规则切题）→ `dedupe`（按 `content_hash`）→ `separateAssets`（图片占位识别，MVP 只计数不落库）→ 逐题入库，**整段包在 `withTransaction` 内**，任一步失败整批回滚。
@@ -516,7 +578,8 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - ✅ **BE-03**：缺陷单完整状态机迁 PG（DRAFT→ANALYZED→ACTION_DONE→V1→V2→V3→CLOSED/REOPENED + `verification_round` + 应用层/DB 触发器双层防线）+ `defect_tickets`/`actions`/`verifications` 三仓储 + `begin-verification` 手动门禁 + fake 层改造；13 条真 PG 集成测试留在 CI
 - ✅ **BE-04**：验证任务列表 + 临期提醒（**纯查询层**）：`server/verify_window.mjs` 窗口常量与 `computeUrgency` 纯函数（13 条单测）+ `listVerificationTasks` / `verificationSummary` 两仓储查询 + 2 个 GET 端点（fake 层 11 条、真 PG 集成 19 条）；进入时间采用 V2/V3 精确 + V1 近似（`updated_at`）混合取法
 - ✅ **BE-05**：限时模考 + 报告生成（两态生命周期）：`server/mock_report.mjs` 四项报告纯函数（22 条单测）+ `mock_exams`/`attempts` 两仓储（随机组卷 + 同事务收卷）+ 5 个端点（组卷/详情/提交/报告/列表/软删）；`v3_candidates` 只指路不当迁移，`strategy_execution` 返回 `null`
-- ⏳ BE-06 复盘统计 / 缺陷分布看板 → FE-09 / BE-08 → FE-11 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
+- ✅ **BE-06**：日/周/月复盘统计（**用户触发快照**）：`server/review_period.mjs` 周期起止纯函数（ISO 周 + `Asia/Shanghai` 日界，10 条单测）+ `server/review_stats.mjs` 六项 metrics 全 SQL 层聚合 + `review_cycles` 仓储与 5 个端点（同周期 `409 ALREADY_EXISTS`）+ 删掉 BE-03 遗留的假 `/review-cycles`；fake 层 6 条、真 PG 集成 12 条
+- ⏳ BE-07 缺陷分布看板 / BE-08 同步服务 → FE-09 → FE-11 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
 
 ---

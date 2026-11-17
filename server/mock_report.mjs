@@ -127,6 +127,29 @@ export function mockAccuracy(mock = {}) {
   return total > 0 ? correct / total : null;
 }
 
+/**
+ * 稳定度 = 近 N 次（默认 3）模考总正确率的变异系数。
+ *
+ * 抽出来供 BE-06 复盘复用：复盘只需要这一个数，若让复盘再去调完整
+ * reportGenerator，就得先造出 questions/attempts 等一堆它用不着的数据。
+ * 本函数只依赖 mockAccuracy()，与 reportGenerator 内的算法逐字一致
+ * （reportGenerator 现在也调本函数，不会出现两份口径）。
+ *
+ * @param {Array<object>} mocks  按时间倒序的模考记录（取前 3 条有效值）
+ * @param {number} window        窗口大小，默认 3
+ * @returns {number|null}        有效样本 <2 个时 null（单点无「波动」可言）
+ */
+export function computeStability(mocks = [], window = 3) {
+  const accuracies = [];
+  for (const m of mocks || []) {
+    const a = mockAccuracy(m);
+    if (a !== null) accuracies.push(round6(a));
+    if (accuracies.length >= window) break;
+  }
+  const win = accuracies.slice(0, window);
+  return win.length < 2 ? null : coefficientOfVariation(win);
+}
+
 // ---------------------------------------------------------------------------
 // 报告
 // ---------------------------------------------------------------------------

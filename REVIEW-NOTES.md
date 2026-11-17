@@ -558,3 +558,58 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - **修复**：①`mock_exams.integration.test.mjs` 的 `after()` 把 `DELETE FROM questions` 移到 `DELETE FROM defect_tickets` 之后；②五个集成测试（`mock_exams` / `index` / `defect_tickets` / `verification_tasks` / `import`）统一改为「捕获清理异常 → 无条件 `app.close()`+`pool.end()` → 再抛」，既不吞错（否则数据泄漏被静默忽略）也不挂死。
 - **实证**（临时探针，已删）：构造真 http server + keep-alive 连接 + 必抛错的 DELETE，子进程 watchdog 6s 判定 —— 旧结构 `HUNG (poolEnded=false)`，新结构 `exited in 108ms (poolEnded=true)`，症状完全复现与消除。
 - **教训**：①`after()` 的资源释放必须无条件执行，清理失败也要先关服——否则「清理小错」会升级成「进程挂死」；②外键顺序要按**引用图**排，不能按业务直觉；③本机 skip 集成测试时，前一轮失败会**掩盖** `after()` 的 bug（测试没跑到造数据的步骤），修复后必须重跑全链路；④断言全绿 ≠ 测试文件通过，文件级 `✖` 要看是不是退出问题。
+
+---
+
+## 21. BE-06 归档（日/周/月复盘统计）
+
+**范围**（用户 m04571 五拍板项）：用户触发快照，不做定时任务；5 个端点；六项 metrics；同周期重复 → `409 ALREADY_EXISTS` 不覆盖。
+
+### 假端点替换（T4）
+
+- **删掉**：`server/routes/defect_tickets.mjs` 的 `reviewCycles(ctx)`（原 :295-307，返回 `{type, closed_count, reopened_count, new_defects, timeline}`，其中数字是**写死的假聚合**）与 `listTicketsForStats` 助手；`match()` 内对应分支改为一小段注释指向新模块。
+- **新建**：`server/routes/review_cycles.mjs` 真 5 端点，挂到 `ROUTE_MODULES` 的 `mock_exams` 之后、`defect_tickets` **之前**（否则旧分支先截胡）。
+- **测试同步**：`server/index.test.mjs` 原本断言假形状的那条改为断言「真模块已接管 → 缺 `user_id` 返 `400 missing_user_id`」。
+
+### 周期时区决策（本轮最值得记的一条）
+
+日/周/月的「一天」按 **`Asia/Shanghai`** 切，不按 UTC。理由：`users.timezone` 默认 `Asia/Shanghai`，若按 UTC 切，中国用户的 daily 复盘会横跨两天（早 8 点到次日早 8 点），用户看到「今日复盘」里混入昨天的数据会直接不信任这个数字。实现用 `Intl.DateTimeFormat` + `formatToParts` 求当地午夜，再用两遍求解处理夏令时切换日；ISO 周用标准算法（第 1 周 = 含 1 月 4 日那周）并做**回读校验**——`2026-W53` 合法（2026 恰有 53 周），`2025-W53`/`2027-W53` 被拒（回读会发现跨年落点不对）。零依赖，不引日期库。
+
+### 六项 metrics 口径（易错点集中在「时点量 vs 周期增量」）
+
+| 字段 | 口径 | 易错点 |
+|---|---|---|
+| `open_defects` | **时点量**：`created_at < 周期结束` 且 `status<>CLOSED` | 历史单仍算在手，**不是**周期内新建数 |
+| `layer_dist` | **周期内增量**：`created_at ∈ [start,end)`，**不按 status 过滤** | 已 CLOSED 的单也算（它是本周新建的） |
+| `verify_pass_rate` | `verifications.result` 在周期内计数 | `total=0 → rate=null`，不能给 0（否则「没做」和「全错」同形） |
+| `mock_stability` | 复用 BE-05 `computeStability()` | 只取周期结束前的模考（快照不能看「未来」） |
+| `target_progress` | `latest_mock_score = report.overall.accuracy × 100` | `target_score` 缺失/0 → `rate=null`，不除零 |
+| `reopen_hotspots` | 周期内新建且 `reopen_count>0` 的单按考点 `SUM` top5 | `reopen_count` 是**当前累计值**，schema 无重开事件表 → 不是历史增量 |
+
+### `computeStability` 抽取方式
+
+从 `reportGenerator` 内联逻辑（原 :239-249）抽成独立导出函数，仍放在 `server/mock_report.mjs`（同文件同职责，不另建模块）。原逻辑取「本次 + 历史」拼 3 条算 `coefficientOfVariation`；抽取后 `computeStability(mocks, window)` 只依赖 `mockAccuracy()`，与内联算法逐字一致。**复盘只读已提交的模考列表**，所以传入的 `mocks` 不含「本次」——这是与报告端语义的差异，已在 JSDoc 写明。
+
+### 真库验证（PGlite，非真 PG 服务）
+
+`npm install --no-save @electric-sql/pglite`（真实 Postgres 编译的 WASM，支持 plpgsql/触发器）+ adapter `{query:(sql,p)=>db.query(sql,p)}` 直接驱动真仓储，12 项断言首轮 8 OK / 4 FAIL。**4 条 FAIL 全是验证脚本自身错误，零代码缺陷**：
+
+1. `open_defects.total` 我按「4 张非 CLOSED」算，实际只建了 3 张（第 4 张是 CLOSED，被 SQL 正确排除）——**时点量口径**。
+2. `layer_dist.concept` 我按「3 张 concept」算，实际 4 张里含 CLOSED——**增量口径不过滤 status**。
+3–4. `mock_stability` / `computeStability` 期望 `0.816497` 实际 `0`：`mockAccuracy()` 读的是 `mock_exams.questions[].is_correct`（[mock_report.mjs:114-131](<server/mock_report.mjs#L114-L131>)），**不读** `report.overall.accuracy`。我的种子只塞了一条 `is_correct:true`，三场准确率都是 1.0 → cv=0。
+
+修种子（按 accuracy 造 2 行判分）后 **12/12 OK**。同时发现集成测试的 `insertSubmittedMock` 有同样隐患（`questions` 恒为 1 条 true），已加 `buildJudgeRows(accuracy)` 修复——这条不改的话 CI 第一次真跑就会挂。
+
+### 验证数字
+
+- `npm test` → **305 tests / 190 pass / 0 fail / 115 skipped**（115 = 4 smoke + 29 仓储 + 11 路由 + 7 导入 + 13 缺陷单 + 19 验证任务 + 20 模考 + **12 复盘**，本机无 PG 全 skip）。
+- `node --check` 5 个新增/修改文件全 OK。
+- `server/index.test.mjs` → 60 test 全通过（含新增的 6 条 BE-06 用例）。
+
+### 遗留
+
+- `metrics` 是**快照**，不随业务数据变化重算；用户要最新数字必须 `DELETE` 再 `POST`。这是拍板项 2 的直接后果。
+- `reopen_hotspots` 用的是 `reopen_count` 当前值，精确的「谁在哪个时间点重开」需 V1 补 `defect_events` 事件表。
+- `open_defects.by_status` 硬编码七个非 CLOSED 状态；若 schema 未来新增状态，需同步改 `DEFECT_STATUSES_OPEN` 白名单（代码里刻意只认白名单键，防静默混进契约）。
+- 复盘端点**无鉴权**（全项目一致，MVP 阶段由 FE 层带 `user_id`）。
+- FE-06 需要的字段：`metrics` 六项已足；图表化建议前端直接用 `by_status` 七键画堆叠柱、`layer_dist` 画饼图、`reopen_hotspots` 画条形。
