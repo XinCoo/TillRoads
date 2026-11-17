@@ -1,0 +1,53 @@
+name: tillroad_app
+description: "题路 TillRoad · 备考闭环管理（首页看板 FE-01）"
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: ^3.14.0
+
+# 依赖最小化（FE-01 约束）：
+# - 只有 cupertino_icons 一个运行时依赖；CupertinoIcons 来自它。
+# - 不引状态管理库（setState 够用）、不引网络库（全部 mock 数据）、不引路由库（Navigator 够用）、
+#   不引图表库（缺陷分布条形图用 Container + FractionallySizedBox 手绘）。
+# - flutter_launcher_icons 仅 dev_dependencies，用于一次性生成各平台图标，不进产物。
+# 注: 已移除 `flutter create` 模板默认生成的 material_ui 依赖 —— FE-01 要求 iOS 原生 Cupertino 风格，
+#     全部界面使用 lib/ 下的 Cupertino* 组件，不需要 Material。
+dependencies:
+  flutter:
+    sdk: flutter
+
+  cupertino_icons: ^1.0.8
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^6.0.0
+  flutter_launcher_icons: ^0.14.4
+
+# 图标生成器配置：源图为 1024×1024 PNG（由 12500×12500 毛笔字 logo 裁字形后居中重排得到）
+# - app_icon.png            纯白底（无 alpha）→ iOS 不接受带透明通道的图标
+# - app_icon_foreground.png 透明底          → Android 自适应图标前景层
+flutter_launcher_icons:
+  image_path: "assets/icons/app_icon.png"
+  android: "launcher_icon"
+  min_sdk_android: 21
+  adaptive_icon_background: "#FFFFFF"
+  adaptive_icon_foreground: "assets/icons/app_icon_foreground.png"
+  ios: true
+  remove_alpha_ios: true
+  windows:
+    generate: true
+    image_path: "assets/icons/app_icon.png"
+    icon_size: 256
+
+flutter:
+  # 保留 MaterialIcons 字体：本工程不使用任何 Material 组件（界面全 Cupertino），
+  # 但 Flutter 在部分基础能力（如调试横幅、部分内部 Icon 回退）仍会查找该字体族，
+  # 保留可避免运行时缺字体告警。它只多打包一个字体文件，不引入代码依赖。
+  uses-material-design: true
+
+  assets:
+    - assets/icons/

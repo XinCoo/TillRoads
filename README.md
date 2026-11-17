@@ -591,13 +591,13 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 **Git Bash** 执行一次：
 
 ```bash
-git config --global alias.acp '!f() { git add -A && git commit -m "${1:-wip}" && git push; }; f'
+git config --global alias.acp '!f() { git add -A; if ! git diff --cached --quiet; then git commit -m "${1:-wip}"; fi; git push; }; f'
 ```
 
 **PowerShell** 用这条（Windows 的原生参数传递会吃掉裸 `"`，必须写成 `\"`；否则写进配置的是 `-m ${1:-wip}`，引号丢失后 `git acp "四表仓储 + 集成测试"` 会报 `pathspec '四表仓储' did not match`）：
 
 ```powershell
-git config --global alias.acp '!f() { git add -A && git commit -m \"${1:-wip}\" && git push; }; f'
+git config --global alias.acp '!f() { git add -A; if ! git diff --cached --quiet; then git commit -m \"${1:-wip}\"; fi; git push; }; f'
 ```
 
 之后每个里程碑一条命令即可：
@@ -614,5 +614,6 @@ git config --get alias.acp   # 关键：必须看到 ${1:-wip}（否则引号已
 ```
 
 > - 本仓已跟踪 `origin/main`，所以裸 `git push` 可用；新克隆若未设上游，先 `git push -u origin main` 一次。
-> - 工作区无改动时 `git acp "x"` 会因「nothing to commit」失败（退出码非 0，`&&` 保证不会误 push）——预期行为。
-> - 提交前建议先跑 `npm test`（本机无 PG：99 passed / 43 skipped；CI 设 `RUN_PG_INTEGRATION=1` 则全量真跑）。
+> - **工作区无改动时也会 push**：`git add -A` 后若暂存区为空则跳过 commit 直接 push（旧版用 `&&` 串联，`nothing to commit` 返回非 0 会让 `&&` 短路、push 永远不执行）。这使得「上一条 commit 已在本地但没推上去」的情况下再跑一次 `git acp` 能补推。
+> - 已跟踪但无任何改动的仓库上跑 `git acp` 会输出 `Everything up-to-date`，退出码 0——正常。
+> - 提交前建议先跑 `npm test`（本机无 PG：190 passed / 115 skipped；CI 设 `RUN_PG_INTEGRATION=1` 则全量真跑）。

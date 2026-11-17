@@ -614,6 +614,18 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - `npm test` → **305 tests / 190 pass / 0 fail / 115 skipped**（115 = 4 smoke + 29 仓储 + 11 路由 + 7 导入 + 13 缺陷单 + 19 验证任务 + 20 模考 + **12 复盘**，本机无 PG 全 skip）。
 - PGlite 真库逐条复原本用例 → **17/17 OK**（见上节）。
 - `node --check` 11 个文件全 OK；`server/index.test.mjs` → 60 test 全通过。
+
+### 工具链修复：`git acp` alias 在「工作区干净但有未推送 commit」时不会 push
+
+- **现象**（用户实测报告）：本地已有 commit、`git status` 干净，跑 `git acp "..."` 后 `git push` 没执行，分支停在 `Your branch is ahead of 'origin/main' by 1 commit`。
+- **根因**：旧版 `!f() { git add -A && git commit -m "${1:-wip}" && git push; }; f` —— 工作区无改动时 `git commit` 输出 `nothing to commit, working tree clean` 并返回退出码 1，`&&` 短路导致 `git push` 永不执行。这不是「预期行为」（旧 README 甚至把它写成「预期」，那是错的）：用 `git acp` 的人恰恰期望它把该推的东西推上去。
+- **修复**（用户提议，零成本采纳）：`git add -A; if ! git diff --cached --quiet; then git commit -m "${1:-wip}"; fi; git push;` —— 暂存区为空则跳过 commit 直接 push。
+- **实测**（临时裸仓库 + 真 remote，已删）：
+  - Git Bash 旧 alias，`ahead=1` 且工作区干净 → `nothing to commit, working tree clean` / `EXIT=1` / `ahead` 仍为 1（**未推**，症状完全复现）。
+  - 同一处境下新 alias → `EXIT=0` / `ahead=0` / `remote==local`（已推）。
+  - 四种场景全过：有改动带消息、有改动不带消息（走 `wip`）、无改动已同步（`Everything up-to-date`，EXIT=0）、中文多词消息。
+- **另一个独立坑（本轮再次确认）**：**在 PowerShell 里配置 Git Bash 那条 alias，裸 `"` 会被吃掉**，存成 `-m ${1:-wip}`，随后 `git acp "四表仓储 + 集成测试"` 报 `pathspec '四表仓储' did not match`。必须按 shell 选对写法：Git Bash 用 `"${1:-wip}"`，PowerShell 用 `\"${1:-wip}\"`。两者存进配置后逐字相同，执行行为一致。
+- **验证方式**：`git config --global --get alias.acp` 必须看到 `${1:-wip}` 带引号（README 已写这条自检）。
 ### 遗留
 
 - `metrics` 是**快照**，不随业务数据变化重算；用户要最新数字必须 `DELETE` 再 `POST`。这是拍板项 2 的直接后果。
