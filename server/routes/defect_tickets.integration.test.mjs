@@ -136,17 +136,30 @@ before(async () => {
 after(async () => {
   if (!RUN || !app) return;
   const c = await pool.connect();
+  let cleanupFailure = null;
   try {
     await c.query(`DELETE FROM verifications WHERE defect_ticket_id IN (SELECT id FROM defect_tickets WHERE user_id=$1)`, [seed.userId]);
     await c.query(`DELETE FROM actions WHERE defect_ticket_id IN (SELECT id FROM defect_tickets WHERE user_id=$1)`, [seed.userId]);
     await c.query(`DELETE FROM defect_tickets WHERE user_id=$1`, [seed.userId]);
     await c.query(`DELETE FROM exam_profiles WHERE user_id=$1`, [seed.userId]);
     await c.query(`DELETE FROM users WHERE id=$1`, [seed.userId]);
+  } catch (cleanupError) {
+    // 与 mock_exams.integration.test.mjs 同样的加固：清理抛错不能连带 skip 掉关服。
+    // 原实现把 app.close()/pool.end() 放在 try/finally 之外，异常一跳出就永远执行不到，
+    // HTTP server 与连接池仍有活 handle → node:test 进程退不出去（CI 超时 cancel）。
+    // 不吞错误（否则数据泄漏被静默忽略）：先关服再抛，fail fast 且进程能退出。
+    cleanupFailure = cleanupError;
   } finally {
     c.release();
   }
-  await new Promise((resolve) => app.close(resolve));
-  await pool.end();
+  try {
+    await new Promise((resolve) => app.close(resolve));
+  } finally {
+    await pool.end();
+  }
+  if (cleanupFailure) {
+    throw new Error(`after(): 清理数据失败（前置测试已跑完，但库中可能残留测试数据）: ${cleanupFailure.message}`);
+  }
 });
 
 // ---------------------------------------------------------------------------

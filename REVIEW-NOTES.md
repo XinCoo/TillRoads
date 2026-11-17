@@ -549,3 +549,12 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - **修复**：`server/routes/mock_exams.integration.test.mjs:121` 与 `server/index.test.mjs:824` 的种子值改为 `'medium'`，并各加注释指向 `schema.sql:57` 防回归。
 - **顺带修正文档错误**：README 报告字段表原写「`overall.total` 含未判分」，与 `server/mock_report.mjs:322` 的实际实现（`total: gradedTotal`，只计已判分）矛盾；已改为「`total` 只计已判分，未判分由 `ungraded`/`ungraded_count` 反映」。这条是文档 bug，不是代码 bug——`mock_report.test.mjs:137/139` 与 `:396/397` 早就锁定了正确语义。
 - **教训**：①种子数据也要严格对 schema 的 ENUM/CHECK，测试代码绕过了应用层校验也会被 DB 拒；②一个根因可放大成几十条失败，先看**第一条**失败的错误码，别逐条看；③文档写「含/不含」这类二分口径必须与实现逐字核对。
+
+### 交付后 CI 修复（二）：文件级 ✖ 且挂 3 小时 → 两个根因
+
+- **现象**（与上一轮性质完全不同）：20 条断言全 ✔，但文件级 `✖ ...mock_exams.integration.test.mjs (3.440423ms)` 且 CI 跑 3 小时被 cancel、重跑卡同一位置。断言全过说明**不是逻辑失败，是进程退不出去**。
+- **根因一（FK 顺序）**：`after()` 先删 `questions` 再删 `defect_tickets`，但 `defect_tickets.question_id` 引用 `questions(id)`（`defect_tickets_question_id_fkey`）→ `23503`。上一轮 18 fail 时测试在 `seedQuestions()` 就崩、`after()` 删不到这类缺陷单，所以顺序错误一直潜伏；这轮测试真跑完才第一次暴露。正确顺序：`attempts → mock_exams → verifications → actions → defect_tickets → questions → knowledge_nodes → subjects → exam_profiles → users`。
+- **根因二（清理失败导致永不关服）**：`app.close()` / `pool.end()` 写在 `try/finally` **之外**，清理语句一抛错就永远执行不到 → HTTP server 仍在 listen、连接池仍开着 → 事件循环有活 handle → `node:test` 记录 ✖ 后等不到排空 → 进程挂死。**这是「挂 3 小时」的真正机制，根因一只负责让清理抛错。**
+- **修复**：①`mock_exams.integration.test.mjs` 的 `after()` 把 `DELETE FROM questions` 移到 `DELETE FROM defect_tickets` 之后；②五个集成测试（`mock_exams` / `index` / `defect_tickets` / `verification_tasks` / `import`）统一改为「捕获清理异常 → 无条件 `app.close()`+`pool.end()` → 再抛」，既不吞错（否则数据泄漏被静默忽略）也不挂死。
+- **实证**（临时探针，已删）：构造真 http server + keep-alive 连接 + 必抛错的 DELETE，子进程 watchdog 6s 判定 —— 旧结构 `HUNG (poolEnded=false)`，新结构 `exited in 108ms (poolEnded=true)`，症状完全复现与消除。
+- **教训**：①`after()` 的资源释放必须无条件执行，清理失败也要先关服——否则「清理小错」会升级成「进程挂死」；②外键顺序要按**引用图**排，不能按业务直觉；③本机 skip 集成测试时，前一轮失败会**掩盖** `after()` 的 bug（测试没跑到造数据的步骤），修复后必须重跑全链路；④断言全绿 ≠ 测试文件通过，文件级 `✖` 要看是不是退出问题。

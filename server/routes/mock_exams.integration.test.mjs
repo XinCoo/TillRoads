@@ -171,6 +171,7 @@ before(async () => {
 after(async () => {
   if (!RUN || !app) return;
   const c = await pool.connect();
+  let cleanupFailure = null;
   try {
     if (createdUsers.length > 0) {
       await c.query(
@@ -185,12 +186,6 @@ after(async () => {
         [createdUsers],
       );
       await c.query(
-        `DELETE FROM questions WHERE subject_id IN (
-           SELECT s.id FROM subjects s JOIN exam_profiles p ON p.id = s.exam_profile_id
-            WHERE p.user_id = ANY($1::uuid[]))`,
-        [createdUsers],
-      );
-      await c.query(
         `DELETE FROM verifications WHERE defect_ticket_id IN (
            SELECT id FROM defect_tickets WHERE user_id = ANY($1::uuid[]))`,
         [createdUsers],
@@ -200,7 +195,18 @@ after(async () => {
            SELECT id FROM defect_tickets WHERE user_id = ANY($1::uuid[]))`,
         [createdUsers],
       );
+      // 顺序陷阱：defect_tickets.question_id 引用 questions(id)，必须先删缺陷单再删题目。
+      // 之前 questions 排在 defect_tickets 之前，一旦本文件真跑完并造出「引用了题目的缺陷单」，
+      // after() 就报 23503 defect_tickets_question_id_fkey（外键约束失败）→ 文件级 ✖ 且
+      // 未捕获的 rejection 让进程挂住不退出（CI 跑 3 小时被 cancel）。早期 18 fail 时测试在
+      // seedQuestions 就崩、after() 删不到这种缺陷单，故这个顺序错误一直没暴露。见 REVIEW-NOTES。
       await c.query(`DELETE FROM defect_tickets WHERE user_id = ANY($1::uuid[])`, [createdUsers]);
+      await c.query(
+        `DELETE FROM questions WHERE subject_id IN (
+           SELECT s.id FROM subjects s JOIN exam_profiles p ON p.id = s.exam_profile_id
+            WHERE p.user_id = ANY($1::uuid[]))`,
+        [createdUsers],
+      );
       await c.query(
         `DELETE FROM knowledge_nodes WHERE subject_id IN (
            SELECT s.id FROM subjects s JOIN exam_profiles p ON p.id = s.exam_profile_id
@@ -215,11 +221,25 @@ after(async () => {
       await c.query(`DELETE FROM exam_profiles WHERE user_id = ANY($1::uuid[])`, [createdUsers]);
       await c.query(`DELETE FROM users WHERE id = ANY($1::uuid[])`, [createdUsers]);
     }
+  } catch (cleanupError) {
+    // 挂起根因（二）：清理语句抛错后，原实现把 app.close()/pool.end() 放在 try/finally 之外，
+    // 异常一跳出就永远执行不到它们 —— HTTP server 仍在监听、连接池仍开着，
+    // 事件循环有活 handle，node:test 进程永远退不出去（CI 表现为 3 小时后被 cancel）。
+    // 处理方式：不吞掉错误（否则数据泄漏会被静默忽略）而是记下来，先把服务器与连接池关掉，
+    // 再抛出去 —— 让 CI 看到一个明确的失败，且进程能正常退出（fail fast，不挂死）。
+    cleanupFailure = cleanupError;
   } finally {
     c.release();
   }
-  await new Promise((resolve) => app.close(resolve));
-  await pool.end();
+  // 无论如何先关服 + 断开连接池，保证进程能退出。
+  try {
+    await new Promise((resolve) => app.close(resolve));
+  } finally {
+    await pool.end();
+  }
+  if (cleanupFailure) {
+    throw new Error(`after(): 清理数据失败（前置测试已跑完，但库中可能残留测试数据）: ${cleanupFailure.message}`);
+  }
 });
 
 // ---------------------------------------------------------------------------
