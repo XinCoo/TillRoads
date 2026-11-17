@@ -275,7 +275,7 @@ test('POST /review-cycles：生成 weekly 快照，metrics 六项真实聚合', 
   const userId = await freshUser('复盘-生成');
   const tree = await freshTree(userId, { targetScore: 400 });
 
-  // 两张未关闭的单（ANALYZED / V1），一张已关闭（CLOSED）
+  // 三张未关闭的单（ANALYZED / V1 / V2）+ 一张已关闭（CLOSED）
   await insertTicket(userId, tree, { status: 'ANALYZED', errorLayer: 'concept' });
   await insertTicket(userId, tree, { status: 'V1', errorLayer: 'method' });
   await insertTicket(userId, tree, { status: 'CLOSED', errorLayer: 'concept' });
@@ -300,7 +300,8 @@ test('POST /review-cycles：生成 weekly 快照，metrics 六项真实聚合', 
   const m = r.data.metrics;
 
   // open_defects：时点量，排除 CLOSED，by_status 只含有数据的键（预填七态为 0）
-  assert.equal(m.open_defects.total, 4, JSON.stringify(m.open_defects));
+  // total 只数非 CLOSED：ANALYZED + V1 + V2 = 3（CLOSED 被 SQL 正确排除，不是 4）
+  assert.equal(m.open_defects.total, 3, JSON.stringify(m.open_defects));
   assert.equal(m.open_defects.by_status.ANALYZED, 1);
   assert.equal(m.open_defects.by_status.V1, 1);
   assert.equal(m.open_defects.by_status.V2, 1);
@@ -308,7 +309,8 @@ test('POST /review-cycles：生成 weekly 快照，metrics 六项真实聚合', 
   assert.equal(m.open_defects.by_status.DRAFT, 0);
 
   // layer_dist：周期内新建，按 error_layer 分组
-  assert.equal(m.layer_dist.concept, 4, JSON.stringify(m.layer_dist));
+  // concept 3 张（ANALYZED + CLOSED + V2）——layer_dist 是周期内增量，**不按 status 过滤**，CLOSED 也算
+  assert.equal(m.layer_dist.concept, 3, JSON.stringify(m.layer_dist));
   assert.equal(m.layer_dist.method, 1);
 
   // verify_pass_rate：1 pass / 1 fail / total 2 -> 0.5

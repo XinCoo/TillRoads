@@ -600,12 +600,20 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 
 修种子（按 accuracy 造 2 行判分）后 **12/12 OK**。同时发现集成测试的 `insertSubmittedMock` 有同样隐患（`questions` 恒为 1 条 true），已加 `buildJudgeRows(accuracy)` 修复——这条不改的话 CI 第一次真跑就会挂。
 
-### 验证数字
+### 交付后 CI 修复（1 fail）：同一个断言改了一边没改另一边
+
+- **现象**：CI 真跑 305 tests / 304 pass / 1 fail，唯一失败是 `mock_exams.integration.test.mjs` 之后的 `POST /review-cycles：生成 weekly 快照`，`AssertionError: 3 !== 4` 于 [review_cycles.integration.test.mjs:303](<server/routes/review_cycles.integration.test.mjs#L303>)，实际值 `{"total":3,"by_status":{"V1":1,"V2":1,"ANALYZED":1,...}}`。
+- **根因**：与上节 PGlite 验证里修的第 1、2 条是**同一个错误**。我在临时验证脚本里把 `open_defects.total` 4→3、`layer_dist.concept` 4→3 改了，**但没有把同样的修改回写到集成测试**（两处是不同文件）。本机集成全 skip，所以 `npm test` 依旧全绿，错误直到 CI 真跑才现。
+- **修复**：[review_cycles.integration.test.mjs:304](<server/routes/review_cycles.integration.test.mjs#L304) `total` 4→3（注释改为「ANALYZED + V1 + V2 = 3」）、[:313](<server/routes/review_cycles.integration.test.mjs#L313) `layer_dist.concept` 4→3（注释改为「含 CLOSED，增量不按 status 过滤」）、[:277](<server/routes/review_cycles.integration.test.mjs#L277) 种子注释「两张未关闭」→「三张未关闭」。
+- **为何顺带改 `layer_dist`**：CI 只报第一条失败（断言在 303 行就中断），但 `layer_dist.concept` 原写 4 紧接着就会失败。按前一轮「一个根因常放大成多条」的教训，一次改干净而不是等下一轮 CI。
+- **验证方式**：写一次性 PGlite 脚本（`.tmp_confirm.mjs`，已删）**逐字复刻该用例的种子与 17 条断言**，真库跑出 17 OK / 0 FAIL，其中 `open_defects.total=3`、`layer_dist={concept:3,method:1}` 与 CI 报的实际值一致。这比「再推一轮看 CI」快且不浪费 CI 配额。
+- **教训**：①**同一个错误出现在验证脚本和正式测试两处时，两边都必须改**——本机 skip 集成测试让第二处无声地留在全绿里；②本机 `npm test` 全绿**不能证明集成测试正确**，只证明它被跳过了（这是本项目反复付学费的一条）；③CI 只报第一条失败，修时要主动把同根因的后续断言一起改。
+
+### 验证数字（CI 修复后）
 
 - `npm test` → **305 tests / 190 pass / 0 fail / 115 skipped**（115 = 4 smoke + 29 仓储 + 11 路由 + 7 导入 + 13 缺陷单 + 19 验证任务 + 20 模考 + **12 复盘**，本机无 PG 全 skip）。
-- `node --check` 5 个新增/修改文件全 OK。
-- `server/index.test.mjs` → 60 test 全通过（含新增的 6 条 BE-06 用例）。
-
+- PGlite 真库逐条复原本用例 → **17/17 OK**（见上节）。
+- `node --check` 11 个文件全 OK；`server/index.test.mjs` → 60 test 全通过。
 ### 遗留
 
 - `metrics` 是**快照**，不随业务数据变化重算；用户要最新数字必须 `DELETE` 再 `POST`。这是拍板项 2 的直接后果。
