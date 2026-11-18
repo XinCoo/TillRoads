@@ -737,3 +737,70 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - **`adb shell input tap` 坐标是物理像素**：预览截图被降采样到 720×1600，实机 1080×2400（420 dpi），比例 1.5。按预览图坐标点对话框按钮会打到空白处。必须按物理像素算（对话框「知道了」预览 y≈850 → 实机 1275）。
 - **`adb exec-out screencap -p` 在 PowerShell 里会把字节流当字符串数组**，`[System.IO.File]::WriteAllBytes` 报 `无法将值“�PNG”转换为类型“System.Byte”`。改用 `adb shell screencap -p /sdcard/x.png` + `adb pull` 两步。
 - **`adb` 不在 PATH**：必须用全路径 `C:\Users\guosu\AppData\Local\Android\Sdk\platform-tools\adb.exe`。
+
+---
+
+## 24. FE-03 归档（缺陷单列表 + 详情页，纯 mock）
+
+### 范围
+
+用户任务书 FE-03：列表页（FE-03A）+ 详情页（FE-03B），延续 FE-01 设计语言与动效规格，**数据全 mock、不连后端**。硬约束：不引第三方状态管理/路由/图表/时间格式化库；不改后端任何文件；不改 FE-01 已有文件（只新增 + 改 `defects_page.dart`）。
+
+### 交付
+
+新增 6 个 dart 文件（工程共 18 个）：
+
+| 文件 | 职责 |
+|---|---|
+| `lib/mock/defects_mock.dart` | 八态枚举 + `DefectTicket` + 8 条 mock（覆盖全部 8 个 status）+ 相对/绝对时间 |
+| `lib/widgets/defect_badges.dart` | 徽标/卡片壳/信息行公共组件 |
+| `lib/widgets/defect_card.dart` | `DefectCard` + `FilterChipRow` |
+| `lib/widgets/verification_progress.dart` | `VerificationProgress` + `StatusTimeline`（手画） |
+| `lib/pages/defect_detail_page.dart` | 六栏 + 动作列表 + 验证进度 + 时间线 + 底部操作区 |
+
+改写：`lib/pages/defects_page.dart`（空状态 → 真列表）、`test/widget_test.dart`（3 条 → 5 条）。
+
+### 8 条 mock 覆盖矩阵
+
+| id | status | q_type | priority | 特点 |
+|---|---|---|---|---|
+| dt-0001 | DRAFT | 判断推理·类比推理 | P1 | 未归因 |
+| dt-0002 | ANALYZED | 数量关系·行程问题 | P0 | — |
+| dt-0003 | ACTION_DONE | 言语理解·逻辑填空 | P1 | 2 actions 全 done（不变量展示：动作全完但未关闭） |
+| dt-0004 | V1 | 资料分析·增长率比较 | P0 | 当前阶段高亮 |
+| dt-0005 | V2 | 判断推理·充分必要条件 | P0 | **actions 1 done / 1 未 done**，v1=pass |
+| dt-0006 | V3 | 常识判断·法律常识 | P2 | v1=v2=pass |
+| dt-0007 | REOPENED | 判断推理·图形推理 | P0 | **round=3 / reopen=2**，v1=fail，history 含两条 reopened |
+| dt-0008 | CLOSED | 资料分析·比重变化 | P1 | **v1=v2=v3 全 pass** |
+
+### 关键决策
+
+1. **详情页用 `CupertinoSliverNavigationBar`**（而不用 `CupertinoPageScaffold(navigationBar:)`）。第一版用后者，`ListView` 内容钻到导航栏下方，截图里归因首行被压住。改成 sliver 后与首页/列表页同构，顺带获得大标题折叠。
+2. **筛选条不用 `CupertinoSegmentedControl`**：5 个中文标签在 375pt 宽下会换行/截断，且选中色被系统主题覆盖。改用 `AnimatedContainer` 手写 chip（250ms `easeInOut`），配色可控。
+3. **`REOPENED` 归入「进行中」并带红色角标**（任务书明要求）：`DefectFilter.ongoing.matches` 用 switch 穷举含 `reopened`。
+4. **时间线手画**（`IntrinsicHeight` + 圆点 + 2px 竖线），不引图表/时间线库。
+5. **相对时间自实现**：`relativeTime()` 与 `absoluteTime()` 在 mock 文件内，不引 `intl`/`timeago`。
+
+### 验收证据
+
+- `flutter analyze` → **16 issues，0 error / 0 warning**（余下全是同一条 cupertino 弃用 info）。
+- `flutter test` → `00:01 +5: All tests passed!`（首页首屏 / 首页滚动 / 缺陷单列表 / 筛选到已关闭 / 进详情页）。
+- `flutter build apk --debug` → `√ Built`；`adb install -r` → Success；`topResumedActivity=com.tillroad.tillroad_app/.MainActivity`。
+- 截图（`tillroad_app/screenshots/`）：`fe03-home.png`(218786 B，首页回归) / `fe03-list.png`(293238 B，列表页 8 条 + 筛选条 8/4/3/1) / `fe03-detail.png`(241110 B，V2 详情页，导航栏不再遮挡) / `fe03-detail-timeline.png`(232812 B，滚到时间线，5 节点 + 当前盘点亮)。
+
+### 踩坑
+
+- **`CupertinoPageScaffold(navigationBar:)` 不给 child 让位**：必须改 `CustomScrollView` + `CupertinoSliverNavigationBar`。
+- **纯 Cupertino 工程里 `Colors` 不存在**：透明要用 `CupertinoColors.transparent`（首版 `Colors.transparent` 导致 2 处 `undefined_identifier`）。
+- **`const List<DefectAction> _noActions`**：类型标注写成 `DefectAction` 会静默通过语法但产生 `invalid_assignment`（两处 error）。
+- **测试断言多义词要 `findsWidgets`**：「待验证」「已关闭」既是筛选 chip 文案又是状态徽标文案，用 `findsOneWidget` 必挂。
+- **折叠线下方内容必须 `scrollUntilVisible`**：800×600 测试视口下「状态时间线」在视口外。
+- **大段 edit 把类尾部吃掉**：本轮一次 edit 后 `flutter analyze` 报 66 issues（`Expected to find '}'` + `_BottomActionBar` 的 `status`/`label`/`onPressed` 全部 `read_potentially_unassigned_final`），根因是替换范围越界吞掉了类结构。**整份 `write` 重写**才彻底修好。教训：改写整个 class 时应直接重写文件而不是局部 edit。
+- **tap 坐标要乘 1.5**：预览 720×1600 → 实机 1080×2400。本轮第一次点错卡片（点到 ACTION_DONE 而非 V2）。
+
+### 遗留
+
+- 接真实 API 需要：后端本地跑起来 + 配置 CORS + 模拟器用 `10.0.2.2` 映射宿主机（`localhost` 在模拟器里指模拟器自己）。
+- 底部主按钮的实际操作（去归因/进入验证/提交验证/重新归因）待 FE-04 / BE-03 接口接入。
+- 状态时间线的真实数据需要服务端补 `defect_events` 表（当前 schema 只有 `created_at`/`closed_at`/`updated_at`，无法还原完整状态迁移历史）。
+- 列表页尚无分页/下拉刷新（纯 mock 8 条用不上）。

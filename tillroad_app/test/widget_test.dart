@@ -55,14 +55,73 @@ void main() {
     expect(find.text('开始模考'), findsOneWidget);
   });
 
-  testWidgets('切换到缺陷单 Tab 显示空状态', (WidgetTester tester) async {
+  testWidgets('切换到缺陷单 Tab 显示列表（FE-03 替换了空状态）', (
+    WidgetTester tester,
+  ) async {
     await tester.pumpWidget(const TillRoadApp());
     await tester.pumpAndSettle();
 
     await tester.tap(find.text('缺陷单'));
     await tester.pumpAndSettle();
 
-    expect(find.text('还没有缺陷单'), findsOneWidget);
-    expect(find.text('暂无数据，从一次模考或错题开始'), findsOneWidget);
+    // FE-03 起这个 Tab 是真实列表，不再是空状态。
+    // mock 第一条是 DRAFT 的「判断推理 · 类比推理」。
+    expect(find.text('判断推理 · 类比推理'), findsWidgets);
+    // 四个筛选 chip 都在（「待验证」同时是 ACTION_DONE 的状态徽标文案，
+    // 所以这里用 findsWidgets 而不是 findsOneWidget）
+    expect(find.text('全部'), findsOneWidget);
+    expect(find.text('进行中'), findsOneWidget);
+    expect(find.text('待验证'), findsWidgets);
+    expect(find.text('已关闭'), findsWidgets);
+  });
+
+  testWidgets('缺陷单筛选条切到「已关闭」只剩 CLOSED 那条', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const TillRoadApp());
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('缺陷单'));
+    await tester.pumpAndSettle();
+
+    // 点筛选 chip（chip 里的「已关闭」文字）
+    await tester.tap(find.text('已关闭'));
+    await tester.pumpAndSettle();
+
+    // 只剩 dt-0008 这类 CLOSED 条目可见
+    expect(find.text('资料分析 · 比重变化'), findsWidgets);
+  });
+
+  testWidgets('点击列表卡片进入详情页，展示六栏与三次验证', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const TillRoadApp());
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('缺陷单'));
+    await tester.pumpAndSettle();
+
+    // 点第一条卡片进详情
+    await tester.tap(find.text('判断推理 · 类比推理').first);
+    await tester.pumpAndSettle();
+
+    // 详情页的前三个分组（时间线在下方，需滚动）
+    expect(find.text('基本信息'), findsOneWidget);
+    expect(find.text('处理动作'), findsOneWidget);
+    expect(find.text('三次验证'), findsOneWidget);
+
+    // 三次验证的三个阶段
+    expect(find.text('V1'), findsOneWidget);
+    expect(find.text('V2'), findsOneWidget);
+    expect(find.text('V3'), findsOneWidget);
+
+    // 滚动到最底才看得到状态时间线
+    await tester.scrollUntilVisible(
+      find.text('状态时间线'),
+      200,
+      scrollable: find.byType(Scrollable).last,
+    );
+    await tester.pumpAndSettle();
+    expect(find.text('状态时间线'), findsOneWidget);
   });
 }

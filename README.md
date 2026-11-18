@@ -595,10 +595,31 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 
 ### 目录与依赖
 
-- `tillroad_app/lib/` 13 个 dart 文件：`main.dart` / `theme/app_theme.dart` / `mock/home_mock.dart` / `pages/` 5 个 / `widgets/` 5 个。
+- `tillroad_app/lib/` 18 个 dart 文件：`main.dart` / `theme/app_theme.dart` / `mock/` 2 个（`home_mock`、`defects_mock`）/ `pages/` 6 个 / `widgets/` 8 个。
 - 运行时依赖只有 `cupertino_icons`；dev 依赖 `flutter_lints` + `flutter_launcher_icons`。**无状态管理库、无网络库、无路由库、无图表库**。
 - 兼容平台：`android` / `ios` / `windows`（Windows 仅为本机开发期验证用，交付目标是移动端）。
 - 已知 `flutter analyze` 输出：**0 error / 0 warning / 12 info**，12 条全是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「只加 cupertino_icons」的约束冲突。
+
+### 缺陷单界面（FE-03）
+
+列表页与详情页，数据全部来自 `lib/mock/defects_mock.dart`（8 条 mock，**覆盖全部 8 个 status 各一条**），不连后端。
+
+| 文件 | 职责 |
+|---|---|
+| `lib/mock/defects_mock.dart` | `DefectStatus`（八态）/ `DefectPriority` / `VerifyResult` / `DefectAction` / `StatusEvent` / `DefectTicket` + 8 条 mock + `relativeTime` / `absoluteTime` |
+| `lib/widgets/defect_badges.dart` | `statusColor` / `priorityColor` / `StatusBadge`（`AnimatedContainer` 250ms）/ `PriorityBadge` / `RoundChip` / `ReopenChip` / `CardShell` / `InfoRow` / `InfoText` |
+| `lib/widgets/defect_card.dart` | `DefectCard`（三行卡片）+ `FilterChipRow`（横向滚动筛选条） |
+| `lib/widgets/verification_progress.dart` | `VerificationProgress`（V1/V2/V3 当前阶段橙色左边框高亮）+ `StatusTimeline`（手画圆点竖线） |
+| `lib/pages/defects_page.dart` | 列表页（`CupertinoSliverNavigationBar` + 筛选条 + `SliverList`） |
+| `lib/pages/defect_detail_page.dart` | 详情页（六栏基本信息 + 处理动作 + 三次验证 + 状态时间线 + 底部固定操作区） |
+
+**筛选分组**：全部 / 进行中（DRAFT+ANALYZED+ACTION_DONE+**REOPENED**）/ 待验证（V1+V2+V3）/ 已关闭（CLOSED）。`REOPENED` 归入进行中，卡片上带红色「重开 N 次」角标。
+
+**为什么详情页用 `CupertinoSliverNavigationBar` 而不是 `CupertinoPageScaffold(navigationBar:)`**：后者**不会给 child 预留导航栏高度**，`ListView` 的内容会钻到导航栏下面（实测截图里归因首行被压住）。改成 sliver 导航栏后与首页/列表页同构，顺带获得大标题折叠。
+
+**为什么筛选条不用 `CupertinoSegmentedControl`**：5 个中文标签挤在 375pt 宽下会换行或截断，且选中色被系统主题覆盖；改用 `AnimatedContainer` 手写 chip，可精确控制 250ms `easeInOut` 与配色。
+
+**底部主按钮**按状态分支：DRAFT→「去归因」/ ANALYZED→「暂无操作」/ ACTION_DONE→「进入验证」/ V1·V2·V3→「提交验证」/ REOPENED→「重新归因」/ CLOSED→不给按钮，居中显示绿色「已关闭」。当前点击只弹提示（需接后端 API）。
 
 ---
 
@@ -619,7 +640,8 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - ✅ **BE-06**：日/周/月复盘统计（**用户触发快照**）：`server/review_period.mjs` 周期起止纯函数（ISO 周 + `Asia/Shanghai` 日界，10 条单测）+ `server/review_stats.mjs` 六项 metrics 全 SQL 层聚合 + `review_cycles` 仓储与 5 个端点（同周期 `409 ALREADY_EXISTS`）+ 删掉 BE-03 遗留的假 `/review-cycles`；fake 层 6 条、真 PG 集成 12 条
 - ✅ **FE-01**：Flutter 项目初始化 + 首页看板（纯 Cupertino、无第三方状态/网络/路由/图表库）：`tillroad_app/` 13 个 dart 文件 + `home_mock.dart` 假数据；大标题折叠、弹簧按压、倒计时 `AnimatedSwitcher`、Reduce Motion 降级；`flutter analyze` 0 error；Android 17 模拟器真机跑通并截图
 - ✅ **FE-01 字体**：接入霞鹜新致宋（`assets/fonts/霞鹜新致宋字体.ttf`，SIL OFL 1.1），`CupertinoTextThemeData` 九个 TextStyle 逐项覆盖 + `CupertinoAlertDialog` 三处硬编码 `CupertinoSystemText` 的显式覆盖；Android 17 模拟器真机复核四张截图
-- ⏳ FE-02 建题/导入页 → FE-11 审核七态 UI → BE-07 缺陷分布看板 / BE-08 同步服务 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
+- ✅ **FE-03**：缺陷单列表 + 详情页（纯 mock，不连后端）：`defects_mock.dart` 8 条覆盖八态 + `defect_badges`/`defect_card`/`verification_progress` 三组共用组件 + 状态筛选条（进行中含 REOPENED）+ 详情页六栏/处理动作/三次验证进度/手画状态时间线/底部状态化操作区；`flutter analyze` 0 error，`flutter test` 5/5，Android 17 模拟器真机截图（列表页 + 详情页 + 时间线）
+- ⏳ **下一批**：FE-02 建题/导入页 → FE-11 审核七态 UI → BE-07 缺陷分布看板 / BE-08 同步服务 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
 
 ---
