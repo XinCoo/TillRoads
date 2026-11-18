@@ -399,3 +399,64 @@ test('并发提交：两个连接用同一 version 提交验证 -> 一个 201、
   assert.equal(t.status, 'V2', '只有一个提交生效');
   assert.equal(t.verifications.filter((v) => v.stage === 'V1').length, 1, 'V1 记录只有一条');
 });
+
+// ---------------------------------------------------------------------------
+// 8) FE-04 A1/A2：建单时 actions 同事务落表（堵住 NO_ACTIONS 缺口）
+// ---------------------------------------------------------------------------
+
+test('建单带 2 条 actions -> actions 表 2 行 done=false -> 标记完成后可进入 V1', skipOpt, async () => {
+  const r = await req('POST', '/defect-tickets', {
+    user_id: seed.userId,
+    exam_profile_id: seed.profileId,
+    error_layer: 'concept',
+    error_cause: '把充分条件当成必要条件导致判断错误',
+    actions: ['重做同类题 10 道', { content: '整理错因卡片', due: '2026-12-01' }],
+  });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  const id = r.data.id;
+
+  // A3：响应体里就能拿到刚写入的 actions（从 actions 表读，已不是 jsonb 列）
+  assert.equal(Array.isArray(r.data.actions), true, '建单响应应带 actions 数组');
+  assert.equal(r.data.actions.length, 2, JSON.stringify(r.data.actions));
+  assert.equal(r.data.actions[0].done, false);
+
+  // 直接查表确认落了 actions 行（而不是只写了 jsonb 列）
+  const rows = await pool.query(
+    `SELECT content, done, due FROM actions WHERE defect_ticket_id=$1 ORDER BY created_at ASC, id ASC`,
+    [id],
+  );
+  assert.equal(rows.rowCount, 2, 'actions 表应有 2 行');
+  assert.deepEqual(rows.rows.map((x) => x.content), ['重做同类题 10 道', '整理错因卡片']);
+  assert.equal(rows.rows[0].done, false);
+  assert.equal(rows.rows[1].done, false);
+  assert.ok(rows.rows[1].due, '第二条应带 due');
+
+  // 门禁：两条未完成时不能进入验证
+  let cur = await getTicket(id);
+  let b = await req('PATCH', `/defect-tickets/${id}/begin-verification`, { version: cur.version });
+  assert.equal(b.status, 400);
+  assert.equal(b.data.error, 'ACTIONS_NOT_DONE');
+
+  // 标记两条 done 后应能进入 V1
+  const acts = (await getTicket(id)).actions;
+  for (const a of acts) {
+    const m = await req('PATCH', `/defect-tickets/${id}/actions/${a.id}`, { version: a.version });
+    assert.equal(m.status, 200, JSON.stringify(m.data));
+  }
+  cur = await getTicket(id);
+  b = await req('PATCH', `/defect-tickets/${id}/begin-verification`, { version: cur.version });
+  assert.equal(b.status, 200, JSON.stringify(b.data));
+  assert.equal(b.data.status, 'V1');
+});
+
+test('建单 actions 含空白项 -> 跳过不报错；actions 为字符串数组也兼容', skipOpt, async () => {
+  const r = await req('POST', '/defect-tickets', {
+    user_id: seed.userId,
+    exam_profile_id: seed.profileId,
+    draft: true,
+    actions: ['   ', '真动作'],
+  });
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  assert.equal(r.data.actions.length, 1, '空白动作应被跳过');
+  assert.equal(r.data.actions[0].content, '真动作');
+});

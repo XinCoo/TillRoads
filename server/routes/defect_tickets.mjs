@@ -96,7 +96,10 @@ async function createTicket(ctx) {
       error_layer: body.error_layer,
       error_cause: body.error_cause,
       actions: body.actions,
-      // priority 由仓储用 C.computePriority 在事务内计算（T5）
+      // priority：优先用客户端显式选择的值（FE-03 写操作联调 B2 的 P0/P1/P2 三选一）；
+      // 未提供时再由仓储用 C.computePriority 从四个因子算出（T5）。
+      priority: body.priority,
+      // priority 缺省时的因子（仓储内 priorityOf 使用）
       frequency: body.frequency,
       loss: body.loss,
       closability: body.closability,

@@ -113,12 +113,48 @@ function isPgSqlState(code) {
 }
 
 // ---------------------------------------------------------------------------
+// CORS（FE-03 联调用；MVP 用通配符，生产需收窄到 App 的来源）
+// ---------------------------------------------------------------------------
+
+/**
+ * 为什么手写而不是引 cors 包：
+ *   本轮硬约束是「后端只加 CORS 和启动脚本，不引新依赖」。
+ *   我们只需要这几个静态头 + OPTIONS 返 204，用常量对象比引包更省。
+ *
+ * 为什么放在 json() 里而不是每个 handler：
+ *   所有 HTTP 响应都经过 json()（含 sendError），放这里才能保证
+ *   连 404 / 500 也带 CORS 头 —— 否则浏览器会把错误响应当成 CORS 失败，
+ *   前端只能看到「网络错误」而看不到真实的 404/500 语义。
+ *
+ * Access-Control-Allow-Origin 用 '*' 而不是回写 req Origin：
+ *   MVP 阶段无 Cookie / 无凭据（后端也没有鉴权），'*' 更简单且不涉及
+ *   credentials 与通配符冲突的限制。生产收窄时改这一处即可。
+ */
+export const CORS_HEADERS = Object.freeze({
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Methods': 'GET, POST, PATCH, DELETE, OPTIONS',
+  'Access-Control-Allow-Headers': 'Content-Type, If-Match, If-None-Match',
+  'Access-Control-Max-Age': '86400',
+});
+
+/**
+ * OPTIONS 预检直接返 204（无 body）。
+ * 必须在 dispatch 之前处理：预检请求不带业务 body，进 dispatch 只会落 404。
+ */
+export function preflight(res) {
+  res.writeHead(204, { ...CORS_HEADERS });
+  res.end();
+}
+
+// ---------------------------------------------------------------------------
 // 底层 HTTP 工具（原来是 server/index.mjs 里的私有函数，搬到路由层共用）
 // ---------------------------------------------------------------------------
 
 export function json(res, status, obj) {
   const data = JSON.stringify(obj);
   res.writeHead(status, {
+    // CORS 头必须与业务头一起下发，不能让前端把 4xx/5xx 误判成网络错误。
+    ...CORS_HEADERS,
     'Content-Type': 'application/json; charset=utf-8',
     'Content-Length': Buffer.byteLength(data),
   });

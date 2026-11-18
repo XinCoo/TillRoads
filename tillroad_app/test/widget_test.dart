@@ -4,9 +4,16 @@
 // 与本项目实际根组件（lib/main.dart 的 TillRoadApp）保持一致。
 import 'package:flutter/widgets.dart';
 import 'package:flutter_test/flutter_test.dart';
+import 'package:tillroad_app/config/api_config.dart';
 import 'package:tillroad_app/main.dart';
-
 void main() {
+  // FE-03 联调后，列表/详情默认走真实 API。widget test 里没有后端，
+  // 必须在每个用例前把开关拨回 mock，否则会真的发 HTTP 并超时 10s。
+  // 用 setUp 而不是全局一次性赋值，是为了防未来某个用例把它改回去。
+  setUp(() {
+    kUseMock = true;
+  });
+
   testWidgets('首页首屏：Tab 栏、大标题、倒计时与待验证任务', (WidgetTester tester) async {
     await tester.pumpWidget(const TillRoadApp());
     await tester.pumpAndSettle();

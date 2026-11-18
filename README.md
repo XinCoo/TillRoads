@@ -98,11 +98,20 @@ TillRoads/
 ├── schema.sql                 # 数据库单一事实来源
 ├── .github/workflows/schema-ci.yml  # schema 幂等/可逆 + Node 单测 + PG 集成
 ├── *.md                       # 设计 / 决策 / 评审文档
-├── package.json               # scripts: test / test:core / test:server / test:integration / start
+├── package.json               # scripts: test / test:core / test:server / test:integration / start / dev / db:*
+├── scripts/                   # 本地运维脚本（联调新增，均 process.loadEnvFile()）
+│   ├── migrate.mjs            #   用 pg 跑 schema.sql（代替 psql，避开 \ir 元命令）
+│   ├── verify-schema.mjs      #   校验表/枚举/触发器/索引/函数数量
+│   ├── seed-dev.mjs           #   幂等 seed：8 条缺陷单覆盖全 8 个 status
+│   └── dev-start.mjs          #   探活 + 监听 0.0.0.0:3000（供 Android 模拟器 10.0.2.2 访问）
+├── .env                       # 本地连接参数（已 gitignore，不入库）
 ├── tillroad_app/              # Flutter 前端（FE-01 已初始化，iOS/Android/Windows 三平台）
-│   ├── lib/                   #   13 个 dart 文件：main / theme / mock / pages×5 / widgets×5
+│   ├── lib/                   #   21 个 dart 文件：main / theme / config×1 / api×2 / mock×2 / pages×5 / widgets×8
+│   ├── lib/api/               #   api_client（http 薄封装）+ defect_api（snake_case 映射）
+│   ├── lib/config/            #   api_config（kUseMock / kApiBaseUrl / kDemoUserId）
 │   ├── assets/icons/          #   1024 图标源（白底 app_icon + 透明底 foreground）
-│   └── screenshots/           #   FE-01 验收截图（Windows + Android）
+│   ├── assets/fonts/          #   霞鹜新致宋（单个 Regular 字重）
+│   └── screenshots/           #   FE-01 / FE-03 / FE-03 联调验收截图
 └── REVIEW-NOTES.md / README.md
 ```
 
@@ -133,9 +142,17 @@ npm run test:integration   # pg-smoke + 四表仓储 + 路由层 + 导入链路�
 npm start
 ```
 
-数据库（需 PG15+，本机未安装，故由 GitHub Actions 的 PG15 service 容器真跑）：
+数据库（PG15+）：
+
+- **CI**：由 GitHub Actions 的 PG15 service 容器真跑（`psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql`）。
+- **本地**：本机未安装 PostgreSQL，联调时改用 Neon 云库（连接参数放 `.env`，已被 `.gitignore` 忽略），并用 `scripts/migrate.mjs` 代替 `psql`（因为 `migrations/0001_init_up.sql` 只有 `\ir ../schema.sql` 这条 psql 元命令，`pg` 驱动执行不了；脚本改为直接跑纯 SQL 的 `schema.sql`）。
 
 ```bash
+npm run db:migrate      # = node scripts/migrate.mjs，跑 schema.sql，跑完自行校验
+npm run db:verify       # = node scripts/verify-schema.mjs，打印表/枚举/触发器/索引/函数数量
+npm run db:seed         # = node scripts/seed-dev.mjs，幂等灌 8 条缺陷单（覆盖全部 8 个 status）
+
+# 有 psql 的机器仍可用原来的方式
 psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql   # 打印 SCHEMA_VERIFY_OK 即通过
 psql -v ON_ERROR_STOP=1 -f migrations/0001_init_down.sql # 回滚
 ```
@@ -156,6 +173,32 @@ RUN_PG_INTEGRATION=1 npm test
 > 集成测试的 `before()` 会自行执行整份 `schema.sql`（单一事实来源，无 psql 元命令），
 > 因此 CI 中无需额外跑迁移步骤；本地若已迁移也是幂等的，不冲突。
 
+### 本地联调（App ↔ 后端 ↔ 云数据库）
+
+```bash
+# 1. 准备连接参数（只需一次）：把 PG* 变量写进 .env
+#    PGHOST / PGPORT / PGUSER / PGPASSWORD / PGDATABASE
+#    PGSSLMODE=require        # 云库强制 TLS
+#    PGCONNECT_TIMEOUT=30     # 云库冷启动可能超过 pool 的 5s 连接超时
+
+# 2. 建库 + 灌数据（幂等，可重复跑）
+npm run db:migrate && npm run db:seed
+
+# 3. 启动后端（监听 0.0.0.0，否则 Android 模拟器连不上）
+npm run dev             # = node scripts/dev-start.mjs
+```
+
+`npm run dev` 会先探活数据库、打印记录数，再监听 `0.0.0.0:3000`，并打印三个可用地址：
+
+| 客户端 | 地址 |
+|---|---|
+| Android 模拟器 | `http://10.0.2.2:3000`（模拟器到宿主机的固定映射） |
+| iOS 模拟器 / Windows 桌面 / curl | `http://localhost:3000` |
+
+> **`PGSSLMODE` 与 `PGCONNECT_TIMEOUT` 都能直接生效，不需要改 `server/db/pool.mjs`**：
+> `pg@8.23.1` 的 `readSSLConfigFromEnvironment()` 原生读 `PGSSLMODE`（`require`/`verify-full` 等→启用 TLS，`no-verify`→启用但不校验证书），
+> `PGCONNECT_TIMEOUT` 也由驱动自己读（`node_modules/pg/lib/connection-parameters.js`）。
+> 这样「接云库」不会污染业务代码——`pool.mjs` 至今没有一行 `ssl` 配置。
 ---
 
 ## 4. 核心规则速查（core/index.mjs）
@@ -602,24 +645,87 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 
 ### 缺陷单界面（FE-03）
 
-列表页与详情页，数据全部来自 `lib/mock/defects_mock.dart`（8 条 mock，**覆盖全部 8 个 status 各一条**），不连后端。
+列表页与详情页。**FE-01/FE-03 初版数据全部来自 `lib/mock/defects_mock.dart`（8 条 mock，覆盖全部 8 个 status 各一条）；FE-03 联调后默认走真实 API**，mock 仅作离线回退（`kUseMock = true`）。
 
 | 文件 | 职责 |
 |---|---|
 | `lib/mock/defects_mock.dart` | `DefectStatus`（八态）/ `DefectPriority` / `VerifyResult` / `DefectAction` / `StatusEvent` / `DefectTicket` + 8 条 mock + `relativeTime` / `absoluteTime` |
+| `lib/config/api_config.dart` | `kUseMock` 总开关（**非 const**，便于测试翻转）/ `kDemoUserId` / `kApiBaseUrl`（按平台切）/ `kApiTimeout` |
+| `lib/api/api_client.dart` | 薄封装 `http`：统一超时、非 2xx → `ApiException`（带 `statusCode` / `body` / `isNetworkError`） |
+| `lib/api/defect_api.dart` | 读：`fetchDefectTickets`（支持 `status` 逗号多值）/ `fetchDefectDetail` / `fetchKnowledgeNodes` / `fetchExamProfiles` / `fetchSubjects`；写：`createDefectTicket` / `analyzeDefectTicket`（含 REOPENED→reanalyze）/ `markActionDone` / `beginVerification` / `submitVerification`。手写 snake_case 映射，不引 `json_serializable` |
+| `lib/widgets/form_field.dart` | 表单共用件：`FormFieldGroup`（标题+红星+hint+内联红字）/ `FormTextField` / `FormChipGroup` / `FormSubmitButton`（busy 转圈）/ `FormErrorBanner` / `FormScaffold` / `FormEmptyHint` |
+| `lib/pages/defect_create_page.dart` | 建单表单（q_type / error_layer 六 chip / error_cause 多行 / 考点 chip / priority 三 chip / 动态动作列表） |
+| `lib/pages/defect_analyze_page.dart` | 归因表单，DRAFT「补充归因」与 REOPENED「重新归因」共用；409 后自动回填服务端最新值 |
+| `lib/pages/defect_verify_page.dart` | 提交验证表单：`verify_type` 按 stage 白名单给选项、`result` 二选一、`evidence` 自证说明 |
 | `lib/widgets/defect_badges.dart` | `statusColor` / `priorityColor` / `StatusBadge`（`AnimatedContainer` 250ms）/ `PriorityBadge` / `RoundChip` / `ReopenChip` / `CardShell` / `InfoRow` / `InfoText` |
 | `lib/widgets/defect_card.dart` | `DefectCard`（三行卡片）+ `FilterChipRow`（横向滚动筛选条） |
 | `lib/widgets/verification_progress.dart` | `VerificationProgress`（V1/V2/V3 当前阶段橙色左边框高亮）+ `StatusTimeline`（手画圆点竖线） |
-| `lib/pages/defects_page.dart` | 列表页（`CupertinoSliverNavigationBar` + 筛选条 + `SliverList`） |
+| `lib/pages/defects_page.dart` | 列表页（`CupertinoSliverNavigationBar` + 筛选条 + `SliverList` + 加载/错误/空态三态） |
 | `lib/pages/defect_detail_page.dart` | 详情页（六栏基本信息 + 处理动作 + 三次验证 + 状态时间线 + 底部固定操作区） |
-
 **筛选分组**：全部 / 进行中（DRAFT+ANALYZED+ACTION_DONE+**REOPENED**）/ 待验证（V1+V2+V3）/ 已关闭（CLOSED）。`REOPENED` 归入进行中，卡片上带红色「重开 N 次」角标。
 
 **为什么详情页用 `CupertinoSliverNavigationBar` 而不是 `CupertinoPageScaffold(navigationBar:)`**：后者**不会给 child 预留导航栏高度**，`ListView` 的内容会钻到导航栏下面（实测截图里归因首行被压住）。改成 sliver 导航栏后与首页/列表页同构，顺带获得大标题折叠。
 
 **为什么筛选条不用 `CupertinoSegmentedControl`**：5 个中文标签挤在 375pt 宽下会换行或截断，且选中色被系统主题覆盖；改用 `AnimatedContainer` 手写 chip，可精确控制 250ms `easeInOut` 与配色。
 
-**底部主按钮**按状态分支：DRAFT→「去归因」/ ANALYZED→「暂无操作」/ ACTION_DONE→「进入验证」/ V1·V2·V3→「提交验证」/ REOPENED→「重新归因」/ CLOSED→不给按钮，居中显示绿色「已关闭」。当前点击只弹提示（需接后端 API）。
+**底部主按钮**按状态分支（已全部接真实写接口）：DRAFT→「去归因」push 归因页 / **ANALYZED 与 ACTION_DONE→ 都是「进入验证」** / V1·V2·V3→「提交验证」push 验证页 / REOPENED→「重新归因」push 归因页 / CLOSED→不给按钮，居中显示绿色「已关闭」。
+
+**为什么 ANALYZED 也走「进入验证」**：DB 触发器只接受 `ANALYZED → ACTION_DONE → V1` 逐步跳，而 `PATCH /:id/begin-verification` 已在同一事务里做了这两跳（应用层先 `assertTransition(cur.status,'ACTION_DONE')` → `actions.assertAllDone` 门禁 → 写 ACTION_DONE → 再 `beginVerification({status:'ACTION_DONE'},'V1')`，两次都过 core 纯函数，触发器再兜底）。所以「进入验证」是 ANALYZED 唯一的前进路径——早期把它写成「暂无操作」会让整条闭环卡在 ANALYZED 无法推进。动作未完成时后端返回 `NO_ACTIONS` / `ACTIONS_NOT_DONE`，由 `_handleWriteError` 给出可操作提示。
+
+#### 写路径的错误处理（乐观锁 / 禁用语 / AI 关单）
+
+| HTTP | `error` 字段 | 前端表现 |
+|---|---|---|
+| 409 | `conflict` + `current` | toast「该单已被修改，正在刷新到最新状态。」并自动 `_refreshDetail()`；归因页还会把表单回填成服务端最新值 |
+| 400 | `forbidden_phrase` / `FORBIDDEN_PHRASE_IN_ERROR_CAUSE` | **内联红字**（在「具体错因」字段下方）「请写出具体哪一步算错或记错，不要写「X」这类词」，不弹 alert |
+| 400 | `missing_error_layer_or_cause` | 内联到对应字段（层级/错因） |
+| 400 | `NO_ACTIONS` / `ACTIONS_NOT_DONE` | toast「先添加至少一条处理动作」/「还有处理动作未完成，全部勾选后才能进入验证」 |
+| 400 | `INVALID_BASE_VERSION` | 「缺少版本号（乐观锁）。请刷新页面后重试。」 |
+| 400 | `INVALID_VERIFICATION_STAGE` / `ILLEGAL_DEFECT_TRANSITION` | 「当前状态不支持这个操作，正在刷新到最新状态。」+ 刷新 |
+| 403 | `ai_cannot_close` | 「AI 不能替用户关单：验证通过必须由你本人标记。」 |
+| — | 网络错误（`statusCode == null`） | 顶部橙色 `FormErrorBanner` + 「重试」 |
+
+**禁用语是 7 个不是 5 个**：`粗心 / 马虎 / 没掌握 / 我懂了 / 大意 / 差不多 / 忘了`（见 `core/index.mjs:29-31` `FORBIDDEN_PHRASES`）。表单提示与 `kForbiddenPhrases` 常量必须与 core 同源，漏一个就会让用户先过前端预校验、再被后端 400 抦下。
+
+**`verify_type` 选项按 core 白名单而不是自拟**：`V1 = redo_hidden / similar_variant / teach_back`、`V2 = new_question`、`V3 = timed_mock`（见 `core/index.mjs:40-44` `STAGE_WINDOWS`）。注意 **V3 只有 `timed_mock`**，没有「讲题」——后端枚举能收但不合 core 阶段语义，前端只列白名单内的。
+
+**归因层级是自由文本**：`defect_tickets.error_layer` 在 schema 里是 `text`（`schema.sql:299`），不是枚举。六个选项（知道/识别/执行/抗压/策略取舍/稳定迁移）来自开发文档 §20 行测六层，仅作前端常用项；后端不做白名单校验。
+
+#### 验证任务页（FE-04）
+
+`lib/pages/verify_page.dart` 整页重写，接 BE-04 的两个只读端点：
+
+| 文件 | 职责 |
+|---|---|
+| `lib/api/verification_api.dart` | `VerificationTask`（18 字段，派生 `daysLabel` / `windowLabel` / `freqLabel`）+ `VerificationSummary`（`total/overdue/dueSoon/normal/byStage`）+ `VerificationApi` 两个 fetch |
+| `lib/pages/verify_page.dart` | 三色摘要卡片（可点击即筛选）+ stage 筛选条 + 三态列表 + 每卡局部 loading 拉详情再 push |
+| `lib/pages/home_page.dart` | 「今日待验证」标题右侧改为真实三色计数（`_CountDot` 圆点 + 数字），失败回落 mock 条数并标「离线」 |
+
+设计取舍（三条都写进了源码 JSDoc）：
+
+1. **urgency 由后端算，前端只展示**。窗口天数是后端常量（`server/verify_window.mjs` 的 `{V1: 7, V2: 14, V3: 21}`），前端再算一遍就会出现「服务端说逾期、客户端说还剩 1 天」的双口径。
+2. **筛选走后端**。BE-04 的 `status` 与 `urgency` 都支持逗号分隔多值，所以切筛选 = 重新请求，而不是内存过滤。这与 FE-03 缺陷单列表不同（那里首轮后端只支持单值，只能在本地算）——**别再照搬**。
+3. **摘要始终拉全量，不随筛选变**。否则「逾期 3」在筛到 V1 后会变成「逾期 1」，用户会以为数据丢了。
+
+点卡片进详情不走 `pushReplacement`：`DefectDetailPage` 构造要求一个完整 `DefectTicket`（它先用传入数据首屏渲染，再 `initState` 补拉 `verifications`/`actions`），所以 `_openDetail` 先 `fetchDefectDetail`，拿到后一次性 push；点击到 push 之间只给**该卡片**局部 `CupertinoActivityIndicator`，不遮全屏。
+后端同轮修（只改 `create` 路径，未动状态机/触发器/schema）：`server/repositories/defect_tickets.mjs` 的 `create` 原本只把 `actions` 写进 `defect_tickets.actions` **jsonb 冗余列**，**不生成 `actions` 表行**；而 `begin-verification` 的门禁 `actions.assertAllDone()` 读的是 `actions` 表 → 新单永远是 `NO_ACTIONS`，闭环走不通。现在 `create` 在插完主行后调 `insertActionsForTicket()` 逐条插表（入参兼容 `['文案']` 与 `[{content, due}]`，空串静默跳过），并在同一个 `withTransaction` 内（任一条失败整笔回滚），返回 `{...ticket, actions: created}`。
+
+> 前端 `createDefectTicket` 里「建单后逐条 `POST /:id/actions`」的补丁**保留但已非必需**（向后兼容旧后端）：新客户端直接建单即可。
+
+---
+#### 接真实 API 后的状态与取舍（FE-03 联调）
+
+列表页与详情页都改为**三态**：`CupertinoActivityIndicator` 加载中 → 数据或「加载失败 + 重试」。详情页额外做了一层保护：**先用列表页传来的 `ticket` 立即渲染**，再在 `initState` 补拉详情，失败时只在顶部加一条橙色提示条（`_RefreshFailedBanner`）而不是把整页换成错误屏——因为详情页的归因/状态/优先级本来就能看，把可见内容换掉反而更差。
+
+**筛选曾有一轮在本地算，现在改回服务端了**：联调首轮时后端 `GET /users/:userId/defect-tickets` 的 `status` 参数是**单值**（`status = $1`），而「进行中」= DRAFT+ANALYZED+ACTION_DONE+REOPENED、「待验证」= V1+V2+V3 都是**多状态集合**，所以只能客户端过滤。写操作联调时后端已把该参数改成**逗号分隔多值**（`status::text = ANY($n::text[])`，参数化数组、不拼字符串），前端筛选因此可以交给后端。
+**真实响应暴露的 3 个契约缺口（均已处理）**：
+
+| 缺口 | 现象 | 处理 |
+|---|---|---|
+| 无考点/科目名 | 列表与详情都只有 `knowledge_node_id`（两端点走 `SELECT *` 不 JOIN） | ✅ **写操作联调已修**：仓储 `SELECT_WITH_DISPLAY` 用 `LEFT JOIN knowledge_nodes`（`title`→`knowledge_node_title`、`freq_tag`→`knowledge_node_freq_tag`）与 `LEFT JOIN subjects`（→`subject_name`）。用 LEFT 不用 INNER，因为 `knowledge_node_id` 可空，INNER 会丢单 |
+| 字段名是 `status` 不是 `stage` | 缺陷单响应里状态字段叫 `status`，而验证记录里同概念叫 `stage` | 保持现状（两者语义确实不同：单的状态 vs 某次验证的阶段） |
+| `verification_state` 恒 `pending` | 该 jsonb 列不会随 `verifications` 表变化自动更新 | 前端从响应里的 `verifications` 数组按 stage + 当前 round 推导（**只取 `round` 等于当前 `verification_round` 的记录**，否则重开后旧 round 的 pass 会误显示成新 round 已通过） |
+**状态时间线只显示两个节点**：schema 没有 `defect_events` 表，无法还原完整状态变更历史。当前用 `created_at` + 当前 `status` 造最小序列（创建 → 当前状态）。完整历史需新增 `defect_events(defect_ticket_id, from_status, to_status, at, reason)` 并让触发器写入。
 
 ---
 
@@ -640,8 +746,12 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - ✅ **BE-06**：日/周/月复盘统计（**用户触发快照**）：`server/review_period.mjs` 周期起止纯函数（ISO 周 + `Asia/Shanghai` 日界，10 条单测）+ `server/review_stats.mjs` 六项 metrics 全 SQL 层聚合 + `review_cycles` 仓储与 5 个端点（同周期 `409 ALREADY_EXISTS`）+ 删掉 BE-03 遗留的假 `/review-cycles`；fake 层 6 条、真 PG 集成 12 条
 - ✅ **FE-01**：Flutter 项目初始化 + 首页看板（纯 Cupertino、无第三方状态/网络/路由/图表库）：`tillroad_app/` 13 个 dart 文件 + `home_mock.dart` 假数据；大标题折叠、弹簧按压、倒计时 `AnimatedSwitcher`、Reduce Motion 降级；`flutter analyze` 0 error；Android 17 模拟器真机跑通并截图
 - ✅ **FE-01 字体**：接入霞鹜新致宋（`assets/fonts/霞鹜新致宋字体.ttf`，SIL OFL 1.1），`CupertinoTextThemeData` 九个 TextStyle 逐项覆盖 + `CupertinoAlertDialog` 三处硬编码 `CupertinoSystemText` 的显式覆盖；Android 17 模拟器真机复核四张截图
-- ✅ **FE-03**：缺陷单列表 + 详情页（纯 mock，不连后端）：`defects_mock.dart` 8 条覆盖八态 + `defect_badges`/`defect_card`/`verification_progress` 三组共用组件 + 状态筛选条（进行中含 REOPENED）+ 详情页六栏/处理动作/三次验证进度/手画状态时间线/底部状态化操作区；`flutter analyze` 0 error，`flutter test` 5/5，Android 17 模拟器真机截图（列表页 + 详情页 + 时间线）
+- ✅ **FE-03**：缺陷单列表 + 详情页：`defects_mock.dart` 8 条覆盖八态 + `defect_badges`/`defect_card`/`verification_progress` 三组共用组件 + 状态筛选条（进行中含 REOPENED）+ 详情页六栏/处理动作/三次验证进度/手画状态时间线/底部状态化操作区；`flutter analyze` 0 error，`flutter test` 5/5，Android 17 模拟器真机截图（列表页 + 详情页 + 时间线）
+- ✅ **FE-03 联调**（App → HTTP → PG → 界面）：后端新增 CORS（原生 `node:http`，OPTIONS → 204，连 4xx/5xx 也带头）与 `scripts/` 四个运维脚本（migrate / verify / seed / dev-start），**未动任何业务逻辑**；前端新增 `http` 依赖（本轮唯一新依赖）+ `api_client` / `defect_api` / `api_config`，两页改为加载/成功/错误三态；Android 模拟器连 Neon 云库真跑：列表 8 条真实数据、详情 V1/V2/V3 全通过、停后端起后端后重试恢复——**错误态与重试链路均已截图验证**
+- ✅ **FE-03 写操作联调**（建单 → 归因 → 标记动作 → 进入验证 → 提交验证）：后端两处查询小修（LEFT JOIN 考点/科目名、`status` 逗号分隔多值）；前端新增建单页 / 归因页 / 提交验证页 + `widgets/form_field.dart` 共用表单件，`defect_api.dart` 补齐 5 个写方法与 3 个读方法；乐观锁 `version` 全程携带、409 提示刷新、禁用语 400 内联红字、`ai_cannot_close` 403 文案；Android 17 模拟器 + Neon 真跑通「DRAFT 建单 → ANALYZED → 动作勾完 → `begin-verification` 两跳进 V1 → 提交 V1 pass 进 V2」，四处截图留证
+- ✅ **FE-04**：验证任务页接真实 API + 后端建单 actions 同事务：仓储 `create` 改为「先插 `defect_tickets` 行、再逐条插 `actions` 表行」并返回带 `actions` 的 ticket（仍在同一 `withTransaction` 内，任一条失败整笔回滚），**堵上 `begin-verification` 门禁读不到动作的 `NO_ACTIONS` 缺口**；前端新增 `verification_api.dart`（`VerificationTask` / `VerificationSummary`）+ `verify_page.dart` 整页重写（三色摘要卡片可点击筛选、stage 筛选条走后端、每卡局部 loading 拉详情再 push）+ 首页「今日待验证」右侧改为真实三色计数（拿不到时回落 mock 条数并标「离线」）；2 条新 PG 集成用例（建单带 2 条动作 → 表 2 行 → 标记完成 → 进 V1）留 CI；Android 17 模拟器 + Neon 真跑 1/1/1 三色、点击筛选、进详情并提交 V1 pass，截图四张
 - ⏳ **下一批**：FE-02 建题/导入页 → FE-11 审核七态 UI → BE-07 缺陷分布看板 / BE-08 同步服务 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
+- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两节点）；②CORS 的 `*` 生产前收窄为白名单；③补 userId 鉴权；④Neon 空闲回收连接时 `pg` 池会冒未监听 `error` 事件杀进程（已在 `scripts/dev-start.mjs` 绑 `pool.on('error')` 兜住，生产需同类防护）；⑤前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
 
 ---

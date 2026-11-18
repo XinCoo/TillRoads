@@ -22,8 +22,10 @@ import {
   archiveWithVersion,
   insertRow,
   listRows,
+  notFoundError,
   pageParams,
   queryMany,
+  queryOne,
   requireRow,
   selectRow,
   toJsonbParam,
@@ -104,28 +106,129 @@ export async function create(client, input = {}) {
     if (c === 'actions') return toJsonbParam(input.actions ?? []);
     return input[c] ?? null;
   });
-  return insertRow(client, TABLE, INSERT_COLUMNS, values);
+  const ticket = await insertRow(client, TABLE, INSERT_COLUMNS, values);
+
+  // ★ FE-04 A2：建单时同步把 actions 落成 actions 表的真实行。
+  //
+  // 背景（FE-03 写操作联调发现的缺口）：此前 create 只把 actions 写进
+  // defect_tickets.actions 这个 jsonb 列，actions 表一行都没有；而
+  // beginVerification 的门禁 actions.assertAllDone() 读的是 actions 表，
+  // 于是「建单带动作 → 进入验证」必然 NO_ACTIONS。前端一度在客户端逐条补 POST，
+  // 但那只能救本 App 一个客户端，任何直接调后端 API 的调用方都会踩同一个坑。
+  //
+  // 这里把「写单行」+「逐条写 actions 行」收进调用方的同一个 withTransaction
+  // （create 本身不 BEGIN，它总是被 withTransaction 包着跑），任一条动作失败
+  // 整笔回滚，不会留下「单子在、动作丢了」的半截数据。
+  //
+  // 入参兼容两种形状：`['重做同类题']` 与 `[{content:'重做同类题', due:'2026-01-01'}]`。
+  const created = await insertActionsForTicket(client, ticket.id, input.actions);
+  return { ...ticket, actions: created };
 }
+
+/**
+ * 把建单入参里的 actions 批量写成 actions 表行（done=false）。
+ *
+ * @param client 事务内 client
+ * @param defectTicketId 刚落库的缺陷单 id
+ * @param rawActions  `['文案'] | [{content, due}] | null | undefined`
+ * @returns {Promise<Array<object>>} 新建的动作行（与 GET 详情的 actions 形状一致）
+ */
+async function insertActionsForTicket(client, defectTicketId, rawActions) {
+  if (!Array.isArray(rawActions) || rawActions.length === 0) return [];
+  const rows = [];
+  for (const item of rawActions) {
+    // 字符串直接当 content；对象取 content，并允许带 due。
+    const content = typeof item === 'string' ? item : item?.content;
+    const trimmed = content == null ? '' : String(content).trim();
+    // 空白动作静默跳过（前端「添加动作」可能留空行，不该因此整单失败）。
+    if (trimmed === '') continue;
+    const due = typeof item === 'object' && item !== null ? (item.due ?? null) : null;
+    rows.push(await actions.create(client, { defect_ticket_id: defectTicketId, content: trimmed, due }));
+  }
+  return rows;
+}
+
+/**
+ * GET /defect-tickets/:id 的投影：在 `SELECT *` 基础上 LEFT JOIN 考点与科目。
+ *
+ * FE-03 联调发现：原实现直接 `SELECT *`，前端只拿到 knowledge_node_id，
+ * 无法显示考点名与科目名（只能拿 id 前 8 位当占位）。这里补三个展示字段：
+ *   knowledge_node_title / knowledge_node_freq_tag / subject_name。
+ *
+ * 为什么用 LEFT JOIN 而不是 INNER JOIN：knowledge_node_id 在 schema 里可空
+ * （手写建单可以不带考点），INNER JOIN 会把这类单子直接从结果里丢掉。
+ *
+ * 注意：这是**读路径专用投影**。写方法（analyze / beginVerification /
+ * submitVerification / update）仍走 updateWithVersion(... RETURNING *)，
+ * 返回的是裸行（不带 JOIN 字段）——前端写完后会重新 GET 详情，不影响正确性。
+ */
+const SELECT_WITH_DISPLAY = `
+  SELECT
+    dt.*,
+    kn.title AS knowledge_node_title,
+    kn.freq_tag AS knowledge_node_freq_tag,
+    sub.name AS subject_name
+  FROM defect_tickets dt
+  LEFT JOIN knowledge_nodes kn ON kn.id = dt.knowledge_node_id AND kn.deleted_at IS NULL
+  LEFT JOIN subjects sub ON sub.id = kn.subject_id AND sub.deleted_at IS NULL
+`;
 
 export async function getById(client, id, { includeDeleted = false } = {}) {
-  return requireRow(client, TABLE, id, { includeDeleted });
+  const sql = includeDeleted
+    ? `${SELECT_WITH_DISPLAY} WHERE dt.id = $1`
+    : `${SELECT_WITH_DISPLAY} WHERE dt.id = $1 AND dt.deleted_at IS NULL`;
+  const row = await queryOne(client, sql, [id]);
+  // 语义与 requireRow 保持一致：不存在或已软删 → 404。
+  if (!row) throw notFoundError(TABLE, id);
+  return row;
 }
 
-/** 可选 includeDeleted，用于乐观锁冲突时回带软删当前行。 */
+/** 可选 includeDeleted，用于乐观锁冲突时回带软删当前行（不 JOIN，只要原值）。 */
 export async function findById(client, id, { includeDeleted = false } = {}) {
   return selectRow(client, TABLE, id, { includeDeleted });
 }
 
+/**
+ * 列表（读路径专用投影，理由同 getById）。
+ *
+ * status 支持**多值**（FE-03 写操作联调 A2）：前端「进行中」= DRAFT+ANALYZED+
+ * ACTION_DONE+REOPENED、「待验证」= V1+V2+V3 都是多状态集合，若只支持单值
+ * 就只能拉全量在客户端过滤。
+ *
+ * 入参形态（opts.status）三种都接受，便利路由层与测试：
+ *   · 字符串 `'V1,V2,V3'`（来自 query string）
+ *   · 字符串数组 `['V1','V2']`
+ *   · 单值 `'V1'`（等价于一元素集合）
+ *
+ * SQL 用 `status::text = ANY($n::text[])` 而不是拼字符串：
+ *   · status 是 enum 类型，直接 = ANY(enum[] 字面量) 需要先造类型数组，
+ *     转 text 比较最稳且能复用现有参数化路径；
+ *   · 数组作为**一个**参数下发，不可能注入。
+ */
 export async function listByUser(client, userId, opts = {}) {
   if (!userId) throw new TypeError('defect_tickets.listByUser: userId 必填');
   const { limit, offset } = pageParams(opts);
-  const where = ['user_id = $1'];
+  const where = ['dt.user_id = $1', 'dt.deleted_at IS NULL'];
   const params = [userId];
-  if (opts.status) {
-    params.push(opts.status);
-    where.push(`status = $${params.length}`);
+
+  const wanted = parseStatusFilter(opts.status);
+  if (wanted.length > 0) {
+    params.push(wanted);
+    where.push(`dt.status::text = ANY($${params.length}::text[])`);
   }
-  return listRows(client, TABLE, where, params, { limit, offset });
+
+  const sql = `${SELECT_WITH_DISPLAY}
+    WHERE ${where.join(' AND ')}
+    ORDER BY dt.created_at ASC, dt.id ASC
+    LIMIT $${params.length + 1} OFFSET $${params.length + 2}`;
+  return (await client.query(sql, [...params, limit, offset])).rows || [];
+}
+
+/** `'V1,V2,V3'` / `['V1','V2']` / `'V1'` → 去空白去空项的数组；非法输入返回 []（不过滤）。 */
+function parseStatusFilter(status) {
+  if (status == null) return [];
+  const raw = Array.isArray(status) ? status : String(status).split(',');
+  return raw.map((s) => String(s).trim()).filter((s) => s !== '');
 }
 
 /** 全表列表（供模考报告 / 复盘统计这类跨用户聚合端点使用）。 */

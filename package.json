@@ -9,7 +9,11 @@
     "test:core": "node --test core/*.test.mjs",
     "test:server": "node --test --test-concurrency=1 server/*.test.mjs server/*/*.test.mjs",
     "test:integration": "node --test --test-concurrency=1 server/db/pg-smoke.integration.test.mjs server/repositories/repositories.integration.test.mjs server/index.integration.test.mjs server/import/import.integration.test.mjs server/routes/defect_tickets.integration.test.mjs server/routes/verification_tasks.integration.test.mjs server/routes/mock_exams.integration.test.mjs server/routes/review_cycles.integration.test.mjs",
-    "start": "node server/index.mjs"
+    "start": "node server/index.mjs",
+    "dev": "node scripts/dev-start.mjs",
+    "db:migrate": "node scripts/migrate.mjs",
+    "db:verify": "node scripts/verify-schema.mjs",
+    "db:seed": "node scripts/seed-dev.mjs"
   },
   "dependencies": {
     "pdfjs-dist": "^6.5.438",

@@ -142,6 +142,7 @@ class DefectTicket {
     required this.v2,
     required this.v3,
     required this.statusHistory,
+    this.version = 1,
   });
 
   final String id;
@@ -177,6 +178,12 @@ class DefectTicket {
 
   final List<StatusEvent> statusHistory;
 
+  /// 乐观锁版本号（后端每写一次 +1）。
+  ///
+  /// FE-03 写操作联调新增：所有写请求都必须带当前 version，
+  /// 后端 0 行命中即返回 409 + 服务端当前行，前端提示用户刷新。
+  /// mock 数据里没有版本概念，故默认 1 且不参与 mock 构造参数。
+  final int version;
   /// 已完成动作数
   int get doneActionCount => actions.where((DefectAction a) => a.done).length;
 

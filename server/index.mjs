@@ -18,7 +18,7 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 import { dispatch } from './routes/index.mjs';
-import { json, readBody, sendError } from './routes/_http.mjs';
+import { json, preflight, readBody, sendError } from './routes/_http.mjs';
 
 /**
  * 每个 app 实例持有独立的内存状态，便于集成测试隔离。
@@ -51,6 +51,13 @@ export function createApp(options = {}) {
   const reposCtx = repos;
   const server = httpCreateServer(async (req, res) => {
     try {
+      // FE-03 联调：CORS 预检必须在读 body / 路由分发**之前**处理。
+      // OPTIONS 不带业务 body，进 dispatch 只会落 404，浏览器就把预检判失败。
+      if (req.method === 'OPTIONS') {
+        preflight(res);
+        return;
+      }
+
       const body = await readBody(req);
       const u = new URL(req.url, 'http://localhost');
       let pathname = u.pathname;
@@ -102,8 +109,15 @@ if (invoked && fileURLToPath(import.meta.url) === invoked) {
   const { createPool } = await import('./db/pool.mjs');
   const pool = createPool();
   const app = createApp({ pool });
-  app.listen(port, () => {
+  // 显式绑 0.0.0.0：默认不传 host 时 Node 绑 '::'（dual-stack），多数情况下
+  // Android 模拟器走 10.0.2.2 也能访问，但这依赖系统 IPv6/双栈行为，不够确定。
+  // 显式绑 IPv4 全部网卡可直接覆盖模拟器与局域网真机两种场景。
+  app.listen(port, '0.0.0.0', () => {
     // eslint-disable-next-line no-console
-    console.log(`TillRoad API listening on http://127.0.0.1:${port}`);
+    console.log(`TillRoad API listening on http://0.0.0.0:${port}`);
+    // eslint-disable-next-line no-console
+    console.log(`  · Android 模拟器访问: http://10.0.2.2:${port}`);
+    // eslint-disable-next-line no-console
+    console.log(`  · 本机/桌面/iOS 模拟器: http://localhost:${port}`);
   });
 }

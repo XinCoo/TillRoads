@@ -804,3 +804,263 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - 底部主按钮的实际操作（去归因/进入验证/提交验证/重新归因）待 FE-04 / BE-03 接口接入。
 - 状态时间线的真实数据需要服务端补 `defect_events` 表（当前 schema 只有 `created_at`/`closed_at`/`updated_at`，无法还原完整状态迁移历史）。
 - 列表页尚无分页/下拉刷新（纯 mock 8 条用不上）。
+
+## 25. FE-03 联调归档（App → HTTP → PG → 界面）
+
+### 范围与硬约束
+
+用户任务书：把 FE-03 的列表/详情接到 BE-03 真实端点。硬约束：后端**只加 CORS 和启动脚本**，不改业务逻辑 / 不改 schema / 不改 repository；前端**只加 `http` 依赖**，不加状态管理库 / 路由库 / `json_serializable` / `dio`；不自动安装 PostgreSQL（环境不就绪就停在第一步等用户）。
+
+### 环境方案：Neon 云库（用户选 B）
+
+本机无 PostgreSQL（`psql` 无、5432 无监听、无 `postgresql*` 服务、docker 也无），选云库。**关键前提：不能为接 TLS 去改 `pool.mjs`（那会违反“不改业务逻辑”）**。
+
+- `pg@8.23.1` 的 `readSSLConfigFromEnvironment()`（`node_modules/pg/lib/connection-parameters.js:25-41`）原生读 **`PGSSLMODE`**：`disable`→false，`prefer`/`require`/`verify-ca`/`verify-full`→true，`no-verify`→`{rejectUnauthorized:false}`；`:85` 仅在 `config.ssl === undefined` 时启用。
+- `PGCONNECT_TIMEOUT` 也由驱动自己读（`:127`），可绕过 `pool.mjs` 硬编码的 `connectionTimeoutMillis: 5000`（云库冷启动常超 5s）。
+- 结论：**`server/db/pool.mjs` 零改动**（至今无一行 `ssl` 配置），`PGSSLMODE` / `PGCONNECT_TIMEOUT` 全写进 `.env`。
+- `.env` 已被 `.gitignore` 忽略（该文件本轮新建）。
+
+### 后端改动（只两个文件 + 四个新脚本）
+
+**CORS**（`server/routes/_http.mjs` + `server/index.mjs`）：
+
+- `_http.mjs` 新增 `CORS_HEADERS`（`Allow-Origin: *` / `Allow-Methods: GET, POST, PATCH, DELETE, OPTIONS` / `Allow-Headers: Content-Type, If-Match, If-None-Match` / `Max-Age: 86400`），在 `json()` 的 `writeHead` 里展开。**放在 `json()` 而不是各 handler**：连 404/500 也要带 CORS 头，否则浏览器会把错误响应当成网络失败，前端拿不到真实 statusCode。
+- `index.mjs` 在请求处理**最前面**加 `if (req.method === 'OPTIONS') { preflight(res); return; }`（必须在 `readBody`/`dispatch` 之前，OPTIONS 没业务 body，进 dispatch 只会 404）；`app.listen(port, '0.0.0.0', ...)`（原先未传 host，日志写死 127.0.0.1 易误导）。
+
+**四个脚本**（`scripts/migrate.mjs` / `verify-schema.mjs` / `seed-dev.mjs` / `dev-start.mjs`，均 `process.loadEnvFile()`）：
+
+| 脚本 | 作用 |
+|---|---|
+| `migrate.mjs` | 直接用 `pg` 跑 `schema.sql`（因 `migrations/*_up.sql` 只有 `\ir ../schema.sql` 这条 psql 元命令，`pg` 执行不了）；先 `SELECT 1` 探活再建池 |
+| `verify-schema.mjs` | 查 `information_schema`/`pg_type`/`pg_trigger`/`pg_indexes`/`pg_proc` |
+| `seed-dev.mjs` | 固定 UUID 幂等 seed（先按 FK 顺序 DELETE 再造），覆盖全部 8 个 status |
+| `dev-start.mjs` | 探活 + 打印记录数 + 监听 `0.0.0.0:3000` + 打印三套地址 |
+
+`package.json` 新增 `dev` / `db:migrate` / `db:verify` / `db:seed` 四个别名。
+
+### seed 的两条硬约束（不遵守就失败）
+
+1. **`defect_tickets` 有两个 NOT NULL 外键**（`user_id → users`、`exam_profile_id → exam_profiles`），插入顺序必须是 `users → exam_profiles → subjects → knowledge_nodes → defect_tickets`。
+2. **每个 status 必须单独 INSERT，不能 UPDATE 连跳**：`check_defect_transition` 在 UPDATE 时校验允许的迁移，连跳会抛 `ILLEGAL_DEFECT_TRANSITION`；而 `check_defect_forbidden_phrase` 在 INSERT 也跑，所以只有 DRAFT 那条归因写 null。
+
+### 前端改动
+
+| 文件 | 内容 |
+|---|---|
+| `pubspec.yaml` | `http: ^1.2.0`（本轮唯一新运行时依赖；不用 dio，因为只有 2 个 GET 端点） |
+| `lib/config/api_config.dart` | `kUseMock`（**非 const**，见下）/ `kDemoUserId` / `kApiBaseUrl`（`Platform.isAndroid` → `10.0.2.2`，否则 `localhost`）/ `kApiTimeout = 10s` |
+| `lib/api/api_client.dart` | `http` 薄封装；`ApiException{message, statusCode, body, uri, isNetworkError}`；**刻意不做自动重试**（会掩盖错误态） |
+| `lib/api/defect_api.dart` | 手写 snake_case → `DefectTicket` 映射（不引 `json_serializable`） |
+| `lib/pages/defects_page.dart` | 三态（`CupertinoActivityIndicator` / `_LoadErrorView` + 重试 / 列表）；筛选本地算 |
+| `lib/pages/defect_detail_page.dart` | 改 `StatefulWidget`；先用列表传来的 ticket 渲染，再 `initState` 补拉；失败只加 `_RefreshFailedBanner` |
+| `test/widget_test.dart` | `setUp(() { kUseMock = true; })` |
+
+### 关键决策与理由
+
+1. **`kUseMock` 从 `const` 改成 `bool`**：widget test 要在运行时把它翻成 true，否则测试会真的去连 `10.0.2.2:3000`（CI 没后端，必超时）。用 `setUp` 而非一次性赋值，防未来某用例改回去污染后续。
+2. **详情页失败不用整页错误态**：已能看归因/状态/优先级，换错误屏反而丢掉可见内容；改用顶部轻提示条 + 重试。
+3. **筛选在本地算**：后端 `status` 参数是单值（`status = $1`），而“进行中”（DRAFT+ANALYZED+ACTION_DONE+REOPENED）与“待验证”（V1+V2+V3）都是多状态集合。代价是一次性拉全量（MVP 可接受）。
+4. **考点名缺失时用占位而不伪造**：`'考点 ${nodeId.substring(0,8)}'`。伪造中文名会让前端看起来“好像能用”，反而掩盖后端缺口。
+
+### 真实响应暴露的 3 个契约缺口
+
+curl 实测（非猜测）：
+
+1. **列表与详情都没有 `knowledge_node_title` / `subject_name`**——两端点走 `SELECT *`（`listRows` / `requireRow`），不 JOIN `knowledge_nodes` / `subjects`。
+2. **字段名是 `status` 不是 `stage`**（响应里 `"status":"V2"`）。
+3. **`verification_state` jsonb 恒为 `{"v1":"pending","v2":"pending","v3":"pending"}`**——seed 写了 `verifications` 表但未同步该列；可信来源是 `verifications` 数组。
+
+前端处理：①占位考点名；②按 `status` 读；③从 `verifications` 数组按 stage 推导而非读 `verification_state`。
+
+### 验收证据
+
+- 后端回归：`npm test` → **305 tests / 190 pass / 0 fail / 115 skipped**（CORS 未破坏任何东西）。
+- curl：`GET /health` 200；`GET /users/:id/defect-tickets` 200 带 `Access-Control-Allow-Origin: *` 返 8 条；`GET /defect-tickets/:id` 200 含 actions+verifications；`OPTIONS` → **204**；`?status=V2` → 1 条。
+- `flutter analyze` → **16 issues，0 error / 0 warning**；`flutter test` → **5/5**。
+- Android 17 模拟器真机截图（`tillroad_app/screenshots/`）：`fe03-live-list.png`(304349 B，8 条真实数据 + 四组计数 8/4/3/1 全对) / `fe03-live-detail.png`(209881 B，2 动作 + V1/V2/V3 全通过) / `fe03-live-error.png`(92737 B，停后端后正确显错误态) / `fe03-live-retry.png`(304427 B，重启后点重试恢复)。
+
+### 踩坑
+
+- **`adb shell curl` 在模拟器里不可用**（`curl: inaccessible or not found`），不能拿它验证 `10.0.2.2` 连通性，只能看 App 实际表现。
+- **tap 坐标必须乘 1.5**：预览图 720×1600 对实机 1080×2400。本轮凭图目测点“重试”落在按钮外（点 540,1405，真实 bounds `[432,1412][648,1528]` 中心 540,1470），误以为重试没生效。定位方法：`adb shell uiautomator dump` + `adb pull` + `[System.IO.File]::ReadAllText(path, UTF8)`（`adb shell cat` 会被 PowerShell 编码破坏，`Get-Content -Raw -Encoding UTF8` 也拿不到）。
+- **`flutter` / `adb pull` 的 stderr 噪声**会让 PowerShell 报 `[exit code: 1]`，判据看 `Built` / `file pulled` 字样。
+
+### 遗留（后端待补，已写入 README）
+
+1. 缺陷单列表/详情 JOIN `knowledge_nodes`/`subjects` 返回考点名与科目名。
+2. 新增 `defect_events(defect_ticket_id, from_status, to_status, at, reason)` 表 + 触发器写入，支撑完整状态时间线。
+3. `status` 单值过滤改 `status IN (...)` 以支持服务端分页与分组筛选。
+4. CORS 的 `*` 生产前收窄为白名单。
+5. 补 userId 鉴权（当前任何客户端都能按任意 userId 拉数据）。
+6. ~~底部写操作按钮待接 BE-03 写接口~~ → **已完成，见 §26**。
+
+---
+
+## 26. FE-03 写操作联调归档（建单 → 归因 → 标记动作 → 进入验证 → 提交验证）
+
+### 范围与硬约束
+
+让 FE-03 的缺陷单写路径真正接通，在 App 里走完一条完整闭环。硬约束：后端**只改两处查询**（不碰状态机 / repository 写方法 / schema / 触发器）；前端只加表单页与写请求（不碰 FE-01 已有文件）；不引表单库 / 状态管理库 / 路由库 / `json_serializable`；所有写请求带 `version`，409 必须处理；禁用语 400 内联不弹 alert。
+
+### 后端两处查询小修（A1 / A2）
+
+- **A1 考点与科目名**：`server/repositories/defect_tickets.mjs` 新增 `SELECT_WITH_DISPLAY`：
+  ```sql
+  SELECT dt.*, kn.title AS knowledge_node_title, kn.freq_tag AS knowledge_node_freq_tag,
+         sub.name AS subject_name
+    FROM defect_tickets dt
+    LEFT JOIN knowledge_nodes kn ON kn.id = dt.knowledge_node_id AND kn.deleted_at IS NULL
+    LEFT JOIN subjects sub ON sub.id = kn.subject_id AND sub.deleted_at IS NULL
+  ```
+  用 **LEFT 不用 INNER**：`knowledge_node_id` 可空，INNER 会丢单。`getById` 改用它 + `queryOne`；`findById` 仍走 `selectRow`（内部用，不要 JOIN 列）。写方法仍返回裸行（`updateWithVersion(... RETURNING *)`），前端写完重新 GET。
+- **A2 `status` 多值**：`parseStatusFilter(status)` 接受 `'V1,V2,V3'` 字符串 / 数组 / 单值（split + trim + 过滤空项）；`listByUser` 的 where 改用别名并用 `dt.status::text = ANY($n::text[])`。**转 text 比较**是因为 `status` 是 enum，直接 `= ANY(enum[])` 需先造类型数组；整数组作一个参数下发，不可能注入。
+- `server/_fake_repos.mjs` 同步：`parseFakeStatusFilter`、多值过滤、三个展示字段补 `null`（保持响应形状一致）。
+
+### 前端新增/改动
+
+| 文件 | 变化 |
+|---|---|
+| `lib/mock/defects_mock.dart` | `DefectTicket` 加 `version`（默认 1，乐观锁用） |
+| `lib/api/defect_api.dart` | 加 5 个写方法 + 3 个读方法；`_ticketFromJson` 读 `version`；**`_verifyResults` 只取 `round == 当前 verification_round` 的记录** |
+| `lib/widgets/form_field.dart`（新） | 表单共用件 7 个 |
+| `lib/pages/defect_create_page.dart`（新） | 建单表单 |
+| `lib/pages/defect_analyze_page.dart`（新） | 归因 / 重新归因表单 |
+| `lib/pages/defect_verify_page.dart`（新） | 提交验证表单 |
+| `lib/pages/defect_detail_page.dart` | Stateless→Stateful 写路径；动作行可点；底部按钮接真实接口 |
+| `lib/pages/defects_page.dart` | 新建按钮 push 建单页；筛选改为传 `status` 给后端 |
+| `lib/config/api_config.dart` | `kUseMock` 去掉 `const`（测试可翻转） |
+| `test/widget_test.dart` | `setUp(() => kUseMock = true)` 强制 mock |
+
+### 两条真 bug（本轮发现并修复）
+
+1. **`ANALYZED` 是 UI 死路**：早期 `_primaryActionLabel` 把 ANALYZED 映射成「暂无操作」、点击只弹 toast。但 DB 触发器只接受 `ANALYZED → ACTION_DONE → V1` 逐步跳，而 `begin-verification` 实现为**同事务两跳**——这是 ANALYZED 唯一的前进路径。已改为 `analyzed` 与 `actionDone` 都走 `_enterVerification()`。
+2. **建单的 `actions` 不进 `actions` 表**：`createTicket` 把 `actions` 交给仓储，而仓储只写进 `defect_tickets.actions` **jsonb 列**（`server/repositories/defect_tickets.mjs:106`），不生成 `actions` 表行；`begin-verification` 的门禁 `actions.assertAllDone()` 读 `actions` 表 → 0 行 → `NO_ACTIONS`。实测详情页显示「处理动作 0/0」证实。受「不改后端写方法」约束，改为前端建单 201 后逐条 `POST /defect-tickets/:id/actions` 补行（`addAction` 是让 `actions` 表有行的唯一入口）。**建议 BE-07 把建单与动作插入包进同一事务**。
+
+### 真机验收（Android 17 / emulator-5554 / Neon 云库）
+
+闭环实测：`DRAFT 建单 → ANALYZED → 动作勾完 → begin-verification 两跳进 V1 → 提交 V1 pass 进 V2`，API 逐步核对：
+
+| 步 | API 状态 | version | 备注 |
+|---|---|---|---|
+| 建单 | `ANALYZED` | 1 | `POST /defect-tickets` + 2 次 `POST /:id/actions` |
+| 标记动作 | `ANALYZED` | 1 | `actions` 表 `done=true`（缺陷单 version 不变，动作是子资源） |
+| 进入验证 | `V1` | **3** | 两跳：ACTION_DONE(2) → V1(3) |
+| 提交 V1 pass | `V2` | 4 | `verifications` 1 条 `stage=V1 result=pass round=1` |
+| 归因（DRAFT 单） | `ANALYZED` | 2 | version 1→2，`error_layer=执行` |
+
+截图：`fe03-write-create.png`(297251 B 建单表单) / `fe03-write-analyze.png`(238842 B 归因表单) / `fe03-write-verify.png`(282823 B 提交验证表单) / `fe03-write-detail-v2.png`(212863 B 闭环后 V2 详情：V1 绿勾通过、V2 橙色左边框进行中、底部「提交验证」)。
+
+### 踩坑
+
+- **触控笔手写输入法拦截 `adb shell input text`**：Android 17 模拟器点输入框会弹「Try out your stylus / Write / Delete / Select / Insert」覆盖层，文字只进了手写面板（Flutter 只收到 `AE`）。修法：`adb shell settings put secure stylus_handwriting_enabled 0` + 关面板。
+- **`input text` 的空格用 `%s`**（直接写空格会被 shell 拆词）；中文走 `input text` 不可靠，实测用 ASCII。
+- **改完后端必须先杀掉 3000 端口的旧进程**（`Get-NetTCPConnection -LocalPort 3000 -State Listen` 找 pid → `Stop-Process -Force`），否则 curl 测的是旧代码。
+- **`$pid` 是 PowerShell 只读自动变量**，给同名变量赋值会报「无法覆盖变量 PID」。
+- **Neon 空闲回收连接会杀进程**：`.tmp-backend.err` 里 `Error: Connection terminated unexpectedly` + `node:events:487 throw er; // Unhandled 'error' event`。`pg` 池的空闲连接被 PgBouncer 断开时冒 `'error'` 事件，不监听就整进程退出。已在 `scripts/dev-start.mjs` 绑 `probe.on('error', ...)` 只记日志（池会自愈）。**生产环境需同类防护**。
+- **Neon 挂起后先用长超时探活再启后端**：`connectionTimeoutMillis: 45000` 探活成功（`OK count=9`）后再启 `dev-start.mjs`，否则会撞 `pool.mjs` 硬编码的 5000ms 超时。
+
+### 遗留
+
+1. ~~**建单 `actions` 不落表**~~ → **已在 §27 修复**（后端 `create` 改为同事务写 `actions` 表）。当前前端「建单后逐条 POST」的补丁保留但已非必需。
+2. `defect_events` 表缺失 → 时间线只有「创建 + 当前状态」两节点。
+3. CORS `*` 生产前收窄；无 userId 鉴权。
+4. Neon 冷启动（实测 10–30s）对写操作的首次点击有感知，可在前端加首屏预热请求。
+
+---
+
+## 27. FE-04 归档（验证任务页接真实 API + 建单 actions 同事务）
+
+### 范围与硬约束
+
+- 后端**只改 `create` 路径**：不改状态机、不改触发器、不改 schema、不改其他 repository 方法。
+- 前端只加 `verification_api.dart` + 改 `verify_page.dart` + 小改 `home_page.dart` 的摘要卡片；不改 FE-01 其他文件（`app_theme`/`common`/`countdown_card`）。
+- 不引第三方状态管理、路由库、图表库、`json_serializable`；`flutter analyze` 0 error（20 info 保留）。
+
+### 后端：`create` 改成两张表同事务
+
+**缺口（上轮已记录但未修）**：`server/repositories/defect_tickets.mjs` 的 `create` 只把 `actions` 写进 `defect_tickets.actions` **jsonb 冗余列**（`if (c === 'actions') return toJsonbParam(input.actions ?? [])`），**不生成 `actions` 表行**；而 `begin-verification` 的门禁 `actions.assertAllDone()` 读的是 `actions` 表 → 新单永远 `NO_ACTIONS`。上轮靠前端建单后逐条 `POST /:id/actions` 绕过。
+
+**修法**（`server/repositories/defect_tickets.mjs`）：
+
+```js
+const ticket = await insertRow(client, TABLE, INSERT_COLUMNS, values);
+const created = await insertActionsForTicket(client, ticket.id, input.actions);
+return { ...ticket, actions: created };
+```
+
+`insertActionsForTicket(client, defectTicketId, rawActions)` 模块内私有：`!Array.isArray || length===0 → []`；逐条 `typeof item === 'string' ? item : item?.content`，`trim()` 后空串**静默跳过**（与前端一致，不报错）；`due` 只在对象形态取。
+
+为什么安全：`create` 本身不 `BEGIN`，**总是被 `withTransaction` 包着跑**，任一条 action 插入失败整笔回滚——这才是真正的「同事务」，而不是在仓储里再开一层。
+
+`server/_fake_repos.mjs` 的 `defectTickets.create` 同步（否则 fake 层门禁永远 `NO_ACTIONS`，测不出真行为）。
+
+### 新增集成测试（2 条，真 PG）
+
+1. `建单带 2 条 actions -> actions 表 2 行 done=false -> 标记完成后可进入 V1`：POST 带 `actions: ['重做同类题 10 道', { content: '整理错因卡片', due: '2026-12-01' }]` → 201 / `r.data.actions.length===2` / `done===false` → 直查 `SELECT content, done, due FROM actions WHERE defect_ticket_id=$1 ORDER BY created_at ASC, id ASC` 断言 2 行且顺序一致 → 未完成时 `begin-verification` → 400 `ACTIONS_NOT_DONE` → 逐条 PATCH done → 再 begin → 200 `V1`。
+2. `建单 actions 含空白项 -> 跳过不报错；actions 为字符串数组也兼容`：`draft: true` + `actions: ['   ', '真动作']` → 201 且 `actions.length===1`。
+
+实测：`node --env-file=.env --test --test-concurrency=1 server/routes/defect_tickets.integration.test.mjs` → **15 / 15 通过**（文件 401 → 463 行）。
+
+### 前端：验证任务页
+
+新增 `lib/api/verification_api.dart`（263 行）：`VerificationTask`（18 个 final 字段 + `fromJson`，派生 `daysLabel`/`windowLabel`/`nodeTitle`/`freqLabel`，未知 urgency **回落 `normal`** 而不是染色）+ `VerificationSummary`（`total/overdue/dueSoon/normal/byStage`，`fromJson` 优先读扁平字段、缺失才回落 `by_urgency` 嵌套）+ `VerificationApi`（`fetchVerificationTasks` / `fetchVerificationSummary`）。
+
+`lib/pages/verify_page.dart` 整页重写（约 780 行）：
+
+- 两个私有 enum `_UrgencyFilter` / `_StageFilter`，每个成员带 `wire`（`all` 为 `null` 表示不带该参数）；
+- `_load()` 用 `Future.wait` 并请求列表 + 摘要，**摘要始终拉全量**（不随筛选变，否则计数会变像丢数据）；
+- `_openDetail()` 先 `fetchDefectDetail` 再 push（因为 `DefectDetailPage` 要求完整 `DefectTicket`），中间只给该卡片局部 spinner；
+- 加载/错误/空三态，空态分「筛选后无结果」与「压根没任务」两种文案。
+
+`lib/pages/home_page.dart`（C2）：新增 `VerificationApi` + `_summary` + `_summaryError`，`initState` 拉一次 summary；`_summaryTrailing()` 拿不到时回落 mock 条数并在出错时加「（离线）」；成功时渲染三色 `_CountDot`（6px 圆点 + `tabularFigures` 数字）。
+
+### 两道编译坑（新）
+
+1. **`ambiguous_import`**：`VerificationTask` 在 `api/verification_api.dart` 与 `mock/home_mock.dart` 里各有一个（字段集不同）。`home_page.dart` 同时需要 `VerificationApi`/`VerificationSummary` 和首页自己的 `VerificationTask` → 必须用 `show` 限定：
+   ```dart
+   import '../api/api_client.dart' show ApiException;
+   import '../api/verification_api.dart' show VerificationApi, VerificationSummary;
+   ```
+2. **`VerticalDivider` 是 Material 组件**：纯 Cupertino 工程里不存在。摘要卡片的竖向分隔线改为 `SizedBox(height: 32, width: 0.5, child: ColoredBox(color: AppColors.separator))`。
+
+### ⚠ 事故：PowerShell 管道破坏中文编码（写进铁律）
+
+为消除两条 lint（`separatorBuilder: (_, __)` → `(_, _)`），用了：
+
+```powershell
+(Get-Content lib/pages/verify_page.dart -Raw) -replace 'separatorBuilder: \(_, __\)', 'separatorBuilder: (_, _)' | Set-Content -Encoding UTF8 -NoNewline lib/pages/verify_page.dart
+```
+
+后果：**整个文件中文编码被破坏**，`flutter analyze` 报 **462 issues**（大量 `Illegal character '37813'` / `Unterminated string literal` / `undefined_identifier 鎵撳紑璇︽儏澶辫触锛圚TTP`）。只能靠 `write` 整份重写恢复。
+
+**铁律：绝不用 PowerShell `Get-Content` / `-replace` / `Set-Content` 处理含中文的源码文件**——`edit` 工具或 `write` 整份重写。
+
+### 验收证据
+
+`flutter analyze` → **20 issues，error 0 / warning 0**（全为 `deprecated_member_use: package:flutter/cupertino.dart`）；`flutter test` → **5/5**；后端 `npm test` → **307 tests / 190 pass / 0 fail / 117 skipped**。
+
+Android 17 模拟器 + Neon 云库（三色数据用脚本构造：直接 `INSERT` 三条 V1/V2/V3 单并固定 `updated_at` / 对应 stage 的 `verifications.created_at`，走 `withTransaction` + 原生 DML，**不用 `session_replication_role`**（Neon 非超级用户会被拒））：
+
+| 截图 | 内容 |
+|---|---|
+| `fe04-list.png` | 验证任务列表：摘要 **1 逾期 / 1 临期 / 1 正常**，三张卡片色条与徽标全对（红 `已逾期 3 天` / 橙 `还剩 1 天` / 绿 `还剩 9 天`） |
+| `fe04-overdue.png` | 点「逾期」后只剩 V1 那条，摘要卡片逾期格高亮 |
+| `fe04-home.png` | 首页「今日待验证」右侧 **● 1 ● 1 ● 1** 真实三色计数 |
+| `fe04-detail.png` | 从验证列表点入评情：V1 进行中橙左边框、底部「提交验证」 |
+| `fe04-submit.png` | 验证表单：当前阶段允许的三种方式（无答案重做 / 同类变式 / 讲题） |
+| `fe04-after.png` | 提交 V1 pass 后详情变「第2次验证」、V1 绿勾通过、V2 进行中 |
+
+**状态推进实证**（API 层）：提交后 `verification-summary` 从 `{V1:1,V2:1,V3:1, overdue:1,due_soon:1,normal:1}` 变为 `{V1:0,V2:2,V3:1, overdue:0,due_soon:1,normal:2}`。
+
+### 踩坑
+
+- **`session_replication_role` 在 Neon 被拒**：`SEED_FAIL permission denied to set parameter "session_replication_role"`（需超级用户）。构造演示数据只能走普通 DML；`updated_at` 可用直接 `UPDATE` 改（触发器会覆盖它，所以要在**不触发 set_updated 的路径**下造——实测直接 `INSERT` 时带 `created_at/updated_at` 即可，因为 set_updated 只在 UPDATE/INSERT 触发器里 `NEW.updated_at := now()`，而 `defect_tickets` 的 `trg_defect_*_upd` 确实会覆盖，故改用「插入时的 `updated_at` 值由触发器改写」→ 实际做法是：只靠 `verifications.created_at` 造 V2/V3，V1 用 `updated_at` 但接受近似）。
+- **`Get-NetTCPConnection` 找旧进程**：改后端后必须先杀 3000 端口旧进程，否则 curl 测的是旧代码。
+- **Neon 挂起后必须先用长超时探活**：`createPool({connectionTimeoutMillis: 45000})` 探活成功后再启 `dev-start.mjs`；本轮已把 `dev-start.mjs` 的探活池显式设为 45000ms（`createPool({connectionTimeoutMillis: 45000})`，合并顺序「默认 < 环境变量 < 显式 config」，不改 `pool.mjs`）。
+
+### 遗留
+
+1. `defect_events` 表缺失 → 时间线只有两个节点。
+2. CORS `*` 生产前收窄；无 userId 鉴权。
+3. 前端建单后逐条 `POST /:id/actions` 的补丁可移除（后端已同事务），保留只为向后兼容旧后端。
+4. 筛选切得很快时每个筛选一次请求，未做请求取消/防抖；任务量级（几十条）下可接受。

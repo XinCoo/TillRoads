@@ -7,10 +7,11 @@ version: 1.0.0+1
 environment:
   sdk: ^3.14.0
 
-# 依赖最小化（FE-01 约束）：
-# - 只有 cupertino_icons 一个运行时依赖；CupertinoIcons 来自它。
-# - 不引状态管理库（setState 够用）、不引网络库（全部 mock 数据）、不引路由库（Navigator 够用）、
-#   不引图表库（缺陷分布条形图用 Container + FractionallySizedBox 手绘）。
+# 依赖最小化（FE-01 约束 + FE-03 联调放宽）：
+# - 运行时依赖仅两个：cupertino_icons（图标）与 http（FE-03 联调新增，Dart 官方）。
+# - 仍不引状态管理库（setState 够用）、不引路由库（Navigator 够用）、
+#   不引图表库（缺陷分布条形图用 Container + FractionallySizedBox 手绘）、
+#   不引 json_serializable（手写 snake_case 字段映射，见 lib/api/defect_api.dart）。
 # - flutter_launcher_icons 仅 dev_dependencies，用于一次性生成各平台图标，不进产物。
 # 注: 已移除 `flutter create` 模板默认生成的 material_ui 依赖 —— FE-01 要求 iOS 原生 Cupertino 风格，
 #     全部界面使用 lib/ 下的 Cupertino* 组件，不需要 Material。
@@ -19,6 +20,11 @@ dependencies:
     sdk: flutter
 
   cupertino_icons: ^1.0.8
+
+  # FE-03 联调：唯一新增的运行时依赖。Dart 官方包，无传递依赖负担。
+  # 不用 dio 的理由：只有 7 个端点（2 个读 + 5 个写），http 的简单 API 足够；
+  # dio 带来的拦截器/取消令牌等能力本轮用不上，不值得多一层抽象。
+  http: ^1.2.0
 
 dev_dependencies:
   flutter_test:

@@ -1,28 +1,231 @@
 import 'package:flutter/cupertino.dart';
 
+import '../api/api_client.dart';
+import '../api/defect_api.dart';
+import '../config/api_config.dart';
 import '../mock/defects_mock.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart';
 import '../widgets/defect_badges.dart';
 import '../widgets/verification_progress.dart';
-
+import 'defect_analyze_page.dart';
+import 'defect_verify_page.dart';
 /// 缺陷单详情页（FE-03B）。
 ///
 /// 结构：大标题导航栏（q_type）+ 六栏基本信息 + 处理动作 + 三次验证进度 +
-/// 状态时间线 + 底部固定操作区。数据全部来自 mock，不连后端。
+/// 状态时间线 + 底部固定操作区。
 ///
+/// 数据来源（FE-03 联调）：
+///   · 先用列表页传来的 [ticket] **立即渲染**（避免白屏）
+///   · 若 `kUseMock == false`，initState 再用 id 拉一次详情拿
+///     `verifications` / `actions`（列表端点在 `listRows` 的 SELECT * 下
+///     不带这两个关联集合），拿到后刷新界面
+///   · 拉取失败**不阻断浏览**：只在顶部加一条轻量提示，用户仍能看到列表那份
+///     数据；这与列表页的错误态区别对待（详情页有面包屑可退回，不必强阻断）
 /// 注意：这里用 `CupertinoSliverNavigationBar` 而不是
 /// `CupertinoPageScaffold(navigationBar:)`——后者不会给 child 预留导航栏高度，
 /// 滚动内容会钻到导航栏下面（实测截图里归因首行被挡住）。
-class DefectDetailPage extends StatelessWidget {
+class DefectDetailPage extends StatefulWidget {
   const DefectDetailPage({super.key, required this.ticket});
 
   final DefectTicket ticket;
 
+  @override
+  State<DefectDetailPage> createState() => _DefectDetailPageState();
+}
+
+class _DefectDetailPageState extends State<DefectDetailPage> {
+  late DefectTicket ticket = widget.ticket;
+
+  final DefectApi _api = DefectApi();
+  ApiException? _refreshError;
+
+  @override
+  void initState() {
+    super.initState();
+    _refreshDetail();
+  }
+
+  @override
+  void dispose() {
+    _api.close();
+    super.dispose();
+  }
+
+  /// 拉详情（含 verifications / actions）。失败只记提示，不回退整页错误态。
+  Future<void> _refreshDetail() async {
+    if (kUseMock) return;
+    try {
+      final detail = await _api.fetchDefectDetail(widget.ticket.id);
+      if (!mounted) return;
+      setState(() {
+        ticket = detail;
+        _refreshError = null;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _refreshError = e);
+    }
+  }
+  // ─────────── 写操作（FE-03 写操作联调）───────────
+
+  bool _busy = false;
+
+  /// 统一报错：后端的业务错误用 ApiException.body['error'] 判别。
+  void _handleWriteError(Object e) {
+    if (e is! ApiException) {
+      setState(() => _busy = false);
+      _toast(context, '操作失败：$e');
+      return;
+    }
+    final Object? body = e.body;
+    final String code =
+        body is Map && body['error'] != null ? '${body['error']}' : '';
+
+    setState(() => _busy = false);
+
+    if (code == 'conflict' || e.statusCode == 409) {
+      // 乐观锁失效：别人改过这条单。刷新拿到最新 version 再重试。
+      _toast(context, '该单已被修改，正在刷新到最新状态。');
+      _refreshDetail();
+      return;
+    }
+    if (code == 'ai_cannot_close') {
+      _toast(context, 'AI 不能替用户关单：验证通过必须由你本人标记。');
+      return;
+    }
+    if (code == 'NO_ACTIONS') {
+      _toast(context, '先添加至少一条处理动作，再进入验证。');
+      return;
+    }
+    if (code == 'ACTIONS_NOT_DONE') {
+      _toast(context, '还有处理动作未完成，全部勾选后才能进入验证。');
+      return;
+    }
+    if (code == 'INVALID_BASE_VERSION') {
+      _toast(context, '缺少版本号（乐观锁）。请刷新页面后重试。');
+      return;
+    }
+    if (code == 'ILLEGAL_DEFECT_TRANSITION' ||
+        code == 'INVALID_VERIFICATION_STAGE') {
+      _toast(context, '当前状态不支持这个操作，正在刷新到最新状态。');
+      _refreshDetail();
+      return;
+    }
+    _toast(
+      context,
+      e.isNetworkError ? '${e.message}\n请确认后端在运行。' : e.message,
+    );
+  }
+
+  /// D：点未完成的动作 → 标记 done=true（完成态不可点，避免误取消）。
+  Future<void> _toggleAction(DefectAction action) async {
+    if (_busy || kUseMock) {
+      if (kUseMock) _toast(context, '当前是离线演示模式（kUseMock=true），不会真的改数据。');
+      return;
+    }
+    if (action.done) {
+      _toast(context, '已完成的动作不能取消，如需调整请删除后重新添加。');
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      await _api.markActionDone(
+        ticket.id,
+        action.id,
+        done: true,
+        version: ticket.version,
+      );
+      if (!mounted) return;
+      setState(() => _busy = false);
+      await _refreshDetail();
+    } catch (e) {
+      if (!mounted) return;
+      _handleWriteError(e);
+    }
+  }
+
+  /// E1：ACTION_DONE → V1（后端同事务两跳：先写 ACTION_DONE 再写 V1）。
+  Future<void> _enterVerification() async {
+    if (_busy || kUseMock) {
+      if (kUseMock) _toast(context, '当前是离线演示模式（kUseMock=true），不会真的改数据。');
+      return;
+    }
+    setState(() => _busy = true);
+    try {
+      await _api.beginVerification(ticket.id, version: ticket.version);
+      if (!mounted) return;
+      setState(() => _busy = false);
+      await _refreshDetail();
+      if (!mounted) return;
+      _toast(context, '已进入第 1 次验证（V1）。');
+    } catch (e) {
+      if (!mounted) return;
+      _handleWriteError(e);
+    }
+  }
+
+  /// C：DRAFT → 补充归因；REOPENED → 重新归因。
+  Future<void> _openAnalyze() async {
+    if (kUseMock) {
+      _toast(context, '当前是离线演示模式（kUseMock=true），不会真的改数据。');
+      return;
+    }
+    final bool? changed = await Navigator.of(context).push<bool>(
+      appRoute<bool>(context, DefectAnalyzePage(ticket: ticket)),
+    );
+    if (!mounted) return;
+    if (changed == true) {
+      await _refreshDetail();
+      if (!mounted) return;
+      _toast(context, '归因已提交，状态推进到「已归因」。');
+    }
+  }
+
+  /// E2：V1/V2/V3 → 提交验证表单。
+  Future<void> _openVerify() async {
+    if (kUseMock) {
+      _toast(context, '当前是离线演示模式（kUseMock=true），不会真的改数据。');
+      return;
+    }
+    final bool? submitted = await Navigator.of(context).push<bool>(
+      appRoute<bool>(context, DefectVerifyPage(ticket: ticket)),
+    );
+    if (!mounted) return;
+    if (submitted == true) {
+      await _refreshDetail();
+      if (!mounted) return;
+      final bool closed = ticket.status == DefectStatus.closed;
+      _toast(context, closed ? '三次验证全部通过，缺陷单已关闭。' : '验证已提交，状态已推进。');
+    }
+  }
+
+  /// 底部主按钮分发。
+  Future<void> _onPrimaryAction() async {
+    switch (ticket.status) {
+      case DefectStatus.draft:
+      case DefectStatus.reopened:
+        await _openAnalyze();
+      case DefectStatus.analyzed:
+        // ANALYZED 不是死路：先加动作并全部勾选，再由后端同事务两跳
+        // ANALYZED → ACTION_DONE → V1。若还没满足前置，后端会返回
+        // NO_ACTIONS / ACTIONS_NOT_DONE，_handleWriteError 会给出可操作提示。
+        await _enterVerification();
+      case DefectStatus.actionDone:
+        await _enterVerification();
+      case DefectStatus.v1:
+      case DefectStatus.v2:
+      case DefectStatus.v3:
+        await _openVerify();
+      case DefectStatus.closed:
+        break;
+    }
+  }
+
   /// 底部主按钮文案；`null` 表示不给主按钮（已关闭）。
   String? get _primaryActionLabel => switch (ticket.status) {
     DefectStatus.draft => '去归因',
-    DefectStatus.analyzed => '暂无操作',
+    DefectStatus.analyzed => '进入验证',
     DefectStatus.actionDone => '进入验证',
     DefectStatus.v1 || DefectStatus.v2 || DefectStatus.v3 => '提交验证',
     DefectStatus.reopened => '重新归因',
@@ -145,6 +348,19 @@ class DefectDetailPage extends StatelessWidget {
                     ),
                     sliver: SliverList.list(
                       children: <Widget>[
+                        // 详情刷新失败时不阻断浏览（已先用列表数据渲染），
+                        // 只给一条可感知的提示，并允许点重试。
+                        if (_refreshError != null)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 12),
+                            child: _RefreshFailedBanner(
+                              error: _refreshError!,
+                              onRetry: () {
+                                setState(() => _refreshError = null);
+                                _refreshDetail();
+                              },
+                            ),
+                          ),
                         // ─────────── 六栏基本信息 ───────────
                         const SectionHeader(text: '基本信息'),
                         CardShell(
@@ -310,10 +526,8 @@ class DefectDetailPage extends StatelessWidget {
                                         action: ticket.actions[i],
                                         isLast:
                                             i == ticket.actions.length - 1,
-                                        onTap: () => _toast(
-                                          context,
-                                          '标记完成功能后续实现。',
-                                        ),
+                                        onTap: () =>
+                                            _toggleAction(ticket.actions[i]),
                                       ),
                                   ],
                                 ),
@@ -346,10 +560,7 @@ class DefectDetailPage extends StatelessWidget {
           _BottomActionBar(
             status: ticket.status,
             label: _primaryActionLabel,
-            onPressed: () => _toast(
-              context,
-              '该操作需要连接后端 API，将在 FE-04 / BE-03 接口接入后实现。',
-            ),
+            onPressed: _busy ? () {} : _onPrimaryAction,
           ),
         ],
       ),
@@ -496,6 +707,67 @@ class _BottomActionBar extends StatelessWidget {
                   ),
                 ),
         ),
+      ),
+    );
+  }
+}
+
+/// 详情刷新失败时的轻量提示条。
+///
+/// 为什么不用整页错误态：详情页进来时已有列表传过来的基础数据，
+/// 用户能看到归因/状态/优先级等大部分信息；只是缺 `verifications` /
+/// `actions` 两个关联集合（等于说验证进度会显示为未验证）。
+/// 把整页换成错误屏会丢掉已经能看的内容，得不偿失。
+class _RefreshFailedBanner extends StatelessWidget {
+  const _RefreshFailedBanner({required this.error, required this.onRetry});
+
+  final ApiException error;
+  final VoidCallback onRetry;
+
+  @override
+  Widget build(BuildContext context) {
+    final String reason = error.isNetworkError ? '无法连接后端' : 'HTTP ${error.statusCode}';
+
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+      decoration: BoxDecoration(
+        color: AppColors.dueSoon.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(AppRadii.chip),
+      ),
+      child: Row(
+        children: <Widget>[
+          const Icon(
+            CupertinoIcons.exclamationmark_circle,
+            size: 18,
+            color: AppColors.dueSoon,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '验证进度刷新失败（$reason），下面展示的是列表数据',
+              style: const TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 12,
+                height: 1.35,
+                color: AppColors.label,
+              ),
+            ),
+          ),
+          CupertinoButton(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            minimumSize: Size.zero,
+            onPressed: onRetry,
+            child: const Text(
+              '重试',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: AppColors.accent,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

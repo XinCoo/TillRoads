@@ -1,5 +1,11 @@
 import 'package:flutter/cupertino.dart';
 
+import '../api/api_client.dart' show ApiException;
+// 只拿 summary 相关的两个类型：`VerificationTask` 在 home_mock.dart 里已有一个
+// 首页专用版本（展示字段不同），两个都导入会 ambiguous_import。
+import '../api/verification_api.dart'
+    show VerificationApi, VerificationSummary;
+import '../config/api_config.dart';
 import '../mock/home_mock.dart';
 import '../theme/app_theme.dart';
 import '../widgets/countdown_card.dart';
@@ -27,6 +33,43 @@ class HomePage extends StatefulWidget {
 class _HomePageState extends State<HomePage> {
   /// FE-01 用静态 mock；接后端时改成从 repository 拉取并 setState。
   final HomeSnapshot _snapshot = kHomeSnapshot;
+
+  /// 「今日待验证」的**真实计数**（FE-04 C2）。
+  ///
+  /// 本轮只把这一处接上 `GET /users/:id/verification-summary`，首页其余 mock
+  /// （倒计时、缺陷分布、快捷入口、任务列表本身）都留到 FE-07 完整联调。
+  /// 失败时保持 null，标题右侧回落到 mock 条数——首页不该因为一个计数请求
+  /// 就整屏报错。
+  final VerificationApi _verifyApi = VerificationApi();
+  VerificationSummary? _summary;
+  ApiException? _summaryError;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadSummary();
+  }
+
+  @override
+  void dispose() {
+    _verifyApi.close();
+    super.dispose();
+  }
+
+  Future<void> _loadSummary() async {
+    if (kUseMock) return;
+    try {
+      final summary = await _verifyApi.fetchVerificationSummary(kDemoUserId);
+      if (!mounted) return;
+      setState(() {
+        _summary = summary;
+        _summaryError = null;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _summaryError = e);
+    }
+  }
 
   void _showComingSoon(String feature) {
     showCupertinoDialog<void>(
@@ -80,6 +123,37 @@ class _HomePageState extends State<HomePage> {
     _showComingSoon('验证 · ${task.knowledgeNodeTitle}');
   }
 
+  /// 标题右侧：优先真实计数，拿不到就用 mock 条数（带小标记提示降级）。
+  Widget _summaryTrailing() {
+    final summary = _summary;
+    final fallback = '${_snapshot.tasks.length} 项';
+    if (summary == null) {
+      return Text(
+        _summaryError == null ? fallback : '$fallback（离线）',
+        style: const TextStyle(
+          fontFamily: kFontFamily,
+          fontSize: 13,
+          color: AppColors.secondaryLabel,
+        ),
+      );
+    }
+    // 三色计数：逾期红 / 临期橙 / 正常绿，颜色 + 数字双编码
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        if (summary.overdue > 0) ...<Widget>[
+          _CountDot(color: AppColors.overdue, count: summary.overdue),
+          const SizedBox(width: 8),
+        ],
+        if (summary.dueSoon > 0) ...<Widget>[
+          _CountDot(color: AppColors.dueSoon, count: summary.dueSoon),
+          const SizedBox(width: 8),
+        ],
+        _CountDot(color: AppColors.normal, count: summary.normal),
+      ],
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return CupertinoPageScaffold(
@@ -127,13 +201,7 @@ class _HomePageState extends State<HomePage> {
 
                   SectionHeader(
                     text: '今日待验证',
-                    trailing: Text(
-                      '${_snapshot.tasks.length} 项',
-                      style: const TextStyle(
-                        fontSize: 13,
-                        color: AppColors.secondaryLabel,
-                      ),
-                    ),
+                    trailing: _summaryTrailing(),
                   ),
                   _CardShell(
                     child: TaskListCard(
@@ -217,6 +285,39 @@ class _CardShell extends StatelessWidget {
         ],
       ),
       child: child,
+    );
+  }
+}
+
+/// 首页「今日待验证」右侧的小计数：彩色圆点 + 数字（颜色 + 数字双编码，色盲友好）。
+class _CountDot extends StatelessWidget {
+  const _CountDot({required this.color, required this.count});
+
+  final Color color;
+  final int count;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        Container(
+          width: 6,
+          height: 6,
+          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+        ),
+        const SizedBox(width: 4),
+        Text(
+          '$count',
+          style: TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 13,
+            fontWeight: FontWeight.w600,
+            color: color,
+            fontFeatures: const <FontFeature>[FontFeature.tabularFigures()],
+          ),
+        ),
+      ],
     );
   }
 }

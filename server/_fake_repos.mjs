@@ -34,6 +34,15 @@ function notFound(resource, id) {
   e.body = { error: 'not_found', resource, id };
   return e;
 }
+/**
+ * fake 侧的 status 过滤归一（与真仓储 parseStatusFilter 同语义）：
+ * 'V1,V2,V3' / ['V1'] / 'V1' → 去空白去空项数组；null → [] 表示不过滤。
+ */
+function parseFakeStatusFilter(status) {
+  if (status == null) return [];
+  const raw = Array.isArray(status) ? status : String(status).split(',');
+  return raw.map((s) => String(s).trim()).filter((s) => s !== '');
+}
 
 /**
  * 建一组互相共享状态的 fake 仓储。
@@ -185,7 +194,19 @@ export function createFakeRepos() {
         deleted_at: null,
       };
       tickets.set(row.id, row);
-      return { ...row };
+      // ★ FE-04 A2：与真仓储保持一致——建单时 actions 也落成 actions 表的行，
+      // 否则 fake 层的 begin-verification 门禁永远 NO_ACTIONS，测不出真行为。
+      const createdActions = [];
+      if (Array.isArray(input.actions)) {
+        for (const item of input.actions) {
+          const content = typeof item === 'string' ? item : item?.content;
+          const trimmed = content == null ? '' : String(content).trim();
+          if (trimmed === '') continue;
+          const due = typeof item === 'object' && item !== null ? (item.due ?? null) : null;
+          createdActions.push(await actions.create(null, { defect_ticket_id: row.id, content: trimmed, due }));
+        }
+      }
+      return { ...row, actions: createdActions };
     },
     async getById(_client, id) {
       return { ...need(id) };
@@ -195,10 +216,19 @@ export function createFakeRepos() {
       if (!t || (t.deleted_at && !opts.includeDeleted)) return null;
       return { ...t };
     },
+    // FE-03 联调 A2：status 改多值（对齐真仓储的 'V1,V2,V3' / ['V1'] 三形态）。
+    // 真仓储走 SQL LEFT JOIN 补考点名/科目名；fake 没有 knowledge_nodes 表，
+    // 只把三个展示字段补成 null，保证响应形状一致（前端不用分支）。
     async listByUser(_client, userId, opts = {}) {
       let rows = [...tickets.values()].filter((t) => t.user_id === userId && !t.deleted_at);
-      if (opts.status) rows = rows.filter((t) => t.status === opts.status);
-      return rows.map((t) => ({ ...t }));
+      const wanted = parseFakeStatusFilter(opts.status);
+      if (wanted.length > 0) rows = rows.filter((t) => wanted.includes(t.status));
+      return rows.map((t) => ({
+        ...t,
+        knowledge_node_title: t.knowledge_node_title ?? null,
+        knowledge_node_freq_tag: t.knowledge_node_freq_tag ?? null,
+        subject_name: t.subject_name ?? null,
+      }));
     },
     async listAll(_client, _opts = {}) {
       return [...tickets.values()].filter((t) => !t.deleted_at).map((t) => ({ ...t }));
