@@ -233,6 +233,44 @@ export function createFakeRepos() {
     async listAll(_client, _opts = {}) {
       return [...tickets.values()].filter((t) => !t.deleted_at).map((t) => ({ ...t }));
     },
+    // FE-07：首页缺陷分布聚合。与真仓储同口径（排除软删 / by_layer 只算未关闭 /
+    // 空白 error_layer 归 unclassified / 八态全预填 0），否则 fake 层测不出真行为。
+    async defectStats(_client, userId) {
+      const mine = [...tickets.values()].filter(
+        (t) => t.user_id === userId && !t.deleted_at,
+      );
+      const byStatus = {};
+      for (const s of ['DRAFT', 'ANALYZED', 'ACTION_DONE', 'V1', 'V2', 'V3', 'REOPENED', 'CLOSED']) {
+        byStatus[s] = 0;
+      }
+      for (const t of mine) {
+        if (Object.prototype.hasOwnProperty.call(byStatus, t.status)) byStatus[t.status] += 1;
+      }
+
+      const layerCounts = new Map();
+      for (const t of mine) {
+        if (t.status === 'CLOSED') continue;
+        const raw = typeof t.error_layer === 'string' ? t.error_layer.trim() : '';
+        const key = raw === '' ? 'unclassified' : raw;
+        layerCounts.set(key, (layerCounts.get(key) || 0) + 1);
+      }
+      const byLayer = [...layerCounts.entries()]
+        .map(([error_layer, count]) => ({ error_layer, count }))
+        .sort((a, b) => (b.count - a.count) || a.error_layer.localeCompare(b.error_layer));
+
+      let openTotal = 0;
+      for (const [k, v] of Object.entries(byStatus)) {
+        if (k !== 'CLOSED') openTotal += v;
+      }
+      return {
+        user_id: userId,
+        by_layer: byLayer,
+        by_status: byStatus,
+        open_total: openTotal,
+        closed_total: byStatus.CLOSED,
+        total: openTotal + byStatus.CLOSED,
+      };
+    },
     recomputePriority(body = {}) {
       return C.computePriority({
         frequency: Number(body.frequency) || 0,

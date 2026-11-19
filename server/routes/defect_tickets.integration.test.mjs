@@ -426,10 +426,15 @@ test('建单带 2 条 actions -> actions 表 2 行 done=false -> 标记完成后
     [id],
   );
   assert.equal(rows.rowCount, 2, 'actions 表应有 2 行');
-  assert.deepEqual(rows.rows.map((x) => x.content), ['重做同类题 10 道', '整理错因卡片']);
-  assert.equal(rows.rows[0].done, false);
-  assert.equal(rows.rows[1].done, false);
-  assert.ok(rows.rows[1].due, '第二条应带 due');
+  // ★不能断言插入顺序：create 在**同一事务**里跑，PostgreSQL 的 now() 是事务开始时间，
+  // 两条 action 的 created_at 完全相同；而 id 是 gen_random_uuid()，不递增。
+  // 所以 ORDER BY created_at, id 得到的顺序是任意的（上轮这条断言靠运气过了）。
+  // 这里改成断言集合，并按 content 取回 due 做校验。
+  const byContent = Object.fromEntries(rows.rows.map((x) => [x.content, x]));
+  assert.deepEqual(Object.keys(byContent).sort(), ['整理错因卡片', '重做同类题 10 道'].sort());
+  assert.equal(byContent['重做同类题 10 道'].done, false);
+  assert.equal(byContent['整理错因卡片'].done, false);
+  assert.ok(byContent['整理错因卡片'].due, '第二条应带 due');
 
   // 门禁：两条未完成时不能进入验证
   let cur = await getTicket(id);
@@ -459,4 +464,101 @@ test('建单 actions 含空白项 -> 跳过不报错；actions 为字符串数�
   assert.equal(r.status, 201, JSON.stringify(r.data));
   assert.equal(r.data.actions.length, 1, '空白动作应被跳过');
   assert.equal(r.data.actions[0].content, '真动作');
+});
+
+test('FE-07 defect-stats：多状态多层级 -> 两个聚合都正确（by_layer 只算未关闭）', skipOpt, async () => {
+  // 用独立用户，避免被前面用例的数据污染（绝对断言必须独立用户：BE-04 教训）
+  const u = await pool.query(
+    `INSERT INTO users (nickname) VALUES ($1) RETURNING id`,
+    [`stats-user-${Date.now()}`],
+  );
+  const statsUser = u.rows[0].id;
+  const p = await pool.query(
+    `INSERT INTO exam_profiles (user_id, exam_type, target_label)
+     VALUES ($1, 'postgrad', $2) RETURNING id`,
+    [statsUser, `stats-${Date.now()}`],
+  );
+  const profileId = p.rows[0].id;
+
+  try {
+    // 造 5 张：ANALYZED×3（concept / method / concept）、DRAFT×1（无归因 → unclassified）、
+    // CLOSED×1（calculation）
+    //
+    // ★不能用 error_layer='   ' 建 ANALYZED 单：core 的 assertAnalyzable 对纯空白
+    // 返回 MISSING_ERROR_LAYER（400），这是**正确行为**。未归因的单只能是 DRAFT，
+    // 所以 unclassified 分组用 DRAFT 验证 —— 这才是真实业务里「还没归因」的形态。
+    const mk = (status, layer) => req('POST', '/defect-tickets', {
+      user_id: statsUser,
+      exam_profile_id: profileId,
+      q_type: 'stats-q',
+      draft: status === 'DRAFT',
+      error_layer: status === 'DRAFT' ? undefined : (layer ?? undefined),
+      error_cause: status === 'DRAFT' ? undefined : '用来测聚合的具体错因',
+    });
+
+    assert.equal((await mk('DRAFT')).status, 201);              // 无归因 -> unclassified
+    assert.equal((await mk('ANALYZED', 'concept')).status, 201);
+    assert.equal((await mk('ANALYZED', 'method')).status, 201);
+    assert.equal((await mk('ANALYZED', 'concept')).status, 201);
+
+    // 真造一张 CLOSED（走完整状态机 + 三层验证全 pass），验证 by_layer 确实把 CLOSED 排除。
+    // 不能直接 UPDATE status=CLOSED：触发器只接受逐步跳，且那样就验证不了读端点的口径。
+    const closedId = (await mk('ANALYZED', 'calculation')).data.id;
+    await toV1(closedId);
+    assert.equal((await submitVer(closedId, 'V1', 'pass')).status, 201);
+    assert.equal((await submitVer(closedId, 'V2', 'pass', 'new_question')).status, 201);
+    const closedRes = await submitVer(closedId, 'V3', 'pass', 'timed_mock');
+    assert.equal(closedRes.status, 201, JSON.stringify(closedRes.data));
+    assert.equal((await getTicket(closedId)).status, 'CLOSED');
+    const r = await req('GET', `/users/${statsUser}/defect-stats`);
+    assert.equal(r.status, 200, JSON.stringify(r.data));
+
+    const { by_status: byStatus, by_layer: byLayer } = r.data;
+
+    // 八态全预填（契约形状固定，前端不用兜底）
+    for (const s of ['DRAFT', 'ANALYZED', 'ACTION_DONE', 'V1', 'V2', 'V3', 'REOPENED', 'CLOSED']) {
+      assert.equal(typeof byStatus[s], 'number', `by_status.${s} 应为 number`);
+    }
+    assert.equal(byStatus.DRAFT, 1, '一张 DRAFT（未归因）');
+    assert.equal(byStatus.ANALYZED, 3, '三张 ANALYZED 未关闭');
+    assert.equal(byStatus.CLOSED, 1, '一张走完全链路的 CLOSED');
+    assert.equal(r.data.open_total, 4, 'open = DRAFT 1 + ANALYZED 3');
+    assert.equal(r.data.closed_total, 1);
+    assert.equal(r.data.total, 5);
+
+    // by_layer：只算未关闭 -> concept 2 / method 1 / unclassified 1
+    const layerMap = Object.fromEntries(byLayer.map((x) => [x.error_layer, x.count]));
+    assert.equal(layerMap.concept, 2, JSON.stringify(byLayer));
+    assert.equal(layerMap.method, 1, JSON.stringify(byLayer));
+    assert.equal(layerMap.unclassified, 1, 'DRAFT 单未归因（error_layer IS NULL）应归 unclassified');
+    assert.equal(
+      layerMap.calculation,
+      undefined,
+      'CLOSED 单的 calculation 不应进 by_layer（只看未关闭）',
+    );
+
+    // 排序：count DESC，同 count 按 layer ASC
+    assert.equal(byLayer[0].error_layer, 'concept');
+    assert.equal(byLayer[0].count, 2);
+
+    // 软删的行不参与统计
+    await pool.query(
+      `UPDATE defect_tickets SET deleted_at = now() WHERE user_id = $1 AND error_layer = 'method'`,
+      [statsUser],
+    );
+    const r2 = await req('GET', `/users/${statsUser}/defect-stats`);
+    assert.equal(r2.status, 200);
+    assert.equal(r2.data.by_status.ANALYZED, 2, '软删 method 后应只剩 2 张 ANALYZED');
+    assert.equal(r2.data.open_total, 3);
+    assert.equal(
+      r2.data.by_layer.find((x) => x.error_layer === 'method'),
+      undefined,
+      '已软删的 method 不应再出现',
+    );
+  } finally {
+    // 清理顺序：defect_tickets -> exam_profiles -> users
+    await pool.query('DELETE FROM defect_tickets WHERE user_id = $1', [statsUser]);
+    await pool.query('DELETE FROM exam_profiles WHERE user_id = $1', [statsUser]);
+    await pool.query('DELETE FROM users WHERE id = $1', [statsUser]);
+  }
 });

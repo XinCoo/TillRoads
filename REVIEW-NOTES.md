@@ -1063,4 +1063,42 @@ Android 17 模拟器 + Neon 云库（三色数据用脚本构造：直接 `INSER
 1. `defect_events` 表缺失 → 时间线只有两个节点。
 2. CORS `*` 生产前收窄；无 userId 鉴权。
 3. 前端建单后逐条 `POST /:id/actions` 的补丁可移除（后端已同事务），保留只为向后兼容旧后端。
-4. 筛选切得很快时每个筛选一次请求，未做请求取消/防抖；任务量级（几十条）下可接受。
+CUG
+
+---
+
+## 28. FE-07 归档（首页真实看板、冷启动骨架与离线降级）
+
+### 范围
+
+首页倒计时、今日待验证、缺陷分布与快捷入口接真实 API；保留逐卡片 mock 降级。不新增依赖、状态管理、缓存或 schema；不改 FE-03/FE-04 页面和写路径。后端只增加缺陷统计聚合查询。
+
+### 后端端点
+
+新增 `GET /users/:userId/defect-stats`，在仓储层一次 SQL 统计：
+
+- `by_status` 对全部八种缺陷状态计数，缺省状态预填 0；
+- `open_total` 排除 CLOSED 与软删除行，`closed_total` 独立统计；
+- `by_layer` 按 trim 后的 `error_layer` 分组，空值归为「未分类」，排除 CLOSED 与软删除行。
+
+采用聚合端点而非复用全量缺陷列表：列表页已加载完整记录，首页再加载会重复传输；「未关闭」定义只保留在 SQL 一处，避免前后端口径分叉。Fake 仓储与 PG 集成测试同步验证八态、已关闭和软删除边界。
+
+### 首页加载策略
+
+`home_page.dart` 并发请求考试目标、验证摘要、缺陷统计，各自独立处理超时和错误；单请求超时 15 秒。首次加载显示骨架，不展示 0 或 mock 统计；数据到达淡入。请求失败只让对应卡片回落内存 mock 并标注离线，不阻断其它卡片。`main.dart` 启动时预热 `/health`，无持久缓存。
+
+四个快捷入口已逐一实机点验：建题打开新建缺陷单，缺陷单切到对应 Tab，模考与复盘打开后续功能提示。
+
+### Android 验收
+
+Android 17 模拟器 + Neon 云数据库：冷启动约 4.2 秒进入完整首页；热启动回前台不重新加载。通过阻断模拟器至 API 的连接验证骨架与逐卡片离线回落。真机验收修复两项视觉问题：骨架卡片内容最小高度由固定值改为约束下限，避免 6px overflow；加载阶段隐藏验证摘要及缺陷总数中的 mock 数字。离线标签增加内边距，避免贴近卡片圆角。
+
+| 截图 | 证据 |
+|---|---|
+| `tillroad_app/screenshots/fe07-skeleton.png` | 首屏骨架，不显示 mock 数字 |
+| `tillroad_app/screenshots/fe07-loaded.png` | Neon 数据加载后的完整首页 |
+| `tillroad_app/screenshots/fe07-offline.png` | API 不可达时逐卡片降级 |
+
+### 验证与遗留
+
+验收时 `flutter analyze` 为 0 error / 0 warning（20 条既有 Cupertino deprecation info），`flutter test` 5/5；后端 `npm test` 308 tests / 190 pass / 0 fail / 118 skipped。后续仍需：上线前收窄 CORS 并加入 userId 鉴权；处理 Neon 冷启动长尾和请求重试策略；后续里程碑再决定是否移除 mock 与补足缺陷事件时间线。

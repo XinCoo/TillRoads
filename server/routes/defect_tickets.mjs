@@ -282,6 +282,19 @@ async function listTicketsByUser(ctx, userId) {
   return ok({ items: rows, ...pg });
 }
 
+/**
+ * GET /users/:userId/defect-stats —— 首页缺陷分布聚合（FE-07）。
+ *
+ * 只读端点：不改 schema、不碰写方法、不碰状态机。
+ * 口径见 `repositories/defect_tickets.mjs` 的 defectStats 注释：
+ * 一律排除软删；by_layer 只算未关闭；error_layer 空白归 unclassified。
+ */
+async function getDefectStats(ctx, userId) {
+  const { repos, read } = resolve(ctx);
+  const stats = await read((c) => repos.defectTickets.defectStats(c, userId));
+  return ok(stats);
+}
+
 
 // ---------------------------------------------------------------------------
 // ---------------------------------------------------------------------------
@@ -331,6 +344,11 @@ export function match(method, seg, ctx) {
   // GET /users/:userId/defect-tickets?status=...
   if (method === 'GET' && seg.length === 3 && seg[0] === 'users' && seg[2] === 'defect-tickets') {
     return listTicketsByUser(ctx, seg[1]);
+  }
+
+  // GET /users/:userId/defect-stats —— 首页缺陷分布聚合（FE-07，只读）
+  if (method === 'GET' && seg.length === 3 && seg[0] === 'users' && seg[2] === 'defect-stats') {
+    return getDefectStats(ctx, seg[1]);
   }
 
 

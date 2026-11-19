@@ -372,6 +372,23 @@ class DefectApi {
     return _extractItems(raw);
   }
 
+  /// 缺陷聚合统计：`GET /users/:id/defect-stats`（FE-07 首页缺陷分布用）。
+  ///
+  /// 返回 `{by_layer:[{error_layer,count}], by_status:{八态}, open_total, closed_total, total}`。
+  /// `by_layer` 只统计未关闭的单（后端口径），`unclassified` 是 `error_layer` 为空的归处。
+  ///
+  /// 为什么不在前端 `GROUP BY`：①列表页已经拉过全量，首页再拉一次就是两次全量；
+  /// ②「未关闭」的业务定义只应有一处（`status != 'CLOSED'`），两边各写一遍必然漂移；
+  /// ③八态计数一次 `GROUP BY` 算完，不会漏键。
+  Future<Map<String, Object?>> fetchDefectStats(String userId) async {
+    final raw = await _client.get(
+      '/users/${Uri.encodeComponent(userId)}/defect-stats',
+    );
+    if (raw is Map<String, Object?>) return raw;
+    if (raw is Map) return raw.cast<String, Object?>();
+    throw ApiException('缺陷统计响应形状异常：${raw.runtimeType}');
+  }
+
   void close() => _client.close();
 }
 

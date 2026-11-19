@@ -35,5 +35,10 @@ String get kApiBaseUrl {
   return 'http://localhost:3000';
 }
 
-/// 单次请求超时。直播网/云库冷启动都可能慢，10s 是对用户可接受的上限。
-const Duration kApiTimeout = Duration(seconds: 10);
+/// 单次请求超时。
+///
+/// FE-07 从 10s 提到 15s：Neon 免费版实例空闲会挂起，冷启动唤醒需要 20–40s，
+/// 但**首屏不能等那么久**。所以真实的应对不是把超时拉到 40s（用户早就走了），
+/// 而是：15s 内能拿到就显示真实数据，拿不到就逐卡片降级成离线 mock（见 home_page）。
+/// 15s 是「再等下去也不会有结果」与「偶尔的慢请求别直接判死」之间的折中。
+const Duration kApiTimeout = Duration(seconds: 15);

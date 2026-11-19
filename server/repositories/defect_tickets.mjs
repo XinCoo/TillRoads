@@ -237,6 +237,93 @@ export async function listAll(client, opts = {}) {
 }
 
 /**
+ * 首页缺陷分布聚合（FE-07）。
+ *
+ * 为什么放在 SQL 层而不是让前端拉全量后本地 GROUP BY：
+ *   · 前端已经要拉一次全量列表给缺陷单页，再拉一次给首页就是两次全量；
+ *   · 「未关闭」的定义（`status::text <> 'CLOSED'`）属于业务口径，
+ *     放在两处各写一遍必然漂移；
+ *   · 八态计数用 `GROUP BY status` 一次算完，比前端遍历再累加省事且不会漏键。
+ *
+ * 返回两个聚合（结构固定，调用方不用兜底）：
+ *   by_layer   [{error_layer,count}]  按 count DESC, error_layer ASC；只算未关闭
+ *   by_status  {DRAFT:n,...,CLOSED:n}  八个键全部预填 0
+ *   open_total / closed_total / total
+ *
+ * 口径（写进 README，避免下次有人改错）：
+ *   · 一律 `deleted_at IS NULL`；
+ *   · by_layer 只统计 **未关闭**（CLOSED 已经是收尾单，不影响“当前缺陷分布”）；
+ *   · error_layer 为 NULL/空串/纯空白时归入 `unclassified`，前端显示「未分类」。
+ */
+export const OPEN_STATUSES = Object.freeze([
+  'DRAFT',
+  'ANALYZED',
+  'ACTION_DONE',
+  'V1',
+  'V2',
+  'V3',
+  'REOPENED',
+]);
+
+export const ALL_STATUSES = Object.freeze([...OPEN_STATUSES, 'CLOSED']);
+
+export const UNCLASSIFIED_LAYER = 'unclassified';
+
+export async function defectStats(client, userId) {
+  if (!userId) throw new TypeError('defect_tickets.defectStats: userId 必填');
+
+  // 两条 SQL：status 用 GROUP BY 算八态，layer 用 GROUP BY + ORDER BY 算分布。
+  // 没有合并成一条是因为两个聚合的过滤条件不同（status 算全部，layer 只算未关闭），
+  // 硬合并要用 FILTER 套子查询，可读性反而差；两条都只扫同一用户的几十行，成本可接受。
+  const statusRes = await client.query(
+    `SELECT dt.status::text AS status, count(*)::int AS count
+       FROM ${TABLE} dt
+      WHERE dt.user_id = $1 AND dt.deleted_at IS NULL
+      GROUP BY dt.status`,
+    [userId],
+  );
+
+  const byStatus = {};
+  for (const s of ALL_STATUSES) byStatus[s] = 0;
+  for (const row of statusRes.rows || []) {
+    // 只认白名单键：未来 schema 新增状态时不会静默改动契约形状
+    if (Object.prototype.hasOwnProperty.call(byStatus, row.status)) {
+      byStatus[row.status] = Number(row.count) || 0;
+    }
+  }
+
+  const layerRes = await client.query(
+    `SELECT COALESCE(NULLIF(btrim(dt.error_layer), ''), $2) AS error_layer,
+            count(*)::int AS count
+       FROM ${TABLE} dt
+      WHERE dt.user_id = $1
+        AND dt.deleted_at IS NULL
+        AND dt.status::text <> 'CLOSED'
+      GROUP BY 1
+      ORDER BY count DESC, 1 ASC`,
+    [userId, UNCLASSIFIED_LAYER],
+  );
+
+  const byLayer = (layerRes.rows || []).map((r) => ({
+    error_layer: r.error_layer,
+    count: Number(r.count) || 0,
+  }));
+
+  let openTotal = 0;
+  for (const s of OPEN_STATUSES) openTotal += byStatus[s];
+  const closedTotal = byStatus.CLOSED;
+
+  return {
+    user_id: userId,
+    by_layer: byLayer,
+    by_status: byStatus,
+    open_total: openTotal,
+    closed_total: closedTotal,
+    total: openTotal + closedTotal,
+  };
+}
+
+/**
  * 进入当前验证状态的时间（BE-04 核心难点，schema 无专用列）。
  *
  * schema.sql 的 defect_tickets **没有** v1/v2/v3_started_at，也没有通用 status_changed_at，

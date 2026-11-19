@@ -728,6 +728,30 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 **状态时间线只显示两个节点**：schema 没有 `defect_events` 表，无法还原完整状态变更历史。当前用 `created_at` + 当前 `status` 造最小序列（创建 → 当前状态）。完整历史需新增 `defect_events(defect_ticket_id, from_status, to_status, at, reason)` 并让触发器写入。
 
 ---
+#### 首页看板与冷启动降级（FE-07）
+
+首页四块（倒计时 / 今日待验证 / 缺陷分布 / 快捷入口）现在全部接真实数据，三路请求用 `Future.wait` 并发发出：
+
+| 卡片 | 数据源 | 失败时 |
+|---|---|---|
+| 倒计时 | `GET /users/:userId/exam-profiles`（取首个 `active`） | `_GoalEmptyCard`（「考试目标加载失败 / 还没有设置考试目标」+ 重试/去设置） |
+| 今日待验证 | `GET /users/:userId/verification-summary` | 回落 mock 条数 + 「（离线）」小字 |
+| 缺陷分布 | `GET /users/:userId/defect-stats` | 回落 mock 分布 + 「离线数据」小字 |
+
+**为什么加后端聚合端点而不是前端算**（决策理由写进了源码）：①前端已经为缺陷单页拉过一次全量列表，首页再拉就是两次全量；②「未关闭」的业务定义（`status::text <> 'CLOSED'`）只应存在一处，两边各写一遍必然漂移；③八态计数一次 `GROUP BY status` 算完，不会漏键——返回的 `by_status` 用 `ALL_STATUSES` 白名单预填 0，即使将来 schema 新增状态也不会改契约形状。
+
+**骨架屏与超时**：数据未到时显示 `_SkeletonBlock`（灰块 + `_Bone` 呼吸动画，`reduceMotion` 时静态）而不是 0 或 mock 数字；数据到达用 `AnimatedSwitcher` 250ms 淡入。`kApiTimeout` 为 **15s**——不是拉到 40s（用户早走了），而是 15s 内拿到就显示真实数据、拿不到就逐卡片降级。
+
+**三个在真机验收时才暴露的 UI 缺陷（已修）**：
+
+1. `_SkeletonBlock` 写死 `height: 108` 但内容实高是 `32(padding) + 13 + 14 + 32 + 10 + 13 = 114` → 真机出现 `BOTTOM OVERFLOWED BY 6.0 PIXELS` 黄黑警告条。改为 `constraints: BoxConstraints(minHeight: height)`，让内容自撑。
+2. 骨架阶段「今日待验证」右侧仍显示 mock 的「3 项」→ 违反「首屏不显示 mock」。`_summaryTrailing()` 返回类型改 `Widget?`，骨架阶段直接返回 `null`。
+3. 同一问题在「缺陷分布」的 `共 N 条` 上也存在 → `_openCount` 改 `int?`，骨架阶段返回 `null`，trailing 用 `switch` 表达式不渲染。
+
+> 「离线数据」小字原本贴在卡片圆角上显得被裁，已补 `left/right: 16` + `bottom: 14` 内边距。
+
+**冷启动实测（Android 17 模拟器 + Neon 云库）**：`am force-stop` 后冷启，899ms / 1753 / 2597 / 3467ms 四帧均仍为原生闪屏，**4194ms 起稳定在加载完成画面**——即冷启动到首帧完整内容约 **4.2s**（其中包含 Neon 冷启动）。热启动（不杀进程）回前台无重新加载。用 `adb root` + `iptables -A OUTPUT -p tcp --dport 3000 -j DROP` 阻断后端可稳定复现骨架屏与离线兜底（`-j REJECT` 更快，避免等满 15s）。
+---
 
 ## 6. 当前里程碑与后续
 
@@ -750,6 +774,7 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - ✅ **FE-03 联调**（App → HTTP → PG → 界面）：后端新增 CORS（原生 `node:http`，OPTIONS → 204，连 4xx/5xx 也带头）与 `scripts/` 四个运维脚本（migrate / verify / seed / dev-start），**未动任何业务逻辑**；前端新增 `http` 依赖（本轮唯一新依赖）+ `api_client` / `defect_api` / `api_config`，两页改为加载/成功/错误三态；Android 模拟器连 Neon 云库真跑：列表 8 条真实数据、详情 V1/V2/V3 全通过、停后端起后端后重试恢复——**错误态与重试链路均已截图验证**
 - ✅ **FE-03 写操作联调**（建单 → 归因 → 标记动作 → 进入验证 → 提交验证）：后端两处查询小修（LEFT JOIN 考点/科目名、`status` 逗号分隔多值）；前端新增建单页 / 归因页 / 提交验证页 + `widgets/form_field.dart` 共用表单件，`defect_api.dart` 补齐 5 个写方法与 3 个读方法；乐观锁 `version` 全程携带、409 提示刷新、禁用语 400 内联红字、`ai_cannot_close` 403 文案；Android 17 模拟器 + Neon 真跑通「DRAFT 建单 → ANALYZED → 动作勾完 → `begin-verification` 两跳进 V1 → 提交 V1 pass 进 V2」，四处截图留证
 - ✅ **FE-04**：验证任务页接真实 API + 后端建单 actions 同事务：仓储 `create` 改为「先插 `defect_tickets` 行、再逐条插 `actions` 表行」并返回带 `actions` 的 ticket（仍在同一 `withTransaction` 内，任一条失败整笔回滚），**堵上 `begin-verification` 门禁读不到动作的 `NO_ACTIONS` 缺口**；前端新增 `verification_api.dart`（`VerificationTask` / `VerificationSummary`）+ `verify_page.dart` 整页重写（三色摘要卡片可点击筛选、stage 筛选条走后端、每卡局部 loading 拉详情再 push）+ 首页「今日待验证」右侧改为真实三色计数（拿不到时回落 mock 条数并标「离线」）；2 条新 PG 集成用例（建单带 2 条动作 → 表 2 行 → 标记完成 → 进 V1）留 CI；Android 17 模拟器 + Neon 真跑 1/1/1 三色、点击筛选、进详情并提交 V1 pass，截图四张
+- ✅ **FE-07**：首页看板完整联调：后端新增聚合端点 `GET /users/:userId/defect-stats`（status 八态计数 + error_layer 分组，**只算未关闭**，八态白名单预填 0 防契约漂移）；前端首页整份重写——`Future.wait` 三路并发 + 逐卡片骨架屏（`_SkeletonBlock`/`_Bone`/`_Pulse`）+ 逐卡片独立降级（每路各自 try/catch，一路失败不阻塞其余）+ `AnimatedSwitcher` 淡入 + `main()` 里 `GET /health` 预热；快捷入口四个 onTap 全接（建题 push 建单页 / 转缺陷单切 Tab / 模考与复盘弹提示）；`kApiTimeout` 10s→15s；Android 17 冷启动实测 **冷 ≈4.2s 到首帧完整内容**，骨架屏/加载完成/离线兜底三张截图，四入口逐个点验
 - ⏳ **下一批**：FE-02 建题/导入页 → FE-11 审核七态 UI → BE-07 缺陷分布看板 / BE-08 同步服务 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
 - ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两节点）；②CORS 的 `*` 生产前收窄为白名单；③补 userId 鉴权；④Neon 空闲回收连接时 `pg` 池会冒未监听 `error` 事件杀进程（已在 `scripts/dev-start.mjs` 绑 `pool.on('error')` 兜住，生产需同类防护）；⑤前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
