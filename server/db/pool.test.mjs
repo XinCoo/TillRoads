@@ -78,7 +78,7 @@ test('TYPE_OIDS / DEFAULT_POOL_CONFIG 与拍板值一致且冻结', () => {
     { NUMERIC: 1700, INT8: 20, INT4: 23, INT2: 21, DATE: 1082, TIMESTAMP: 1114, TIMESTAMPTZ: 1184 });
   assert.equal(Object.isFrozen(P.TYPE_OIDS), true);
   assert.deepEqual({ ...P.DEFAULT_POOL_CONFIG },
-    { max: 10, idleTimeoutMillis: 30000, connectionTimeoutMillis: 5000 });
+    { max: 10, idleTimeoutMillis: 5000, connectionTimeoutMillis: 5000 });
   assert.equal(Object.isFrozen(P.DEFAULT_POOL_CONFIG), true);
 });
 
@@ -88,7 +88,7 @@ test('TYPE_OIDS / DEFAULT_POOL_CONFIG 与拍板值一致且冻结', () => {
 test('createPool：默认池参数生效，Pool 惰性构造（无 PG 也安全），显式 config 可覆盖', async () => {
   const pool = P.createPool();
   assert.equal(pool.options.max, 10);
-  assert.equal(pool.options.idleTimeoutMillis, 30000);
+  assert.equal(pool.options.idleTimeoutMillis, 5000);
   assert.equal(pool.options.connectionTimeoutMillis, 5000);
   await pool.end();                       // 惰性：无连接可直接关闭
 

@@ -9,20 +9,12 @@ import 'pages/home_page.dart';
 import 'pages/mock_page.dart';
 import 'pages/review_page.dart';
 import 'pages/verify_page.dart';
+import 'pages/api_token_page.dart';
 import 'theme/app_theme.dart';
 
-void main() {
-  // FE-07 E4：应用启动时顺带打一次 `GET /health` 预热 Neon。
-  //
-  // 为什么有用：Neon 免费版实例空闲会挂起（suspend），第一个请求要等它被唤醒，
-  // 冷启动 20–40s。而这个唤醒是「一次性的」——只要有一个请求把它叫醒，后续就快了。
-  //
-  // 为什么**不阻塞** UI：`unawaited(...)` 把它甩到后台，首屏立刻渲染骨架屏。
-  // 首页的三个数据请求会与这个预热请求并发；如果预热先到，它们就直接命中热连接；
-  // 如果没先到也无所谓，反正三个请求各自有 15s 超时 + 逐卡片降级。
-  //
-  // 为什么不在 widget 里做：`main()` 比任何 widget 都早，能最大化预热收益；
-  // 且失败时不该影响 UI（这里显式吞掉所有异常）。
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await initializeApiToken();
   if (!kUseMock) {
     unawaited(_prewarm());
   }
@@ -64,8 +56,23 @@ class TillRoadApp extends StatelessWidget {
       title: '题路',
       debugShowCheckedModeBanner: false,
       theme: AppTheme.light(),
-      home: const RootTabs(),
+      home: const ApiTokenGate(),
     );
+  }
+}
+
+class ApiTokenGate extends StatefulWidget {
+  const ApiTokenGate({super.key});
+
+  @override
+  State<ApiTokenGate> createState() => _ApiTokenGateState();
+}
+
+class _ApiTokenGateState extends State<ApiTokenGate> {
+  @override
+  Widget build(BuildContext context) {
+    if (kUseMock || hasApiToken) return const RootTabs();
+    return ApiTokenPage(onSaved: () => setState(() {}));
   }
 }
 
@@ -114,10 +121,7 @@ class _RootTabsState extends State<RootTabs> {
           top: BorderSide(color: AppColors.separator, width: 0.5),
         ),
         items: const <BottomNavigationBarItem>[
-          BottomNavigationBarItem(
-            icon: Icon(CupertinoIcons.home),
-            label: '首页',
-          ),
+          BottomNavigationBarItem(icon: Icon(CupertinoIcons.home), label: '首页'),
           BottomNavigationBarItem(
             icon: Icon(CupertinoIcons.doc_text),
             label: '缺陷单',

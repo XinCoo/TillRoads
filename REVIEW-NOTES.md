@@ -1241,3 +1241,13 @@ Android 17 模拟器 + Neon 云数据库：冷启动约 4.2 秒进入完整首�
 `flutter analyze` **24 issues，全部 Cupertino deprecation info，0 error / 0 warning**（比 FE-05 多 1 条，是 review_api 里的 info，不是 error）；`flutter test` **5/5**；后端 `npm test` **309 tests / 191 pass / 0 fail / 118 skipped**（比上一轮多 1 条 pass，正是 `T6b`）；`node --test server/mock_report.test.mjs` 单独跑 23/23。
 
 遗留：①`mock_exams.submitted_at` 列缺失（列表排序只能 `updated_at`，需 schema 解冻后新增）；②`defect_events` 表未建，所以重开热点只给累计值、给不出「周期内新增」；③列表页全量拉取（当前量级没问题，数据量大了要改分页）；④CORS 仍是 `*`、无 userId 鉴权、生产部署未做；⑤`_StaggeredFadeIn` 未写 widget test（视觉动效，靠真机截图验收）。
+
+## 31. 部署改造（Railway + Bearer Token）
+
+- `server/db/pool.mjs`：Neon 空闲连接回收场景将 `idleTimeoutMillis` 从 30 秒降为 5 秒，并为 `Pool` 添加 `error` 监听，避免未处理的 EventEmitter error 终止 Node 进程。
+- 新增 `server/auth.mjs`：解析 `TOKENS=token:userId,...`，使用 SHA-256 固定长度摘要配合 `timingSafeEqual` 比较 Token；失败统一返回 401 `{"error":"unauthorized"}`，不记录 Token。
+- `server/index.mjs`：`/health` 与 `OPTIONS` 公开；其余请求在设置 `TOKENS` 后必须 Bearer 鉴权。认证 userId 在 HTTP 边界覆盖 `/users/:userId` 路径、`user_id` query 和 body 字段，业务仓储与 schema 不变。
+- `server/routes/_http.mjs`：CORS 允许 `Authorization` 请求头，并保留 `Access-Control-Allow-Origin: *`、`Access-Control-Allow-Credentials: false` 的移动端 MVP 策略。
+- Flutter：`API_BASE_URL` / `API_TOKEN` 支持 `--dart-define`；无编译期 Token 时首次启动显示 Cupertino Token 输入页并用 `shared_preferences` 保存；每个 API 请求自动带 `Authorization: Bearer`。
+
+验证记录：`node --test server/auth.test.mjs server/db/pool.test.mjs server/index.test.mjs` 通过；Flutter `pub get`、`flutter test` 5/5，通过 `flutter analyze --no-fatal-infos`（仅 Cupertino deprecation info，无 error/warning）。Railway 真正部署仍需用户在面板连接 GitHub、填写 Neon/TOKENS 环境变量后再用公网 curl 验证。

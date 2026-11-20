@@ -19,7 +19,7 @@ import path from 'node:path';
 
 import { dispatch } from './routes/index.mjs';
 import { json, preflight, readBody, sendError } from './routes/_http.mjs';
-
+import { parseTokens, requireBearer } from './auth.mjs';
 /**
  * 每个 app 实例持有独立的内存状态，便于集成测试隔离。
  * 这些 Map 是 BE-03/BE-04 的临时着陆点，接 PG 后会被删掉。
@@ -33,6 +33,33 @@ function createState() {
   };
 }
 
+function resourcePath(pathname) {
+  const parts = pathname.split('/').filter(Boolean);
+  if (parts.length < 2) return null;
+  const [kind, id] = parts;
+  if (!['defect-tickets', 'mock-exams', 'review-cycles'].includes(kind)) return null;
+  return { kind, id };
+}
+
+async function findResourceOwner(pool, kind, id) {
+  if (!id) return null;
+  if (kind === 'defect-tickets') {
+    const result = await pool.query('SELECT user_id FROM defect_tickets WHERE id = $1 AND deleted_at IS NULL', [id]);
+    return result.rows[0]?.user_id ?? null;
+  }
+  if (kind === 'review-cycles') {
+    const result = await pool.query('SELECT user_id FROM review_cycles WHERE id = $1 AND deleted_at IS NULL', [id]);
+    return result.rows[0]?.user_id ?? null;
+  }
+  const result = await pool.query(
+    `SELECT p.user_id
+       FROM mock_exams m
+       JOIN exam_profiles p ON p.id = m.exam_profile_id
+      WHERE m.id = $1 AND m.deleted_at IS NULL AND p.deleted_at IS NULL`,
+    [id],
+  );
+  return result.rows[0]?.user_id ?? null;
+}
 /**
  * 创建 API 应用。
  *
@@ -47,11 +74,19 @@ function createState() {
 export function createApp(options = {}) {
   const { pool, repos } = options || {};
   const state = createState();
+  // TOKENS is optional for local development; when configured, every API request
+  // (including health) must present one of the configured Bearer tokens.
+  const tokens = parseTokens();
   // BE-03：仓储可注入（fake 测试用）。真库走 pool + PG 仓储，fake 走注入的 repos。
   const reposCtx = repos;
   const server = httpCreateServer(async (req, res) => {
     try {
-      // FE-03 联调：CORS 预检必须在读 body / 路由分发**之前**处理。
+      const u = new URL(req.url, 'http://localhost');
+      const isHealth = req.method === 'GET' && (u.pathname === '/health' || u.pathname === '/health/');
+      let authUserId;
+      if (req.method !== 'OPTIONS' && !isHealth && tokens.length) authUserId = requireBearer(req, tokens);
+      req.authUserId = authUserId;
+      // FE-03 联调：CORS 预检必须在读 body / 路由分发**之前**处理.
       // OPTIONS 不带业务 body，进 dispatch 只会落 404，浏览器就把预检判失败。
       if (req.method === 'OPTIONS') {
         preflight(res);
@@ -59,18 +94,42 @@ export function createApp(options = {}) {
       }
 
       const body = await readBody(req);
-      const u = new URL(req.url, 'http://localhost');
+      const scopedBody = authUserId && body && typeof body === 'object'
+        ? { ...body, user_id: authUserId }
+        : body;
       let pathname = u.pathname;
+      if (authUserId) {
+        const pathParts = pathname.split('/').filter(Boolean);
+        if (pathParts[0] === 'users' && pathParts.length >= 2) {
+          pathParts[1] = authUserId;
+          pathname = `/${pathParts.join('/')}`;
+        }
+        u.searchParams.set('user_id', authUserId);
+      }
       // 容忍尾部斜杠：/health/ 与 /health 等价（客户端拼接 URL 时常见）。
       if (pathname.length > 1 && pathname.endsWith('/')) pathname = pathname.slice(0, -1);
+
+      if (authUserId && pool) {
+        const resource = resourcePath(pathname);
+        if (resource) {
+          const owner = await findResourceOwner(pool, resource.kind, resource.id);
+          if (owner && owner !== authUserId) {
+            const error = new Error('forbidden');
+            error.statusCode = 403;
+            error.body = { error: 'forbidden' };
+            throw error;
+          }
+        }
+      }
 
       const seg = pathname.split('/').filter(Boolean);
       const out = await dispatch(req.method, seg, {
         pool,
         repos: reposCtx,
         state,
+        authUserId,
         searchParams: u.searchParams,
-        body,
+        body: scopedBody,
       });
 
       if (out === null || out === undefined) {

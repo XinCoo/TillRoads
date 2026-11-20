@@ -20,12 +20,7 @@ import '../config/api_config.dart';
 
 /// API 调用失败时抛出。页面用它区分「网络不通」与「后端返回业务错误」。
 class ApiException implements Exception {
-  ApiException(
-    this.message, {
-    this.statusCode,
-    this.body,
-    this.uri,
-  });
+  ApiException(this.message, {this.statusCode, this.body, this.uri});
 
   /// 面向用户的中文短句（可直接显示在错误态里）。
   final String message;
@@ -47,9 +42,9 @@ class ApiException implements Exception {
 
 class ApiClient {
   ApiClient({http.Client? client, String? baseUrl, Duration? timeout})
-      : _client = client ?? http.Client(),
-        _baseUrl = baseUrl ?? kApiBaseUrl,
-        _timeout = timeout ?? kApiTimeout;
+    : _client = client ?? http.Client(),
+      _baseUrl = baseUrl ?? kApiBaseUrl,
+      _timeout = timeout ?? kApiTimeout;
 
   final http.Client _client;
   final String _baseUrl;
@@ -67,18 +62,31 @@ class ApiClient {
   Future<Object?> get(String path, {Map<String, String>? query}) =>
       _send('GET', _uri(path, query));
 
-  Future<Object?> post(String path, {Object? body, Map<String, String>? query}) =>
-      _send('POST', _uri(path, query), body: body);
+  Future<Object?> post(
+    String path, {
+    Object? body,
+    Map<String, String>? query,
+  }) => _send('POST', _uri(path, query), body: body);
 
-  Future<Object?> patch(String path, {Object? body, Map<String, String>? query}) =>
-      _send('PATCH', _uri(path, query), body: body);
+  Future<Object?> patch(
+    String path, {
+    Object? body,
+    Map<String, String>? query,
+  }) => _send('PATCH', _uri(path, query), body: body);
 
-  Future<Object?> delete(String path, {Object? body, Map<String, String>? query}) =>
-      _send('DELETE', _uri(path, query), body: body);
+  Future<Object?> delete(
+    String path, {
+    Object? body,
+    Map<String, String>? query,
+  }) => _send('DELETE', _uri(path, query), body: body);
 
   Future<Object?> _send(String method, Uri uri, {Object? body}) async {
     final request = http.Request(method, uri);
     request.headers['Accept'] = 'application/json';
+    final token = kApiToken;
+    if (token != null && token.trim().isNotEmpty) {
+      request.headers['Authorization'] = 'Bearer ${token.trim()}';
+    }
     if (body != null) {
       request.headers['Content-Type'] = 'application/json; charset=utf-8';
       request.body = jsonEncode(body);
@@ -88,8 +96,7 @@ class ApiClient {
     try {
       streamed = await _client.send(request).timeout(_timeout);
     } on TimeoutException {
-      throw ApiException('请求超时（${_timeout.inSeconds}s），请检查后端是否在运行',
-          uri: uri);
+      throw ApiException('请求超时（${_timeout.inSeconds}s），请检查后端是否在运行', uri: uri);
     } catch (e) {
       // SocketException / ClientException 等传输层失败，statusCode 留 null
       throw ApiException('无法连接后端（$e）', uri: uri);

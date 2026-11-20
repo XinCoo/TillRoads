@@ -3,7 +3,7 @@
 // 两件事在这里集中：走不走真 API、后端地址是什么。
 // 都放在常量里，页面与 api 层都不自己拼 URL。
 
-import 'dart:io' show Platform;
+import 'package:shared_preferences/shared_preferences.dart';
 
 /// 是否使用本地 mock 数据。
 ///
@@ -22,23 +22,43 @@ bool kUseMock = false;
 /// 所以先写死。它只影响「查哪个用户的缺陷单」，不影响任何写操作。
 const String kDemoUserId = '11111111-1111-4111-8111-111111111111';
 
-/// 后端基址，按运行平台切换。
-///
-/// 为什么 Android 模拟器不能用 localhost：
-///   模拟器里的 localhost 指向**模拟器自己**，宿主机在 10.0.2.2（AVD 的标准 NAT 网关）。
-///   iOS 模拟器与 Windows 桌面直接跑在宿主机上，所以用 localhost。
-///
-/// 真机（非模拟器）调试时，需要把这里换成宿主机的局域网 IP，
-/// 且后端已监听 0.0.0.0（scripts/dev-start.mjs 已这样做）。
+/// API base URL. Override for deployment with `--dart-define=API_BASE_URL=...`.
+const String kRailwayApiBaseUrl = 'https://tillroads-production.up.railway.app';
+
 String get kApiBaseUrl {
-  if (Platform.isAndroid) return 'http://10.0.2.2:3000';
-  return 'http://localhost:3000';
+  const configured = String.fromEnvironment('API_BASE_URL');
+  if (configured.isNotEmpty) return configured;
+  return kRailwayApiBaseUrl;
+}
+
+/// API token supplied at build/run time, or entered once on first launch.
+const String kApiTokenFromDefine = String.fromEnvironment('API_TOKEN');
+String? _apiToken;
+
+String? get kApiToken =>
+    kApiTokenFromDefine.isNotEmpty ? kApiTokenFromDefine : _apiToken;
+
+bool get hasApiToken => kApiTokenFromDefine.trim().isNotEmpty || (_apiToken ?? '').trim().isNotEmpty;
+Future<void> initializeApiToken() async {
+  if (kApiTokenFromDefine.isNotEmpty) {
+    _apiToken = kApiTokenFromDefine;
+    return;
+  }
+  final preferences = await SharedPreferences.getInstance();
+  _apiToken = preferences.getString('api_token');
+}
+
+Future<void> saveApiToken(String token) async {
+  final normalized = token.trim();
+  final preferences = await SharedPreferences.getInstance();
+  if (normalized.isEmpty) {
+    await preferences.remove('api_token');
+    _apiToken = null;
+  } else {
+    await preferences.setString('api_token', normalized);
+    _apiToken = normalized;
+  }
 }
 
 /// 单次请求超时。
-///
-/// FE-07 从 10s 提到 15s：Neon 免费版实例空闲会挂起，冷启动唤醒需要 20–40s，
-/// 但**首屏不能等那么久**。所以真实的应对不是把超时拉到 40s（用户早就走了），
-/// 而是：15s 内能拿到就显示真实数据，拿不到就逐卡片降级成离线 mock（见 home_page）。
-/// 15s 是「再等下去也不会有结果」与「偶尔的慢请求别直接判死」之间的折中。
 const Duration kApiTimeout = Duration(seconds: 15);

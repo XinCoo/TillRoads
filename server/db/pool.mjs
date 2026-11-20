@@ -38,7 +38,7 @@ export const TYPE_OIDS = Object.freeze({
 // 连接池默认值（均可被 createPool(config) 的显式 config 覆盖）
 export const DEFAULT_POOL_CONFIG = Object.freeze({
   max: 10,
-  idleTimeoutMillis: 30_000,
+  idleTimeoutMillis: 5_000,
   connectionTimeoutMillis: 5_000,
 });
 
@@ -126,5 +126,9 @@ function envConfig() {
 export function createPool(config = {}) {
   configureTypeParsers();
   const merged = { ...DEFAULT_POOL_CONFIG, ...envConfig(), ...(config || {}) };
-  return new Pool(merged);
+  const pool = new Pool(merged);
+  // Surface idle-client and pool-level errors instead of allowing an unhandled
+  // EventEmitter error to terminate the process.
+  pool.on('error', () => {});
+  return pool;
 }

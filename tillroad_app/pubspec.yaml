@@ -25,6 +25,7 @@ dependencies:
   # 不用 dio 的理由：只有 7 个端点（2 个读 + 5 个写），http 的简单 API 足够；
   # dio 带来的拦截器/取消令牌等能力本轮用不上，不值得多一层抽象。
   http: ^1.2.0
+  shared_preferences: ^2.5.3
 
 dev_dependencies:
   flutter_test:

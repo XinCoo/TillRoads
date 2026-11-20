@@ -803,8 +803,42 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 **动效**：周期类型切换用 `AnimatedContainer(250ms, easeInOut)`；六块卡片用 `_StaggeredFadeIn`（每块延迟 `45 * index` ms 后 `260ms` 淡入）；`disableAnimations` 为 true 时直接显示终态，不做延迟与淡入。
 ---
 
-## 6. 当前里程碑与后续
+## 部署到 Railway
 
+后端可部署到 Railway，数据库继续使用 Neon PostgreSQL。Railway 会自动注入 `PORT`，无需手动填写，也不要启用 Railway PostgreSQL 插件。
+
+### Railway 操作步骤
+
+1. 在 Railway 创建 Project，选择 **Deploy from GitHub Repo**，连接本仓库。
+2. Service 的启动命令使用仓库已有的 `npm start`（即 `node server/index.mjs`）。
+3. 在 Service → Variables 填入下表；保存后等待 Railway 自动构建并部署。
+4. 部署完成后使用 `https://tillroads-production.up.railway.app` 作为 App 的 API 地址。
+
+| 变量 | 值 | 说明 |
+|---|---|---|
+| `PGHOST` | `ep-rapid-lake-azv5xiqd-pooler.c-3.ap-southeast-1.aws.neon.tech` | Neon 主机 |
+| `PGUSER` | `neondb_owner` | Neon 用户 |
+| `PGPASSWORD` | 在 Railway 面板粘贴 Neon 密码 | 不写入仓库或日志 |
+| `PGDATABASE` | `neondb` | Neon 数据库 |
+| `PGSSLMODE` | `require` | 必须启用 TLS |
+| `TOKENS` | `tk_test_001:<user-1-uuid>,tk_test_002:<user-2-uuid>` | 固定邀请 Token 与 userId 映射 |
+| `PORT` | Railway 自动注入 | 不手动设置 |
+
+当前联调映射为：`tk_test_001` → `11111111-1111-4111-8111-111111111111`，`tk_test_002` → `cbd8eb64-73d9-44c3-9898-aa2e701e8d84`。Token 只通过 `Authorization: Bearer <token>` 发送，后端不会记录 Token。`/health` 和 CORS `OPTIONS` 预检公开，其余请求在配置 `TOKENS` 后必须鉴权。移动端没有浏览器 `Origin`，因此 MVP 保留 `Access-Control-Allow-Origin: *` 与 `Access-Control-Allow-Credentials: false`。
+
+### 验证与发布 APK
+
+```bash
+curl -i https://tillroads-production.up.railway.app/health
+curl -i -H "Authorization: Bearer tk_test_001" https://tillroads-production.up.railway.app/users/11111111-1111-4111-8111-111111111111/exam-profiles
+curl -i https://tillroads-production.up.railway.app/users/11111111-1111-4111-8111-111111111111/exam-profiles
+flutter build apk --release --dart-define=API_BASE_URL=https://tillroads-production.up.railway.app --dart-define=API_TOKEN=tk_test_001
+```
+
+不提供 `API_TOKEN` 时，App 首次启动会显示 Token 输入页，并使用 `shared_preferences` 保存在本机；编译期 Token 优先于本地保存值。APK 输出路径为 `tillroad_app/build/app/outputs/flutter-apk/app-release.apk`。部署完成后应确认 `/health` 返回 200、无 Token 返回 401、正确 Token 返回自己的数据，另一个 Token 可以返回其用户的空列表。
+
+
+## 6. 当前里程碑与后续
 - ✅ 文档评审 + 4 项 P0 / 4 项 P1 修订（详见 [REVIEW-NOTES.md](<REVIEW-NOTES.md>)）
 - ✅ `core/` 端无关核心规则层 + 14 个单元测试
 - ✅ `server/` HTTP API 骨架 + 集成测试
