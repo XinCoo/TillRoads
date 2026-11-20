@@ -191,6 +191,10 @@ class EmptyState extends StatelessWidget {
               const SizedBox(height: 20),
               CupertinoButton(
                 color: AppColors.accent,
+                // 必须显式给前景色：`CupertinoButton` 的 plain 样式在传了
+                // `color` 之后，文字默认仍取主题 `primaryColor`（等于 accent），
+                // 于是出现「蓝底蓝字」——按钮看起来是个空蓝块。
+                foregroundColor: CupertinoColors.white,
                 borderRadius: BorderRadius.circular(AppRadii.chip),
                 onPressed: onAction,
                 child: Text(actionLabel!),

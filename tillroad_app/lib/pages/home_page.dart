@@ -9,6 +9,7 @@ import '../api/verification_api.dart'
 import '../config/api_config.dart';
 import '../mock/home_mock.dart';
 import '../pages/defect_create_page.dart';
+import '../pages/mock_create_page.dart';
 import '../theme/app_theme.dart';
 import '../widgets/countdown_card.dart';
 import '../widgets/defect_summary_card.dart';
@@ -500,6 +501,33 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
+  /// 「复盘」：切到底部第 5 个标签（复盘 Tab）。
+  ///
+  /// 用切 Tab 而不是 push 新页：复盘是五分区之一，push 会造出「Tab 里还套着
+  /// 一个复盘页」的双层栈，返回手势会把用户弹回首页而不是留在复盘列表。
+  void _openReview() {
+    final ValueChanged<int>? switchTab = widget.onSwitchTab;
+    if (switchTab != null) {
+      switchTab(4);
+    } else {
+      _toast('复盘', '请在底部标签栏切到「复盘」。');
+    }
+  }
+
+  /// 「开始模考」：直接进组卷配置页（考试目标 / 模式 / 范围 / 题量 / 限时）。
+  ///
+  /// 不在这里预取 profile：配置页自己会拉考试目标并展示成 chips，
+  /// 用户可能想为「另一个考试目标」组卷——首页只负责导航。
+  Future<void> _openMockCreate() async {
+    if (kUseMock) {
+      _toast('限时模考', '离线演示模式（kUseMock=true）下无法组卷。');
+      return;
+    }
+    await Navigator.of(context).push<bool>(
+      appRoute<bool>(context, const MockCreatePage()),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return CupertinoPageScaffold(
@@ -611,12 +639,12 @@ class _HomePageState extends State<HomePage> {
                       QuickAction(
                         icon: CupertinoIcons.timer,
                         label: '开始模考',
-                        onTap: () => _toast('限时模考', '模考页将在后续里程碑实现。'),
+                        onTap: _openMockCreate,
                       ),
                       QuickAction(
                         icon: CupertinoIcons.chart_bar,
                         label: '复盘',
-                        onTap: () => _toast('周期复盘', '复盘页将在后续里程碑实现。'),
+                        onTap: _openReview,
                       ),
                     ],
                   ),

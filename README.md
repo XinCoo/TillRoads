@@ -751,6 +751,56 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 > 「离线数据」小字原本贴在卡片圆角上显得被裁，已补 `left/right: 16` + `bottom: 14` 内边距。
 
 **冷启动实测（Android 17 模拟器 + Neon 云库）**：`am force-stop` 后冷启，899ms / 1753 / 2597 / 3467ms 四帧均仍为原生闪屏，**4194ms 起稳定在加载完成画面**——即冷启动到首帧完整内容约 **4.2s**（其中包含 Neon 冷启动）。热启动（不杀进程）回前台无重新加载。用 `adb root` + `iptables -A OUTPUT -p tcp --dport 3000 -j DROP` 阻断后端可稳定复现骨架屏与离线兜底（`-j REJECT` 更快，避免等满 15s）。
+#### 限时模考页（FE-05）
+
+模考链路四页 + 列表页，把 BE-05 的五个端点接到界面：
+
+| 文件 | 职责 |
+|---|---|
+| `lib/api/mock_api.dart` | 14 个数据类（`MockExam` / `MockQuestion` / `MockReport` / `V3Candidate` …）+ `MockExamApi` 五方法 |
+| `lib/pages/mock_create_page.dart` | 组卷配置：考试目标 → 模式 → 科目/考点 → 题量 → 限时 |
+| `lib/pages/mock_exam_page.dart` | 答题页：计时 + 点阵导航 + 交卷确认 + 超时自动交卷 |
+| `lib/pages/mock_report_page.dart` | 报告页：总分 / 模块正确率 / 平均用时 / 稳定性与重复率 / V3 候选 |
+| `lib/pages/mock_page.dart` | 「我的模考」列表：已交卷历史 + 进行中分区 + 下拉刷新 |
+| `lib/pages/home_page.dart` | 「开始模考」快捷入口 push 组卷页（唯一改动处） |
+
+**四个和后端有关的坑（都写在源码注释里）**：
+
+1. **组卷响应里的题干在顶层，不在 `mock_exam` 里**。`mock_exam.questions` 只是 jsonb 索引行 `[{question_id, attempt_id, is_correct, duration_ms}]`，没有题干/选项；可渲染的题目在响应顶层的 `questions` 数组。所以 `POST /mock-exams` 返回的是 `MockExamCreated`（exam + questions）而不是裸 `MockExam`。
+2. **`mock_exams` 表没有 `submitted_at` 列**。列表页要显示「交卷时间」时取 `updated_at`（提交是同事务 `UPDATE`，`updated_at` 由触发器刷新）。
+3. **报告的 `title` 曾恒为 `null`（FE-06 已修）**——`server/repositories/mock_exams.mjs` 传给 `reportGenerator` 的键是 `title:`，而 `server/mock_report.mjs` 原先只读 `q.knowledge_node_title`，键名不一致。FE-06 任务 A 把读取改成 `q.knowledge_node_title ?? q.title ?? null`（兼容两种键名，旧报告不受影响），并加 `T6b` 单测锁住。前端 `displayTitle` 兜底保留（`title` 仍可能为 null，例如考点已被删除），此时显示 `考点 <id 前 8 位>`（`__ungrouped__` → `未归属考点`），**不伪造成中文考点名**。
+4. **报告不含标准答案与解析**（`HIDDEN_FIELDS = ['answer','analysis']` 在组卷和读卷时都剔除），所以报告页没有「查看解析」，只有一行说明引导用户去缺陷单建单归因。
+
+**`V3 验证建议` 只指路不迁移**：报告里的 `v3_candidates` 由后端按 `knowledge_node_id` 匹配当前 `status = 'V3'` 或 `'CLOSED'` 的缺陷单算出（不要求 `question_id` 非空）。前端点某条候选先 `fetchDefectDetail` 拿完整 `DefectTicket`，再 push 复用 `DefectVerifyPage`——该页会按 `VERIFY_STAGES.V3.types` 自动把验证方式限定为「限时模考」，不需要前端另写白名单。
+
+**一个真机才暴露的遮挡 bug（已修）**：报告页首屏「本次正确率」卡与答题页题干都被导航栏压住。根因在 `CupertinoPageScaffold` 源码（`page_scaffold.dart:146-190`）：只有 `navigationBar.backgroundColor.alpha == 0xFF`（即 `shouldFullyObstruct` 为真）时它才给 child 加 `EdgeInsets.only(top: navBarHeight)`；半透明时只改 `MediaQuery.padding.top` 而不加 padding。两页原先都写了 `SafeArea(top: false)`，于是既不拿 padding 也不读 MediaQuery → 内容顶到 y=0。修法是两处导航栏背景改成不透明 `AppColors.groupedBackground`。
+
+**超时链路**：`duration_limit_ms` 交给后端判定（`elapsedMs > duration_limit_ms + 60000` 才算超时，留 60s 宽限），前端另有自己的本地倒计时——`_deadline` 是**绝对时间**而非每次 tick 递减，避免 ticker 丢帧累积误差。剩余 ≤60s 时倒计时变红并闪烁，归零自动交卷（不弹二次确认），报告顶部显示橙色「超时交卷」徽标。
+
+#### 复盘页（FE-06）
+
+日 / 周 / 月复盘列表 + 六项 metrics 详情，把 BE-06 的五个端点接到界面：
+
+| 文件 | 职责 |
+|---|---|
+| `lib/api/review_api.dart` | 7 个数据类（`ReviewCycle` / `ReviewMetrics` / `OpenDefects` / `VerifyPassRate` / `TargetProgress` / `ReopenHotspot` …）+ 周期类型枚举 `ReviewCycleType` + `ReviewApi` 五方法 |
+| `lib/pages/review_page.dart` | 复盘列表：日/周/月 chip 切换 + 生成 ActionSheet + 409 引导查看已有 |
+| `lib/pages/review_detail_page.dart` | 详情六块卡 + 底部「标记已读 / 删除复盘」操作区 |
+| `lib/pages/home_page.dart` | 快捷入口「复盘」改为切到 Tab 4（唯一改动处） |
+**四个和后端有关的取舍（都写在源码注释里）**：
+
+1. **只有 `POST /review-cycles` 返回周期起止时刻**。`GET` 列表走的是裸 `SELECT *`（`server/repositories/review_cycles.mjs:listByUser`），行里只有 `id/user_id/cycle_type/period/metrics/completed/created_at/updated_at/version/deleted_at`，**没有** `period_start_at` / `period_end_at` / `time_zone`。所以 `ReviewCycle` 把这三个字段设为可空，列表页只用 `period` 字串展示。
+2. **`period` 不传，让后端算当前周期**。前端只发 `{user_id, cycle_type}`，周期格式（`daily: YYYY-MM-DD` / `weekly: YYYY-Www` / `monthly: YYYY-MM`）与时区（`Asia/Shanghai` 日界）完全由 `server/review_period.mjs` 决定——否则前端要自己实现 ISO 周算法，两边容易漂移。
+3. **同周期重复生成是 `409 ALREADY_EXISTS`，且 body 带 `existing_id`**。前端把这个 `existing_id` 当作「查看已有」的目标，而不是弹一个干巴巴的「已存在」：用户点「查看已有」直接进那份复盘的详情页。`resolution: 'delete_then_recreate'` 是后端给的提示，前端在对话框正文里写清了「先打开已有那份删除，再生成新的」。
+4. **`PATCH` 只接受 `completed`，`DELETE` 也要 `version`**。`PATCH` 传其他键会 400 `IMMUTABLE_FIELD`，所以 `markCompleted` 的 body 只发 `{version, completed: true}`；`DELETE` 走 `readBaseVersion`，缺 `version` 直接 400——这两处都靠前端从详情页持有的 `_cycle.version` 补上。
+
+**列表页刻意不做服务端 `cycle_type` 过滤**：一次拉全量（`limit: 100`）再本地按 chip 过滤。理由是两个体验点——①切 chip 不用等网络；②只有拿到全量才能区分「还没有任何复盘」和「「月复盘」下暂无记录」两种空态（任务 C6）。代价是数据量大了要改回分页，已记在遗留项里（当前个人题库量级不成问题）。
+
+**六块 metrics 卡全部纯 Widget 手绘**，不引图表库：未关闭缺陷用七态堆叠条 + 图例（颜色复用 `defect_badges.dart:statusColor`），错因层级/重开热点用横条，验证通过率用两根竖柱，目标进度用 8px 进度条。`mock_stability` 为 null 时显示「本周期无模考」，不是画一条 0 的柱子。
+
+**一个真机才暴露的按钮 bug（已修，影响面不止本页）**：`lib/widgets/common.dart` 的 `EmptyState` 里 `CupertinoButton` 只给了 `color: AppColors.accent`，没给 `foregroundColor`。Flutter 的 plain 按钮样式在传了 `color` 之后，文字仍然取主题 `primaryColor`（= 同一个 accent），于是**蓝底蓝字**——截图里空态按钮看起来是个空蓝块（`D:\DSH\flutter\packages\flutter\lib\src\cupertino\button.dart:501-505` 的 `textStyle.copyWith(color: effectiveForegroundColor)`，`:474` 的 `backgroundColor` 才用 `widget.color`）。修法是显式 `foregroundColor: CupertinoColors.white`。这个组件被 FE-01 起的多个页面共用，属于顺带修掉的存量 bug。
+
+**动效**：周期类型切换用 `AnimatedContainer(250ms, easeInOut)`；六块卡片用 `_StaggeredFadeIn`（每块延迟 `45 * index` ms 后 `260ms` 淡入）；`disableAnimations` 为 true 时直接显示终态，不做延迟与淡入。
 ---
 
 ## 6. 当前里程碑与后续
@@ -775,7 +825,9 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 - ✅ **FE-03 写操作联调**（建单 → 归因 → 标记动作 → 进入验证 → 提交验证）：后端两处查询小修（LEFT JOIN 考点/科目名、`status` 逗号分隔多值）；前端新增建单页 / 归因页 / 提交验证页 + `widgets/form_field.dart` 共用表单件，`defect_api.dart` 补齐 5 个写方法与 3 个读方法；乐观锁 `version` 全程携带、409 提示刷新、禁用语 400 内联红字、`ai_cannot_close` 403 文案；Android 17 模拟器 + Neon 真跑通「DRAFT 建单 → ANALYZED → 动作勾完 → `begin-verification` 两跳进 V1 → 提交 V1 pass 进 V2」，四处截图留证
 - ✅ **FE-04**：验证任务页接真实 API + 后端建单 actions 同事务：仓储 `create` 改为「先插 `defect_tickets` 行、再逐条插 `actions` 表行」并返回带 `actions` 的 ticket（仍在同一 `withTransaction` 内，任一条失败整笔回滚），**堵上 `begin-verification` 门禁读不到动作的 `NO_ACTIONS` 缺口**；前端新增 `verification_api.dart`（`VerificationTask` / `VerificationSummary`）+ `verify_page.dart` 整页重写（三色摘要卡片可点击筛选、stage 筛选条走后端、每卡局部 loading 拉详情再 push）+ 首页「今日待验证」右侧改为真实三色计数（拿不到时回落 mock 条数并标「离线」）；2 条新 PG 集成用例（建单带 2 条动作 → 表 2 行 → 标记完成 → 进 V1）留 CI；Android 17 模拟器 + Neon 真跑 1/1/1 三色、点击筛选、进详情并提交 V1 pass，截图四张
 - ✅ **FE-07**：首页看板完整联调：后端新增聚合端点 `GET /users/:userId/defect-stats`（status 八态计数 + error_layer 分组，**只算未关闭**，八态白名单预填 0 防契约漂移）；前端首页整份重写——`Future.wait` 三路并发 + 逐卡片骨架屏（`_SkeletonBlock`/`_Bone`/`_Pulse`）+ 逐卡片独立降级（每路各自 try/catch，一路失败不阻塞其余）+ `AnimatedSwitcher` 淡入 + `main()` 里 `GET /health` 预热；快捷入口四个 onTap 全接（建题 push 建单页 / 转缺陷单切 Tab / 模考与复盘弹提示）；`kApiTimeout` 10s→15s；Android 17 冷启动实测 **冷 ≈4.2s 到首帧完整内容**，骨架屏/加载完成/离线兜底三张截图，四入口逐个点验
-- ⏳ **下一批**：FE-02 建题/导入页 → FE-11 审核七态 UI → BE-07 缺陷分布看板 / BE-08 同步服务 → 补 Flutter 工具链后移植 Dart / 接入 NestJS
+- ✅ **FE-05**：限时模考页（组卷 → 答题 → 交卷 → 报告 → V3 引导）：前端新增 `api/mock_api.dart`（13 个数据类 + 5 方法）与三个新页 + `mock_page.dart` 整份重写为「我的模考」列表，首页「开始模考」快捷入口接上；答题页用**绝对截止时间**+`Timer.periodic(1s)` 避免 tick 累积误差，剩余 ≤60s 变红闪烁、归零自动交卷；报告页四块卡（总分/模块正确率横条/平均用时/稳定性与缺陷重复率）+ V3 候选区（点某条先拉缺陷详情再复用 `DefectVerifyPage`，V3 验证方式由后端白名单限定为「限时模考」）；修掉两个真机才暴露的导航栏遮挡 bug（`CupertinoPageScaffold` 仅在半透明时不给 child 加 padding）；Android 17 模拟器 + Neon 真跑通全链路（含 1 分钟限时的自动交卷），11 张截图留证
+- ✅ **FE-06**：复盘页（日/周/月生成与查看 + 六项 metrics）：前端新增 `api/review_api.dart`（7 个数据类 + `ReviewCycleType` 枚举 + 5 方法）与两个新页 + `review_page.dart` 从空状态重写为列表，首页「复盘」快捷入口改为切 Tab 4；列表页一次拉全量再本地按 chip 过滤（切 chip 不等网络 + 能区分两种空态），生成走 `CupertinoActionSheet` 且不传 `period` 让后端算当前周期，同周期重复生成把 `409 ALREADY_EXISTS` 的 `existing_id` 接成「查看已有」直达；详情页六块卡全部纯 Widget 手绘（七态堆叠条 / 横条 / 双竖柱 / 8px 进度条），底部「标记已读 → 删除复盘」状态化操作区；**顺手修掉 BE-05 遗留的报告 `title` 恒 null**（`reportGenerator` 改读 `q.knowledge_node_title ?? q.title`，新增 `T6b` 单测）与 `EmptyState` 蓝底蓝字按钮；Android 17 模拟器 + Neon 真跑通「生成 → 列表 → 详情 → 标记已读 → 删除 → 空态」全链路及 409 场景，10 张截图留证
+- ⏳ **下一批**：FE-02 建题/导入页 → FE-11 审核七态 UI → BE-07 缺陷分布看板 / BE-08 同步服务 → 补 Flutter 工具链后移植 Dart / 接入 NestJS（FE-06 完成后前端 MVP 页面已全部到位：FE-01/03/04/05/06/07）
 - ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两节点）；②CORS 的 `*` 生产前收窄为白名单；③补 userId 鉴权；④Neon 空闲回收连接时 `pg` 池会冒未监听 `error` 事件杀进程（已在 `scripts/dev-start.mjs` 绑 `pool.on('error')` 兜住，生产需同类防护）；⑤前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
 

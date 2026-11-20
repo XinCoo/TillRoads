@@ -158,7 +158,9 @@ export function computeStability(mocks = [], window = 3) {
  * 生成模考报告。
  *
  * @param {object}   input
- * @param {Array}    input.questions     本次卷子的题：[{question_id, knowledge_node_id, knowledge_node_title}]
+ * @param {Array}    input.questions     本次卷子的题：[{question_id, knowledge_node_id, knowledge_node_title}]，
+ *                                      考点名兼容 `knowledge_node_title` 与 `title` 两种键名
+ *                                      （仓储 mock_exams.mjs 传的是后者）
  * @param {Array}    input.attempts      判分后的作答：[{question_id, is_correct, duration_ms}]
  * @param {Array}    input.closedDefects 该用户的缺陷单（**status 为 'CLOSED' 或 'V3'**）：
  *                                       [{id|defect_ticket_id, question_id, knowledge_node_id, status}]
@@ -202,7 +204,11 @@ export function reportGenerator({
     const qid = String(q.question_id);
     const attempt = attemptByQuestion.get(qid) || null;
     const key = q.knowledge_node_id == null ? UNGROUPED : String(q.knowledge_node_id);
-    const title = q.knowledge_node_title ?? null;
+    // 考点名兼容两种键名：仓储 mock_exams.mjs 提交时传的是 `title`，
+    // 而本文件旧版只读 `knowledge_node_title` → 报告里 title 恒 null，
+    // 前端只能把考点显示成「考点 <uuid 前 8 位>」。这里同时接受两种，
+    // 既修掉新生成的报告，也让库里已有的旧报告不受影响。
+    const title = q.knowledge_node_title ?? q.title ?? null;
 
     if (!moduleAcc.has(key)) moduleAcc.set(key, { title, correct: 0, total: 0, ungraded: 0 });
     const acc = moduleAcc.get(key);

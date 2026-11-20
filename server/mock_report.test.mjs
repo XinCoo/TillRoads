@@ -140,6 +140,39 @@ test('T6 module_accuracy：按 knowledge_node 分组，正确率与 ungraded 分
   assert.equal(rep.ungraded_count, 1);
 });
 
+test('T6b 考点名兼容两种键名：仓储传 title、旧版传 knowledge_node_title 都能取到', () => {
+  // 回归锁定：server/repositories/mock_exams.mjs 提交时给 reportGenerator 的题是
+  //   { question_id, knowledge_node_id, title }
+  // 而本文件旧版只读 knowledge_node_title → module_accuracy[*].title 恒 null，
+  // 前端只能显示成「考点 <uuid 前 8 位>」。修正为 q.knowledge_node_title ?? q.title。
+  const questions = [
+    { question_id: 'q1', knowledge_node_id: 'kn-a', title: '法律常识' },
+    { question_id: 'q2', knowledge_node_id: 'kn-b', knowledge_node_title: '行程问题' },
+    { question_id: 'q3', knowledge_node_id: 'kn-c', knowledge_node_title: '两者都有', title: '应取前者' },
+    { question_id: 'q4', knowledge_node_id: 'kn-d', title: null, knowledge_node_title: null },
+  ];
+  const attempts = [
+    { question_id: 'q1', is_correct: true, duration_ms: 100 },
+    { question_id: 'q2', is_correct: true, duration_ms: 100 },
+    { question_id: 'q3', is_correct: true, duration_ms: 100 },
+    { question_id: 'q4', is_correct: true, duration_ms: 100 },
+  ];
+
+  const rep = reportGenerator({ questions, attempts });
+
+  // 只有 title 键（仓储真实形状）
+  assert.equal(rep.module_accuracy['kn-a'].title, '法律常识');
+  assert.equal(rep.avg_duration_ms.by_knowledge_node['kn-a'].title, '法律常识');
+  // 只有 knowledge_node_title 键（旧测试/旧调用方形状）
+  assert.equal(rep.module_accuracy['kn-b'].title, '行程问题');
+  assert.equal(rep.avg_duration_ms.by_knowledge_node['kn-b'].title, '行程问题');
+  // 两者都有时以 knowledge_node_title 优先（向后兼容旧语义）
+  assert.equal(rep.module_accuracy['kn-c'].title, '两者都有');
+  // 两者都缺仍是 null，不伪造名字
+  assert.equal(rep.module_accuracy['kn-d'].title, null);
+  assert.equal(rep.avg_duration_ms.by_knowledge_node['kn-d'].title, null);
+});
+
 test('T7 avg_duration_ms：按考点平均 + 全卷平均，未判分的题也算用时', () => {
   const questions = [Q('q1', 'kn-a', '函数'), Q('q2', 'kn-a', '函数'), Q('q3', 'kn-b', '几何')];
   const attempts = [
