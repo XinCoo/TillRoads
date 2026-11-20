@@ -12,10 +12,12 @@ import '../pages/defect_create_page.dart';
 import '../pages/mock_create_page.dart';
 import '../theme/app_theme.dart';
 import '../widgets/countdown_card.dart';
+import '../widgets/diagnose_dialog.dart';
 import '../widgets/defect_summary_card.dart';
 import '../widgets/common.dart';
 import '../widgets/quick_action_grid.dart';
 import '../widgets/task_card.dart';
+import '../widgets/log_export_sheet.dart';
 
 /// 首页看板（FE-01 的核心页面，FE-07 完成数据联调）
 ///
@@ -538,8 +540,8 @@ class _HomePageState extends State<HomePage> {
           parent: AlwaysScrollableScrollPhysics(),
         ),
         slivers: <Widget>[
-          const CupertinoSliverNavigationBar(
-            largeTitle: Text(
+          CupertinoSliverNavigationBar(
+            largeTitle: const Text(
               '题路',
               style: TextStyle(
                 fontSize: 34,
@@ -551,9 +553,32 @@ class _HomePageState extends State<HomePage> {
             // 中间标题与 largeTitle 同时出现（截图里看到「题路」重复两次）。
             // 置 false 让中间标题只在大标题折起后才淡入，符合 iOS 行为。
             alwaysShowMiddle: false,
-            middle: Text('题路'),
-            border: Border(
+            middle: const Text('题路'),
+            border: const Border(
               bottom: BorderSide(color: AppColors.separator, width: 0.5),
+            ),
+            // 右上角两个入口：
+            //   ① 连接诊断（Wi-Fi）：后端连不上时点一下就能看到断在哪一层；
+            //   ② 运行日志（文档）：一键导出脱敏日志发给开发者，替代连电脑抓 logcat。
+            // 两者都只用图标 —— SliverNavigationBar 的 trailing 横向空间很紧。
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  minimumSize: Size.zero,
+                  onPressed: () => showDiagnoseDialog(context),
+                  child: const Icon(
+                    kDiagnoseIcon,
+                    size: 22,
+                    color: AppColors.accent,
+                  ),
+                ),
+                const SizedBox(width: 16),
+                LogExportButton(
+                  onPressed: () => showLogActionsSheet(context),
+                ),
+              ],
             ),
           ),
           SliverSafeArea(
@@ -903,3 +928,4 @@ class _CountDot extends StatelessWidget {
     );
   }
 }
+

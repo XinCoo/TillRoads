@@ -205,9 +205,15 @@ class AppTheme {
 Route<T> appRoute<T>(BuildContext context, Widget page) {
   final bool reduceMotion =
       MediaQuery.maybeOf(context)?.disableAnimations ?? false;
+  // 路由名取自页面类名：日志（[NAV]）靠它才知道「跳到了哪一页」，
+  // 而在 15 个 push 点逐个手写 name 既啰嗦又必然会漏。
+  final RouteSettings settings = RouteSettings(
+    name: page.runtimeType.toString(),
+  );
 
   if (reduceMotion) {
     return PageRouteBuilder<T>(
+      settings: settings,
       pageBuilder: (_, _, _) => page,
       transitionDuration: AppDurations.reduceMotion,
       reverseTransitionDuration: AppDurations.reduceMotion,
@@ -218,5 +224,8 @@ Route<T> appRoute<T>(BuildContext context, Widget page) {
     );
   }
 
-  return CupertinoPageRoute<T>(builder: (_) => page);
+  return CupertinoPageRoute<T>(
+    builder: (_) => page,
+    settings: settings,
+  );
 }

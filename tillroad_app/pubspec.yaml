@@ -26,6 +26,7 @@ dependencies:
   # dio 带来的拦截器/取消令牌等能力本轮用不上，不值得多一层抽象。
   http: ^1.2.0
   shared_preferences: ^2.5.3
+  share_plus: ^13.3.1
 
 dev_dependencies:
   flutter_test:

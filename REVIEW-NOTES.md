@@ -1251,3 +1251,168 @@ Android 17 模拟器 + Neon 云数据库：冷启动约 4.2 秒进入完整首�
 - Flutter：`API_BASE_URL` / `API_TOKEN` 支持 `--dart-define`；无编译期 Token 时首次启动显示 Cupertino Token 输入页并用 `shared_preferences` 保存；每个 API 请求自动带 `Authorization: Bearer`。
 
 验证记录：`node --test server/auth.test.mjs server/db/pool.test.mjs server/index.test.mjs` 通过；Flutter `pub get`、`flutter test` 5/5，通过 `flutter analyze --no-fatal-infos`（仅 Cupertino deprecation info，无 error/warning）。Railway 真正部署仍需用户在面板连接 GitHub、填写 Neon/TOKENS 环境变量后再用公网 curl 验证。
+
+## 32. Release APK 联网故障修复（INTERNET 权限 / URL 清洗 / 连接诊断）
+
+用户报告：手机浏览器访问 `https://tillroads-production.up.railway.app/health` 正常，但 release APK 报
+`ClientException with SocketException: Failed host lookup: 'tillroads-production.up.railway.app' (OS Error: No address associated with hostname, errno = 7)`。
+
+### 根因（A）：`src/main/AndroidManifest.xml` 缺 INTERNET 权限
+
+Flutter 模板只在 `android/app/src/debug/AndroidManifest.xml` 与 `android/app/src/profile/AndroidManifest.xml`
+里声明 `<uses-permission android:name="android.permission.INTERNET"/>`（给热重载、调试用），`src/main/` 里没有。
+debug/profile 构建会合入各自那份，所以**开发期一直能联网**；release 合入后只有 APK 自己声明的权限，
+即只有一个 `com.tillroad.tillroad_app.DYNAMIC_RECEIVER_NOT_EXPORTED_PERMISSION`。
+
+实证（不是猜）：构建产物里的两份合并清单都只有那一个权限——
+`build/app/intermediates/merged_manifest/release/processReleaseMainManifest/AndroidManifest.xml` 与
+`build/app/intermediates/packaged_manifests/release/processReleaseManifestForPackage/AndroidManifest.xml`。
+
+Android 在**没有 INTERNET 权限时把 DNS 解析直接判为失败**，所以报出来的不是「权限不足」而是
+`Failed host lookup` + `errno = 7`——错误文本把人引向了 DNS/域名/证书方向，实际上与域名无关。
+这也是这个 bug 最容易误判的地方。
+
+修复：在 `<manifest>` 直接子级、`<application>` 之前插入该权限，并注释说明「release 才会暴露」。
+修复后重新 grep 合并清单，两项权限均在。
+
+### B：URL 拼接硬化
+
+`lib/config/api_config.dart` 新增 `normalizeBaseUrl(String raw)`：去首尾空白、剥半角/全角引号、
+`Uri.tryParse`、只允许 http/https、要求 host 非空、去尾部所有斜杠、清 query/fragment；非法返回 `null`。
+`kApiBaseUrl` 改为 `normalizeBaseUrl(kApiBaseUrlRaw) ?? kApiBaseUrlRaw.trim()`——
+清洗失败时保留原文而不静默回落官方地址，否则会连出一个「不该成功却成功」的结果，掩盖配置错误。
+
+`lib/api/api_client.dart` 抽出顶层 `Uri buildApiUri(baseUrl, path, [query])`，用
+`'${base.path}$normalized'.replaceAll(RegExp(r'/+'), '/')` 折叠重复斜杠。
+**刻意不用 `Uri.resolve`**：`resolve('/users')` 会把 base 自带路径整体丢掉
+（`https://h/api` + `resolve('/users')` → `https://h/users`），将来挂子路径会静默请求到错位置。
+
+Dart 实测（`dart run` 临时脚本）：`https://h//`→`https://h/`、` https://h/ `→`https://h`、
+`"https://h/"`→`https://h`、`h`/`ftp://h`→`null`、`https://h/api/`→`https://h/api`。
+
+### C：内建连接诊断
+
+`diagnose({baseUrl, timeout, client})` 直接打 `GET /health`（带 Bearer），把结果分为
+`DiagnoseStage: ok / invalidBaseUrl / dns / tls / timeout / http / network`，返回
+`DiagnoseResult{stage, baseUrl, message, uri, statusCode, elapsed, rawError}`。
+
+两个设计取舍：
+- **不 import `dart:io`**：`package:http` 在各平台把 `SocketException` 包成 `ClientException`，
+  按类型判断不可靠；改用异常文本匹配（`failed host lookup` / `no address associated with hostname` → dns，
+  `handshakeexception`/`certificate` → tls，`connection refused`/`no route to host` → network）。
+  附带的好处是这个文件在 web / 测试环境照样能编译。
+- **诊断结果不含 token**：只打地址、状态码、原始错误，用户可以直接截图发给开发者。
+
+UI：`lib/widgets/diagnose_dialog.dart`（`showDiagnoseDialog`），首页导航栏右上角 Wi-Fi 图标唤起。
+正文 `_DiagnoseBody` 用 `_attempt` 计数丢弃过期结果，避免连点「重试」时旧结果盖新结果。
+
+### 真机验证（Android 17 模拟器 / release APK / Railway 公网）
+
+- 修复前：冷启后首页报「考试目标加载失败」，缺陷分布也拿不到数据。
+- 修复后冷启：缺陷分布立刻显示真实数据（共 8 条：执行 4 / 方法不会 2 / 概念不清 1 / 知道 1）。
+  说明 INTERNET 权限是关键。
+- **仍存在一个真实的竞态**：首次冷启时三路并发建 TLS，其中 `exam-profiles` 那一路报
+  `ClientException: Connection closed before full header was received`（status=null），
+  而同一时刻 `/health` 预热成功（1976ms）。点「重试」后倒计时正常显示 45 天。
+  这是逐卡片降级设计要覆盖的场景（不是本轮修复对象），已在遗留项列出。
+- 诊断弹窗实测：Wi-Fi 图标 → 「通过」绿点 + 1449ms + 地址 + 请求 + 状态码 200 + 「重试/关闭」。
+- 截图：`tillroad_app/screenshots/fe-net-home.png`（修复后首页真实数据）、`fe-net-diagnose.png`（诊断弹窗）。
+
+### 数字
+
+- 新 release APK：**51,884,906 bytes（49.5 MB）**（修复前 51,868,370；差值来自新增诊断代码）。
+- `flutter analyze --no-fatal-infos`：26 issues，**全部是既有 Cupertino deprecation info，0 error / 0 warning**。
+- `flutter test`：5/5 通过。后端未改动，本轮未跑 `npm test`。
+
+### 教训
+
+1. **debug 能跑不等于 release 能跑**：权限、混淆、tree-shaking 都只在 release 暴露。涉及网络的改动必须测 release 包。
+2. **错误文本会误导方向**：`Failed host lookup` 看起来像 DNS，实际是缺 INTERNET 权限。
+   排查要先看合并后的清单，而不是先怀疑域名、证书、VPN。
+3. **类名 / 全局函数名不要重名**：本轮在 `api_client.dart` 内同时保留了 `ApiClient._uri` 与顶层 `buildApiUri`，
+   前者改成一行委派——避免两份拼接逻辑逐渐漂移。
+
+---
+
+## 33. 运行日志导出（脱敏 + 按天滚动 + 一键分享）
+
+背景：App 已上 Railway、即将给外部测试用户，但他们拿不到 adb logcat。目标是把「带上下文的日志」变成用户自己就能导出、且**不需要担心泄露**的文件。
+
+### 前置确认
+
+1. `lib/main.dart` 原本**没有** `FlutterError.onError` / `PlatformDispatcher.onError`（只有预热用的 debugPrint）。
+2. 所有 HTTP 都走 `lib/api/api_client.dart` 的 `ApiClient._send(method, uri, {body})`，一处埋点覆盖全部端点。
+3. `lib/pages/` **没有设置页** → 走任务书 D2 分支（首页导航栏图标）。
+4. 「连接诊断」已在上一轮实现，`diagnose()` 结果需入日志（B5）。
+5. analyze 基线 26 info / 0 error。
+
+### 脱敏：在写缓冲区之前做，而不是导出时
+
+这是本轮最重要的结构约束。`AppLogger._write()` 是唯一入口，先 `sanitizeLogText(tag/message/stackTrace)`
+再构造 `LogEntry`——因此**内存缓冲里也不存在原文**，导出路径怎么改都不可能漏。
+
+四条正则（`app_logger.dart`）：
+
+| 规则 | 正则 | 替换 |
+|---|---|---|
+| Bearer | `Bearer\s+[A-Za-z0-9_\-.=+/]+`（忽略大小写） | `Bearer ***` |
+| 裸 token | `\btk_[A-Za-z0-9_]+` | `***` |
+| UUID | `[0-9a-fA-F]{8}-...-[0-9a-fA-F]{12}` | 去连字符取前 4 位 + `****` |
+| query 密文 | `\b(token\|access_token\|api_key\|password)=[^&\s]+` | `$1=***` |
+
+第四条任务书没要求：请求 URL 要落盘，而 URL 拼错时最容易把 token 带进 query，成本一个正则。
+
+UUID 只保留前 4 位而不是全删：同一个用户的日志要能看出「是不是同一个 ID」，而 4 位十六进制
+（65536 种）单独无法定位到人。
+
+### 文件滚动与容量
+
+`log_file_writer.dart`：`app-YYYY-MM-DD.log` 按天一个文件；`_prune()` 两轮——先按文件名日期保留 3 个，
+再按总大小超 5MB 删最旧，但**当天文件永不删**（否则正在写的句柄会把文件重新创建，删了等于没删）。
+写入是串行队列（`_tail.then`）且不 await 磁盘；写失败只 print 不抛——日志组件不能拖垮 App。
+
+目录选择：`Directory.systemTemp/tillroad/logs` → `Directory.current/logs`，每个候选都真写一次
+`.write-probe` 探针验证可写，全失败才抛。**不用 `path_provider`**：它只是 share_plus 的传递依赖，
+没在 pubspec 里声明就直接 import 属于埋雷。
+
+### 埋点
+
+- `main.dart`：`FlutterError.onError` 保留原 handler（`original?.call(details)`）所以 debug 仍打印红屏信息；
+  `PlatformDispatcher.onError` 返回 `true` 吞掉，避免 release 崩在原生层。
+- `api_client._send()`：请求前 info、2xx info（带耗时）、非 2xx error（带 `code=` 与 `body=` 截 200 字符）、
+  网络失败/超时 error。**body 必须截断**：响应体里可能有题干与答案。
+- `appRoute()` 给两个 Route 都传 `settings: RouteSettings(name: page.runtimeType.toString())`，
+  再配合 `LoggingNavigatorObserver` 出 `[NAV] push X ← Y`——比逐个改 15 个 push 点侵入小得多。
+
+### 真机验证（Android 17 模拟器 / release APK / Railway）
+
+- 联网正常时日志：`[API] GET /users/1111****/exam-profiles 200 OK 4060ms` 等 4 条。
+- `svc wifi disable` + `svc data disable` 后重启 App，日志出现 4 条 error：
+  `[ERROR] [API] GET /health 网络失败 100ms：ClientException with SocketException: Failed host lookup: ... errno = 7`。
+- 导出文件 5139 B：含设备头（`android · sdk_gphone16k_x86_64-userdebug 17 ...`、CPU 核数 4、
+  `API 地址 https://tillroads-production.up.railway.app`）；`contains('tk_test_001') == false`、
+  `contains('11111111-1111-4111-8111-111111111111') == false`、`contains('1111****') == true`、
+  题干文本 `充分必要条件` **不在文件里**。
+- 分享面板：`SharePlus.instance.share` 弹出系统面板「Sharing 1 file / tillroad-log-20261120-105817.txt」。
+- 截图：`tillroad_app/screenshots/fe-log-entry.png`（ActionSheet）、`fe-log-share.png`（系统分享面板）。
+
+### 数字
+
+- `flutter analyze --no-fatal-infos`：**28 issues，全部既有 Cupertino deprecation info，0 error / 0 warning**。
+- `flutter test`：**15/15 通过**（新增 `test/logging_test.dart` 10 条：脱敏 5 / 环形缓冲 2 / 文件滚动 3）。
+- 新 release APK：**52,345,064 bytes（49.9 MB）**（上一轮 51,884,906）。
+- 后端**零改动**。
+
+### 踩到的 5 个真实编译/逻辑缺陷
+
+1. `LogEntry.toLine()` 里写 `final String level = level.label` → 局部变量遮蔽字段（`referenced_before_declaration`）。改 `levelText`。
+2. `FlutterExceptionHandler` 类型没在 `show` 列表里 → `undefined_class`。
+3. `LoggingNavigatorObserver` 写成 const 构造 → `const_constructor_with_non_const_super`（`NavigatorObserver` 无 const 超类构造）。
+4. `log_file_writer.dart` 残留未用字段 `_pending` → `unused_field` warning。
+5. 测试断言与实现不一致：`maskUuid` 对任意串都取前 4 位，所以 `maskUuid('not-a-uuid')` 不等于原文；
+   正确断言是 `maskUuid('abc') == '****'` 且 `sanitizeLogText('not-a-uuid') == 'not-a-uuid'`（不被 UUID 正则误伤）。
+
+### 遗留
+
+- 日志上报到服务端（崩溃收集）留后续，本轮只做本地导出。
+- `share_plus` 13.x 在 Android 上会把文件复制到 `cache/share_plus/`，导出目录 `code_cache/tillroad/export/` 只保留 5 份。

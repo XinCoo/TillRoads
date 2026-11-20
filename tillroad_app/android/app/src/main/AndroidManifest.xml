@@ -1,4 +1,9 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <!-- 联网权限：release 包必须在此声明。
+         Flutter 模板只在 debug/profile 的 manifest 里加 INTERNET（供热重载用），
+         main 里没有 → release APK 一联网就 SocketException: Failed host lookup
+         （Android 在无 INTERNET 权限时把 DNS 解析直接判失败，报 errno = 7）。 -->
+    <uses-permission android:name="android.permission.INTERNET"/>
     <application
         android:label="题路"
         android:name="${applicationName}"

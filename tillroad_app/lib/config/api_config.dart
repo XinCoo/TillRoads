@@ -25,11 +25,42 @@ const String kDemoUserId = '11111111-1111-4111-8111-111111111111';
 /// API base URL. Override for deployment with `--dart-define=API_BASE_URL=...`.
 const String kRailwayApiBaseUrl = 'https://tillroads-production.up.railway.app';
 
-String get kApiBaseUrl {
+/// 未清洗的原始 base URL（dart-define 优先）。
+///
+/// 为什么要清洗：`--dart-define=API_BASE_URL="https://x/"` 或手输带空格时，
+/// 引号与空格会原样进入字符串，拼出来就是 `https://x//users/...`、
+/// `"https://x"/users/...` 这类畸形 URL，报错信息里就会看到奇形字符。
+String get kApiBaseUrlRaw {
   const configured = String.fromEnvironment('API_BASE_URL');
-  if (configured.isNotEmpty) return configured;
-  return kRailwayApiBaseUrl;
+  return configured.isNotEmpty ? configured : kRailwayApiBaseUrl;
 }
+
+/// 清洗后的 base URL：去首尾空白、去引号、去尾部斜杠、校协议与 host。
+///
+/// 非法时返回 null（由调用方当成配置错误报给用户，而不是拼出一个坏 URL 去发请求）。
+String? normalizeBaseUrl(String raw) {
+  String s = raw.trim();
+  // 半角/全角引号都剥掉：dart-define 或用户复制粘贴常带
+  s = s.replaceAll('"', '').replaceAll("'", '').replaceAll('\u201C', '').replaceAll('\u201D', '').trim();
+  if (s.isEmpty) return null;
+  final Uri? uri = Uri.tryParse(s);
+  if (uri == null) return null;
+  if (uri.scheme != 'http' && uri.scheme != 'https') return null;
+  if (uri.host.isEmpty) return null;
+  // 去掉尾部斜杠（根路径本身就空），并丢掉 query/fragment——base URL 不该带这些
+  String path = uri.path;
+  while (path.endsWith('/')) {
+    path = path.substring(0, path.length - 1);
+  }
+  return uri.replace(path: path, query: null, fragment: null).toString();
+}
+
+/// 实际使用的 base URL（已清洗）。恒不以 `/` 结尾，可直接 `'$kApiBaseUrl$path'`。
+///
+/// 清洗失败时保留原始值，让请求处抛出带原文的配置错误（便于用户自查），
+/// 而不是静默回落到官方地址连出一个「不该成功却成功」的结果。
+String get kApiBaseUrl => normalizeBaseUrl(kApiBaseUrlRaw) ?? kApiBaseUrlRaw.trim();
+
 
 /// API token supplied at build/run time, or entered once on first launch.
 const String kApiTokenFromDefine = String.fromEnvironment('API_TOKEN');

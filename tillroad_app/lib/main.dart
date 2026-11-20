@@ -1,9 +1,15 @@
 import 'dart:async';
+import 'dart:ui' show PlatformDispatcher;
 
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/foundation.dart'
+    show FlutterError, FlutterErrorDetails, FlutterExceptionHandler;
 
 import 'api/api_client.dart' show ApiClient;
 import 'config/api_config.dart';
+import 'config/app_info.dart';
+import 'logging/app_logger.dart';
+import 'logging/nav_observer.dart';
 import 'pages/defects_page.dart';
 import 'pages/home_page.dart';
 import 'pages/mock_page.dart';
@@ -11,14 +17,55 @@ import 'pages/review_page.dart';
 import 'pages/verify_page.dart';
 import 'pages/api_token_page.dart';
 import 'theme/app_theme.dart';
-
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initializeApiToken();
+  // 日志初始化要尽可能早：越早接上，越不容易丢掉启动阶段的异常。
+  await AppLogger.instance.init();
+  _installErrorHandlers();
   if (!kUseMock) {
     unawaited(_prewarm());
   }
   runApp(const TillRoadApp());
+  AppLogger.instance.info(
+    'APP',
+    '启动 $kAppName v$kAppVersion（API=$kApiBaseUrl，mock=$kUseMock）',
+  );
+}
+
+/// 全局异常捕获（任务 B1）。
+///
+/// 两条链路必须都接：
+///   - `FlutterError.onError`：框架内部的构建/布局/绘制异常（脏 ``Widget``、越界等）；
+///   - `PlatformDispatcher.instance.onError`：**异步未捕获异常**（Future 里 `throw` 而
+///     没人 `catch`），这类异常不会进入 `FlutterError`，release 包里表现就是「点了没反应」。
+///
+/// 「保留默认行为」的具体含义：
+///   - debug：仍然 `FlutterError.presentError` 打红字，否则开发期看不到；
+///   - release：**不**调 presentError（它只写控制台），也绝不弹框——我们的日志已经落盘，
+///     用户可一键导出，比红屏有用得多。
+void _installErrorHandlers() {
+  final FlutterExceptionHandler? original = FlutterError.onError;
+  FlutterError.onError = (FlutterErrorDetails details) {
+    AppLogger.instance.error(
+      'FLUTTER',
+      details.exceptionAsString(),
+      stackTrace: details.stack?.toString() ??
+          details.context?.toString(),
+    );
+    // debug 下继续走框架默认输出（红屏/控制台），release 下安静记日志。
+    original?.call(details);
+  };
+
+  PlatformDispatcher.instance.onError = (Object error, StackTrace stack) {
+    AppLogger.instance.error(
+      'ASYNC',
+      error.toString(),
+      stackTrace: stack.toString(),
+    );
+    // 返回 true 表示「已处理」：不会再被引擎当成未捕获异常上抛（release 下会静默）。
+    return true;
+  };
 }
 
 /// 预热后端连接：只发一次轻量请求，结果完全忽略。
@@ -144,6 +191,11 @@ class _RootTabsState extends State<RootTabs> {
         // 每个 Tab 一个独立的 CupertinoTabView（各自持有 Navigator），
         // 这样切换 Tab 不会丢失各页的滚动位置与导航栈。
         return CupertinoTabView(
+          // 每个 Tab 的 Navigator 都挂一个观察者：底部切 Tab 不会重建 Navigator，
+          // 但 push 详情页大多发生在单个 Tab 栈内，挂在这里就能覆盖。
+          navigatorObservers: <NavigatorObserver>[
+            LoggingNavigatorObserver(),
+          ],
           builder: (BuildContext context) {
             switch (index) {
               case 0:

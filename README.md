@@ -801,6 +801,26 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 **一个真机才暴露的按钮 bug（已修，影响面不止本页）**：`lib/widgets/common.dart` 的 `EmptyState` 里 `CupertinoButton` 只给了 `color: AppColors.accent`，没给 `foregroundColor`。Flutter 的 plain 按钮样式在传了 `color` 之后，文字仍然取主题 `primaryColor`（= 同一个 accent），于是**蓝底蓝字**——截图里空态按钮看起来是个空蓝块（`D:\DSH\flutter\packages\flutter\lib\src\cupertino\button.dart:501-505` 的 `textStyle.copyWith(color: effectiveForegroundColor)`，`:474` 的 `backgroundColor` 才用 `widget.color`）。修法是显式 `foregroundColor: CupertinoColors.white`。这个组件被 FE-01 起的多个页面共用，属于顺带修掉的存量 bug。
 
 **动效**：周期类型切换用 `AnimatedContainer(250ms, easeInOut)`；六块卡片用 `_StaggeredFadeIn`（每块延迟 `45 * index` ms 后 `260ms` 淡入）；`disableAnimations` 为 true 时直接显示终态，不做延迟与淡入。
+
+#### 运行日志导出（用户侧排障）
+
+App 给外部测试用户后拿不到 adb logcat，所以自带一份「可导出、已脱敏」的运行日志。入口在首页导航栏右上角的文档图标（`lib/widgets/log_export_sheet.dart`），点开是 `CupertinoActionSheet`：导出日志 / 清空日志 / 取消。
+
+| 文件 | 职责 |
+|---|---|
+| `lib/logging/app_logger.dart` | 单例 `AppLogger`（debug/info/warn/error）+ 500 条环形缓冲 + **写缓冲区之前**的脱敏 |
+| `lib/logging/log_file_writer.dart` | 按天滚动 `app-YYYY-MM-DD.log`、保留 3 天、总量超 5MB 删最旧（当天文件永不删） |
+| `lib/logging/log_export.dart` | 内存缓冲 + 近 3 天文件 + 设备信息头 → 单个 `.txt`，返回 `LogExportResult` |
+| `lib/logging/nav_observer.dart` | `LoggingNavigatorObserver` 记录 `[NAV] push X ← Y`，替代逐处改 push |
+| `lib/config/app_info.dart` | `kAppName` / `kAppVersion`（与 pubspec 手工同步，不引 `package_info_plus`） |
+
+**脱敏是在 `AppLogger._write()` 里做的，而不是在导出时**——顺序是「先 `sanitizeLogText()`，再构造 `LogEntry`」，所以内存缓冲里也不存在原文（任务 C4）。四条规则：`Bearer <token>` → `Bearer ***`；裸 `tk_xxx` → `***`；UUID → 前 4 位 + `****`（`11111111-1111-4111-8111-111111111111` → `1111****`）；URL query 里的 `token=/access_token=/api_key=/password=` → `***`（任务书没点名，但 URL 要落盘，顺手堵上）。
+
+**埋点位置**：`main.dart` 的 `FlutterError.onError`（保留原 handler，所以 debug 仍打印）+ `PlatformDispatcher.instance.onError`；`api_client.dart` 的 `_send()` 一处覆盖全部端点——请求前 `[API] GET /path`、2xx `[API] GET /path 200 OK 342ms`、非 2xx `... 500 ERROR 1200ms code=... body=...`（body 截 200 字符，避免题干进日志）、网络/超时 `... 网络失败 95ms：...`。`diagnose()` 的结果也记一条 `[DIAG]`。
+
+**新增依赖只有 `share_plus`**（实际解析到 13.3.1）：`SharePlus.instance.share(ShareParams(files: [XFile(path)]))` 调系统分享面板。注意 `path_provider` 只是它的传递依赖，**代码里不直接 import**，日志目录用 `Directory.systemTemp`（Android 上即应用私有 cache）。
+
+日志文件位置（Android）：`/data/data/<pkg>/code_cache/tillroad/logs/`，导出文件在同级 `export/`，分享时由 share_plus 复制到 `cache/share_plus/`。
 ---
 
 ## 部署到 Railway
@@ -837,6 +857,32 @@ flutter build apk --release --dart-define=API_BASE_URL=https://tillroads-product
 
 不提供 `API_TOKEN` 时，App 首次启动会显示 Token 输入页，并使用 `shared_preferences` 保存在本机；编译期 Token 优先于本地保存值。APK 输出路径为 `tillroad_app/build/app/outputs/flutter-apk/app-release.apk`。部署完成后应确认 `/health` 返回 200、无 Token 返回 401、正确 Token 返回自己的数据，另一个 Token 可以返回其用户的空列表。
 
+### ⚠️ Release APK 的联网权限与连接诊断
+
+**`android/app/src/main/AndroidManifest.xml` 必须声明 `android.permission.INTERNET`。**
+Flutter 模板只在 `src/debug/` 和 `src/profile/` 的 manifest 里加这个权限（供热重载用），`src/main/` 里没有 ——
+于是 **debug 包能联网、release 包不能**。缺失时 Android 会把 DNS 解析直接判失败，报：
+
+```
+ClientException with SocketException: Failed host lookup: 'xxx' 
+(OS Error: No address associated with hostname, errno = 7)
+```
+
+排查时先看合并后的清单，而不是源文件：
+
+```powershell
+Select-String -Path tillroad_app\build\app\intermediates\merged_manifest\release\processReleaseMainManifest\AndroidManifest.xml -Pattern 'uses-permission'
+# 必须有 <uses-permission android:name="android.permission.INTERNET" />
+```
+
+**内建诊断入口**：首页导航栏右上角的 Wi-Fi 图标（`lib/widgets/diagnose_dialog.dart`）会打一次 `GET /health`，
+把失败分档为「配置错误 / DNS 解析失败 / HTTPS 握手失败 / 请求超时 / HTTP 异常 / 网络不可达 / 通过」，
+并显示实际请求 URL、状态码与原始错误。release 包没法抓 logcat 时，这个弹窗截图就能定位问题层。
+
+**base URL 会做清洗**（`lib/config/api_config.dart` 的 `normalizeBaseUrl`）：去首尾空白、去半/全角引号、
+去尾部所有斜杠、校验协议与 host。URL 拼接用 `buildApiUri`（`lib/api/api_client.dart`）折叠重复斜杠，
+但**保留** base 自带路径（如 `https://h/api` → `https://h/api/users`），所以将来把后端挂到子路径也不会静默走错。
+
 
 ## 6. 当前里程碑与后续
 - ✅ 文档评审 + 4 项 P0 / 4 项 P1 修订（详见 [REVIEW-NOTES.md](<REVIEW-NOTES.md>)）
@@ -862,7 +908,9 @@ flutter build apk --release --dart-define=API_BASE_URL=https://tillroads-product
 - ✅ **FE-05**：限时模考页（组卷 → 答题 → 交卷 → 报告 → V3 引导）：前端新增 `api/mock_api.dart`（13 个数据类 + 5 方法）与三个新页 + `mock_page.dart` 整份重写为「我的模考」列表，首页「开始模考」快捷入口接上；答题页用**绝对截止时间**+`Timer.periodic(1s)` 避免 tick 累积误差，剩余 ≤60s 变红闪烁、归零自动交卷；报告页四块卡（总分/模块正确率横条/平均用时/稳定性与缺陷重复率）+ V3 候选区（点某条先拉缺陷详情再复用 `DefectVerifyPage`，V3 验证方式由后端白名单限定为「限时模考」）；修掉两个真机才暴露的导航栏遮挡 bug（`CupertinoPageScaffold` 仅在半透明时不给 child 加 padding）；Android 17 模拟器 + Neon 真跑通全链路（含 1 分钟限时的自动交卷），11 张截图留证
 - ✅ **FE-06**：复盘页（日/周/月生成与查看 + 六项 metrics）：前端新增 `api/review_api.dart`（7 个数据类 + `ReviewCycleType` 枚举 + 5 方法）与两个新页 + `review_page.dart` 从空状态重写为列表，首页「复盘」快捷入口改为切 Tab 4；列表页一次拉全量再本地按 chip 过滤（切 chip 不等网络 + 能区分两种空态），生成走 `CupertinoActionSheet` 且不传 `period` 让后端算当前周期，同周期重复生成把 `409 ALREADY_EXISTS` 的 `existing_id` 接成「查看已有」直达；详情页六块卡全部纯 Widget 手绘（七态堆叠条 / 横条 / 双竖柱 / 8px 进度条），底部「标记已读 → 删除复盘」状态化操作区；**顺手修掉 BE-05 遗留的报告 `title` 恒 null**（`reportGenerator` 改读 `q.knowledge_node_title ?? q.title`，新增 `T6b` 单测）与 `EmptyState` 蓝底蓝字按钮；Android 17 模拟器 + Neon 真跑通「生成 → 列表 → 详情 → 标记已读 → 删除 → 空态」全链路及 409 场景，10 张截图留证
 - ⏳ **下一批**：FE-02 建题/导入页 → FE-11 审核七态 UI → BE-07 缺陷分布看板 / BE-08 同步服务 → 补 Flutter 工具链后移植 Dart / 接入 NestJS（FE-06 完成后前端 MVP 页面已全部到位：FE-01/03/04/05/06/07）
-- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两节点）；②CORS 的 `*` 生产前收窄为白名单；③补 userId 鉴权；④Neon 空闲回收连接时 `pg` 池会冒未监听 `error` 事件杀进程（已在 `scripts/dev-start.mjs` 绑 `pool.on('error')` 兜住，生产需同类防护）；⑤前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容
+- ✅ **FE 网络修复**：release APK 连不上 Railway（`Failed host lookup / errno 7`）→ 根因是 `src/main/AndroidManifest.xml` 缺 `INTERNET` 权限（模板只在 debug/profile 里声明）；一并做 base URL 清洗（`normalizeBaseUrl`，剥引号/尾斜杠/校协议）+ 安全拼接（`buildApiUri`，不用 `Uri.resolve` 以保留 base 子路径）+ 首页导航栏「连接诊断」入口（`diagnose()` 分七档）；release APK 51,884,906 B，真机验证缺陷分布拿到真实数据、诊断弹窗显示「通过 / 1449ms / 200」；截图 `fe-net-home.png`、`fe-net-diagnose.png`
+- ✅ **运行日志导出**：外部测试用户拿不到 adb logcat，所以 App 自带「可导出、已脱敏」日志：`lib/logging/app_logger.dart`（500 条环形缓冲 + **写缓冲区之前**脱敏）+ `log_file_writer.dart`（按天滚动 / 保留 3 天 / 总量超 5MB 删最旧）+ `log_export.dart`（内存 + 近 3 天文件 + 设备头 → 单个 `.txt`）+ `nav_observer.dart`；首页导航栏文档图标 → `CupertinoActionSheet`（导出 / 清空 / 取消）→ 确认弹窗 → `share_plus` 系统分享面板；`main.dart` 接 `FlutterError.onError` + `PlatformDispatcher.onError`，`api_client._send()` 一处覆盖全部端点；唯一新增依赖 `share_plus`；真机验证联网成功日志、断网 error 日志（`SocketException ... errno = 7`）与导出文件（无 `tk_test_`、无完整 UUID）；截图 `fe-log-entry.png`、`fe-log-share.png`
+- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
 
 ---
