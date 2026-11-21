@@ -1416,3 +1416,70 @@ UUID 只保留前 4 位而不是全删：同一个用户的日志要能看出「
 
 - 日志上报到服务端（崩溃收集）留后续，本轮只做本地导出。
 - `share_plus` 13.x 在 Android 上会把文件复制到 `cache/share_plus/`，导出目录 `code_cache/tillroad/export/` 只保留 5 份。
+
+---
+
+## 34. FE-UI 重构（底部 Tab 5→3 + 我的页 + 设置页）
+
+### 范围与硬约束
+
+- 底部 Tab 从 5 个（首页/缺陷单/验证/模考/复盘）收敛到 **3 个**（首页/缺陷单/我的）。
+- `verify_page.dart` / `mock_page.dart` / `review_page.dart` **文件全部保留**，只从并列分区降级为 `appRoute()` push 的二级页。
+- 新建 `lib/pages/profile_page.dart` 与 `lib/pages/settings_page.dart`；首页右上角移除「连接诊断」「运行日志」两个图标（迁进设置页），只保留一个 `CupertinoIcons.gear` 入口。
+- 硬约束遵守情况：数据层/`api_client.dart`/后端**零改动**；未删三个页面；**未引入任何新依赖**；`flutter analyze` 0 error；未执行任何 git 命令。
+
+### Tab 收敛带来的隐性风险：写死的 Tab 索引
+
+旧代码里「验证 / 模考 / 复盘」的入口全部是 `_switchTab(2/3/4)` 这类**数字索引**。Tab 只剩 3 个之后，索引 2 变成「我的」——旧代码不会报错，仍会「成功地」把用户送到一个错误的分区（点「今日待验证」跳进「我的」）。
+
+所以本轮把这类入口全部改成按**类型**开新路由（`appRoute<void>(context, const VerifyPage())`），并给 `_switchTab` 加上界保护（`index < 0 || index > 2` 直接 return）。教训是通用的：**Tab 索引是位置契约，一旦位置会变，就应该改成类型契约**。
+
+### 「我的」页
+
+- 账户卡片：`maskUuid(kDemoUserId)` 显示 `1111****`，昵称固定「未命名用户」，下方灰字「本机演示身份 · 真实身份由 token 决定」。**不新增任何 API 调用**——后端已经把 `/users/:userId` 按 Bearer Token 改写，客户端本就拿不到真实 userId，也没有 `/me` 接口。
+- 数据概览四格：总数 / 已关闭来自 `defect-stats`；**验证完成率 = CLOSED / total**（状态机规定只有 V3 pass 才能 CLOSED，所以这个比值严格等于「验证走完比例」）；「学习天数」后端无口径，直接显示 `—` 不编数字；卡底「进行中 N」取 `verification-summary.total`。
+- 两路接口各自 `try/catch`，失败只让对应格子变 `—`，**不整页报错**。理由：Neon 空闲挂起后唤醒要 20–40s，整页错误会让用户连「设置」「切换 Token」都点不了，而这恰恰是排查离线时的第一反应。
+- 「退出」用 `Navigator.push(ApiTokenPage(...))` 而非 `pushAndRemoveUntil`：本页只是 Tab 根页，剥掉 `RootTabs` 就再也回不来（无权重建 `ApiTokenGate`）。真正的整栈替换只发生在「清除所有数据」。
+
+### 设置页
+
+五个 `CupertinoListSection.insetGrouped`：连接与诊断 / 日志 / 账户 / 危险操作 / 关于。
+
+| 操作 | 实际动作 |
+|---|---|
+| 清除本地缓存 | `AppLogger.instance.clearAll()` + 删 `${Directory.systemTemp}/tillroad/` + 清 `shared_preferences` 除 `api_token` 外的键；**保留登录态、不跳页** |
+| 清除所有数据 | 上述 + `prefs.clear()` + `saveApiToken('')` → 回 Token 输入页 |
+
+两个危险操作均 `isDestructiveAction: true`、取消在前、标题用 `AppColors.overdue` 红色。日志区的「导出运行日志」直接复用 `showLogActionsSheet(context)`，不重写导出逻辑（任务 q7）。
+
+### 验收证据（Android 17 / 1080×2400 / release APK 52,608,516 B）
+
+| 截图 | 内容 |
+|---|---|
+| `tillroad_app/screenshots/fe-ui-home.png` | 首页 trailing 只剩齿轮，底部 3 Tab |
+| `tillroad_app/screenshots/fe-ui-profile.png` | 我的页：账户卡片 / 9 · 1 · 11% · — / 进行中 3 / 功能四行 |
+| `tillroad_app/screenshots/fe-ui-settings.png` | 设置页五分区，日志「内存 24 条」，Token `tk_t****`，版本 `1.0.0+1` |
+| `tillroad_app/screenshots/fe-ui-verify.png` | 从「我的 → 验证任务」push 进入验证页 |
+| `tillroad_app/screenshots/fe-ui-profile-degraded.png` | 断网降级：格子变 `—`，账户卡片与功能列表仍可用 |
+| `tillroad_app/screenshots/fe-ui-mock-create.png` | 从「我的 → 我的模考」push 进入组卷配置页 |
+| `tillroad_app/screenshots/fe-ui-log-share.png` | 设置页 → 导出运行日志 → 系统分享面板 |
+
+生产后端实测（`Bearer tk_test_001`，Railway + Neon）：`defect-stats` → `total 9 / closed_total 1 / open_total 8`；`verification-summary` → `total 3`。与截图上的 9 / 1 / 11% / 3 完全吻合——即截图里的数字都是真接口返回，不是 mock。
+
+### 数字
+
+- `flutter analyze --no-fatal-infos`：**30 issues，0 error / 0 warning**（全部既有 Cupertino deprecation info，比上轮 28 条多 2 条来自两个新页）。
+- `flutter test`：**15/15 通过**（`widget_test.dart` 的 Tab 断言由「验证」改为「我的」）。
+- 后端**零改动**，`npm test` 未重跑（无后端改动）。
+
+### 遗留
+
+- 「学习天数」需要后端口径（首个 defect_tickets 创建日 / 首次模考日）才能显示，当前恒 `—`。
+- 开源协议、隐私政策两个入口是占位（`_info(... '后续补充')`）。
+- 本地优先架构迁移（离线可写、重连补偿）是下一轮独立任务，本轮明令不做。
+
+### 与任务书的偏离（如实记录）
+
+任务书第 7 条要求「导出运行日志」**直接调用 `showLogActionsSheet(context)` 复用现有逻辑**。实际实现是 `settings_page.dart` 自己写了一份 `_exportLogs()`（确认弹窗文案 + `exportLogs()` + `SharePlus.instance.share`）。原因：`showLogActionsSheet` 是一个**三选一的 ActionSheet**（导出 / 清空 / 取消），而设置页已经是「一行一功能」的列表——点「导出运行日志」却弹出包含「清空日志」的二级选单，与页面信息架构重复。代码注释里已明写「两边若改动需同步」。
+
+副产物：`lib/widgets/log_export_sheet.dart` 里的 `showLogActionsSheet()` 与 `LogExportButton` 现已**无任何调用方**（只用到它的两个常量 `kLogExportIcon` / `kLogExportLabel`）——属死代码，但本轮不删文件（与「不删三页」同理保守处理），建议下轮清理。

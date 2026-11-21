@@ -12,9 +12,7 @@ import 'logging/app_logger.dart';
 import 'logging/nav_observer.dart';
 import 'pages/defects_page.dart';
 import 'pages/home_page.dart';
-import 'pages/mock_page.dart';
-import 'pages/review_page.dart';
-import 'pages/verify_page.dart';
+import 'pages/profile_page.dart';
 import 'pages/api_token_page.dart';
 import 'theme/app_theme.dart';
 Future<void> main() async {
@@ -123,9 +121,11 @@ class _ApiTokenGateState extends State<ApiTokenGate> {
   }
 }
 
-/// 底部五个 Tab 的容器
+/// 底部三个 Tab 的容器（首页 / 缺陷单 / 我的）
 ///
-/// 用 `CupertinoTabScaffold` + `CupertinoTabBar`，
+/// FE-UI 重构：原来是五个 Tab（首页 / 缺陷单 / 验证 / 模考 / 复盘）。
+/// 收敛成三个后，「验证 / 模考 / 复盘」不再是并列分区，而是从「我的」页
+/// 或首页快捷入口按需 push 的**二级页**（文件均保留，未删）。
 /// 而不是 Material 的 `BottomNavigationBar`：前者是 iOS 原生的
 /// 标签栏行为（无 ripple、图标与文字垂直居中、选中态用主色而非高亮块）。
 ///
@@ -148,10 +148,14 @@ class _RootTabsState extends State<RootTabs> {
     super.dispose();
   }
 
-  /// 供首页快捷入口调用。用 `animateTo` 而不是直接改 `index`，
-  /// 这样标签栏的高亮有个短过渡，与 iOS 行为一致。
+  /// 供首页快捷入口调用（目前只有「转缺陷单」用，切到索引 1）。
+  ///
+  /// 直接改 `_controller.index`：
+  ///   · 不用 `animateTo` —— `CupertinoTabController` 只有 `index` setter，
+  ///     `TabController.animateTo` 是 Material 的 API，这里没有；
+  ///   · 上界跟着 Tab 数量走（现为 3），写死 4 会在缩减 Tab 后悄悄失效。
   void _switchTab(int index) {
-    if (index < 0 || index > 4) return;
+    if (index < 0 || index > 2) return;
     _controller.index = index;
   }
 
@@ -174,16 +178,8 @@ class _RootTabsState extends State<RootTabs> {
             label: '缺陷单',
           ),
           BottomNavigationBarItem(
-            icon: Icon(CupertinoIcons.check_mark_circled),
-            label: '验证',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(CupertinoIcons.timer),
-            label: '模考',
-          ),
-          BottomNavigationBarItem(
-            icon: Icon(CupertinoIcons.chart_bar),
-            label: '复盘',
+            icon: Icon(CupertinoIcons.person),
+            label: '我的',
           ),
         ],
       ),
@@ -203,11 +199,7 @@ class _RootTabsState extends State<RootTabs> {
               case 1:
                 return const DefectsPage();
               case 2:
-                return const VerifyPage();
-              case 3:
-                return const MockPage();
-              case 4:
-                return const ReviewPage();
+                return const ProfilePage();
               default:
                 return HomePage(onSwitchTab: _switchTab);
             }

@@ -638,10 +638,10 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 
 ### 目录与依赖
 
-- `tillroad_app/lib/` 18 个 dart 文件：`main.dart` / `theme/app_theme.dart` / `mock/` 2 个（`home_mock`、`defects_mock`）/ `pages/` 6 个 / `widgets/` 8 个。
-- 运行时依赖只有 `cupertino_icons`；dev 依赖 `flutter_lints` + `flutter_launcher_icons`。**无状态管理库、无网络库、无路由库、无图表库**。
+- `tillroad_app/lib/` 42 个 dart 文件：`main.dart` / `theme/` 1 / `config/` 2（`api_config`、`app_info`）/ `mock/` 2（`home_mock`、`defects_mock`）/ `api/` 5 / `logging/` 4 / `pages/` 16 / `widgets/` 11。
+- 运行时依赖 `cupertino_icons` + `http` + `shared_preferences` + `share_plus`；dev 依赖 `flutter_lints` + `flutter_launcher_icons`。**无状态管理库、无路由库、无图表库**。
 - 兼容平台：`android` / `ios` / `windows`（Windows 仅为本机开发期验证用，交付目标是移动端）。
-- 已知 `flutter analyze` 输出：**0 error / 0 warning / 12 info**，12 条全是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「只加 cupertino_icons」的约束冲突。
+- 已知 `flutter analyze` 输出：**0 error / 0 warning / 30 info**，30 条全是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「纯 Cupertino」的约束冲突。
 
 ### 缺陷单界面（FE-03）
 
@@ -804,7 +804,7 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 
 #### 运行日志导出（用户侧排障）
 
-App 给外部测试用户后拿不到 adb logcat，所以自带一份「可导出、已脱敏」的运行日志。入口在首页导航栏右上角的文档图标（`lib/widgets/log_export_sheet.dart`），点开是 `CupertinoActionSheet`：导出日志 / 清空日志 / 取消。
+App 给外部测试用户后拿不到 adb logcat，所以自带一份「可导出、已脱敏」的运行日志。入口在**设置页 → 日志 → 导出运行日志**（FE-UI 重构前是首页导航栏右上角的文档图标，现在两个调试入口都收进设置页）。
 
 | 文件 | 职责 |
 |---|---|
@@ -821,6 +821,34 @@ App 给外部测试用户后拿不到 adb logcat，所以自带一份「可导�
 **新增依赖只有 `share_plus`**（实际解析到 13.3.1）：`SharePlus.instance.share(ShareParams(files: [XFile(path)]))` 调系统分享面板。注意 `path_provider` 只是它的传递依赖，**代码里不直接 import**，日志目录用 `Directory.systemTemp`（Android 上即应用私有 cache）。
 
 日志文件位置（Android）：`/data/data/<pkg>/code_cache/tillroad/logs/`，导出文件在同级 `export/`，分享时由 share_plus 复制到 `cache/share_plus/`。
+
+#### 底部 Tab 收敛与「我的 / 设置」（FE-UI 重构）
+
+底部导航从 **5 个 Tab 收敛到 3 个**（首页 / 缺陷单 / 我的）。验证、模考、复盘三个页面 **文件全部保留**，只是不再是并列分区，而是从「我的」页或首页快捷入口按需 `appRoute()` push 的二级页。
+
+| 文件 | 职责 |
+|---|---|
+| `lib/main.dart` | `RootTabs`：3 个 `BottomNavigationBarItem`，`_switchTab` 上界跟着数量走（`index > 2` 直接 return） |
+| `lib/pages/profile_page.dart` | 「我的」：账户卡片（`maskUuid` 脱敏 ID + 切换 Token / 退出）+ 数据概览四格 + 功能列表四入口 |
+| `lib/pages/settings_page.dart` | 设置：连接与诊断 / 日志 / 账户 / 危险操作 / 关于 五个 `CupertinoListSection` |
+| `lib/pages/home_page.dart` | 右上角 trailing 从「诊断 + 日志」两个图标改为单个 `CupertinoIcons.gear` → push 设置页 |
+
+**为什么全部改 push 而不再切 Tab**：只剩 3 个 Tab 时「验证 / 模考 / 复盘」没有对应索引（旧代码写死 verify=2 / mock=3 / review=4）。继续用切 Tab 语义，一旦 Tab 数量变化，这些写死的索引会**静默指到别的页面**——现在索引 2 已经是「我的」，点「今日待验证」会把用户送到错误的分区。改 `appRoute()` push 后，导航意图用**类型**表达（`VerifyPage()`），不依赖任何数字。
+
+**数据概览四格的口径**：总数与已关闭来自 `GET /users/:userId/defect-stats`（`total` / `by_status.CLOSED`）；**验证完成率 = CLOSED / total**——状态机规定只有 V3 pass 才能进 CLOSED，所以这个比值就是严格意义上的「验证走完比例」；「进行中 N」来自 `verification-summary.total`。「学习天数」后端没有该统计口径，直接显示 `—`（不编数字）。
+
+**逐项降级，不整页报错**：两路接口各自 `try/catch`，失败只让对应格子变成 `—`。理由与首页一致：Neon 免费版空闲会挂起，唤醒要 20–40s；若一个请求超时就整页变错误页，用户连「设置」「切换 Token」都点不了——而这恰恰是排查离线时的第一反应。账户卡片与功能列表完全不依赖网络，无条件可用。
+
+**设置页的两个危险操作**（均 `isDestructiveAction: true`、取消在前、标题用 `AppColors.overdue` 红色）：
+
+| 操作 | 实际动作 |
+|---|---|
+| 清除本地缓存 | `AppLogger.instance.clearAll()` + 删 `${Directory.systemTemp}/tillroad/` + 清 `shared_preferences` 中除 `api_token` 外的键；**保留登录态、不跳页** |
+| 清除所有数据 | 上述 + `prefs.clear()` + `saveApiToken('')`（清掉进程内副本）→ 经 `onSessionCleared` 或 rootNavigator `pushAndRemoveUntil` 回 Token 输入页 |
+
+**「退出」为什么用 push 而不是 pushAndRemoveUntil**：本页只是 Tab 的根页，把 `RootTabs` 从根 Navigator 上剥掉之后就再也回不来（本页无权重建 `ApiTokenGate`）。push 到 Token 页、保存后 `pop` 回本页，与「换一个凭证继续用」的预期一致。真正的整栈替换只发生在「清除所有数据」，那时确实需要重新走一遍启动门。
+
+**账户卡片的 ID 为什么是脱敏的**：后端已经把 `/users/:userId` 路径参数按 Bearer Token 改写成对应 user，客户端本来就拿不到也不应展示真实 userId，且无 `/me` 接口。所以直接用 `maskUuid(kDemoUserId)`（复用 `lib/logging/app_logger.dart`）显示 `1111****`，下方 12px 灰字「本机演示身份 · 真实身份由 token 决定」，**不新增任何 API 调用**。
 ---
 
 ## 部署到 Railway
@@ -910,7 +938,8 @@ Select-String -Path tillroad_app\build\app\intermediates\merged_manifest\release
 - ⏳ **下一批**：FE-02 建题/导入页 → FE-11 审核七态 UI → BE-07 缺陷分布看板 / BE-08 同步服务 → 补 Flutter 工具链后移植 Dart / 接入 NestJS（FE-06 完成后前端 MVP 页面已全部到位：FE-01/03/04/05/06/07）
 - ✅ **FE 网络修复**：release APK 连不上 Railway（`Failed host lookup / errno 7`）→ 根因是 `src/main/AndroidManifest.xml` 缺 `INTERNET` 权限（模板只在 debug/profile 里声明）；一并做 base URL 清洗（`normalizeBaseUrl`，剥引号/尾斜杠/校协议）+ 安全拼接（`buildApiUri`，不用 `Uri.resolve` 以保留 base 子路径）+ 首页导航栏「连接诊断」入口（`diagnose()` 分七档）；release APK 51,884,906 B，真机验证缺陷分布拿到真实数据、诊断弹窗显示「通过 / 1449ms / 200」；截图 `fe-net-home.png`、`fe-net-diagnose.png`
 - ✅ **运行日志导出**：外部测试用户拿不到 adb logcat，所以 App 自带「可导出、已脱敏」日志：`lib/logging/app_logger.dart`（500 条环形缓冲 + **写缓冲区之前**脱敏）+ `log_file_writer.dart`（按天滚动 / 保留 3 天 / 总量超 5MB 删最旧）+ `log_export.dart`（内存 + 近 3 天文件 + 设备头 → 单个 `.txt`）+ `nav_observer.dart`；首页导航栏文档图标 → `CupertinoActionSheet`（导出 / 清空 / 取消）→ 确认弹窗 → `share_plus` 系统分享面板；`main.dart` 接 `FlutterError.onError` + `PlatformDispatcher.onError`，`api_client._send()` 一处覆盖全部端点；唯一新增依赖 `share_plus`；真机验证联网成功日志、断网 error 日志（`SocketException ... errno = 7`）与导出文件（无 `tk_test_`、无完整 UUID）；截图 `fe-log-entry.png`、`fe-log-share.png`
-- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）
+- ✅ **FE-UI 重构**：底部 Tab 从 5 个收敛到 **3 个**（首页 / 缺陷单 / 我的），验证·模考·复盘三页**文件全部保留**、降为 `appRoute()` push 的二级页；新建 `lib/pages/profile_page.dart`（账户卡片 `maskUuid` 脱敏 ID + 数据概览四格 + 功能四入口）与 `lib/pages/settings_page.dart`（连接与诊断 / 日志 / 账户 / 危险操作 / 关于 五分区）；首页 trailing 由「诊断 + 日志」两图标改为单个齿轮 → 设置页；所有旧 `_switchTab(2/3/4)` 写死索引改为按类型 push（否则索引 2 现在是「我的」，点「今日待验证」会静默跳到错误分区）；数据层 / `api_client.dart` / 后端**零改动、零新依赖**；`flutter analyze` 30 info / **0 error / 0 warning**，`flutter test` **15/15**；Android 17 真机 7 张截图（含断网降级态），数据概览 9 / 1 / 11% / 进行中 3 与生产接口返回完全吻合
+- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两个节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
 
 ---

@@ -10,14 +10,15 @@ import '../config/api_config.dart';
 import '../mock/home_mock.dart';
 import '../pages/defect_create_page.dart';
 import '../pages/mock_create_page.dart';
+import '../pages/review_page.dart';
+import '../pages/settings_page.dart';
+import '../pages/verify_page.dart';
 import '../theme/app_theme.dart';
 import '../widgets/countdown_card.dart';
-import '../widgets/diagnose_dialog.dart';
 import '../widgets/defect_summary_card.dart';
 import '../widgets/common.dart';
 import '../widgets/quick_action_grid.dart';
 import '../widgets/task_card.dart';
-import '../widgets/log_export_sheet.dart';
 
 /// 首页看板（FE-01 的核心页面，FE-07 完成数据联调）
 ///
@@ -230,13 +231,17 @@ class _HomePageState extends State<HomePage> {
     );
   }
 
+  /// 「今日待验证」摘要位点击 → push 验证任务页。
+  ///
+  /// Tab 从 5 个瘦成 3 个后，验证不再是 Tab 之一（旧代码里固定切索引 2，
+  /// 而现在索引 2 是「我的」）——继续用切 Tab 会把用户送到错误页面，
+  /// 所以一律改 push，导航意图不再依赖数字索引。
+  void _openVerify() {
+    Navigator.of(context).push<void>(appRoute<void>(context, const VerifyPage()));
+  }
+
   void _onTapTask(VerificationTask task) {
-    // 首页任务列表是摘要位，点进去切到「验证」Tab 看完整列表
-    if (widget.onSwitchTab != null) {
-      widget.onSwitchTab!(2);
-    } else {
-      _toast('验证 · ${task.knowledgeNodeTitle}', '完整验证任务列表在「验证」标签页。');
-    }
+    _openVerify();
   }
 
   // ─────────────────────────── 倒计时 ───────────────────────────
@@ -503,17 +508,18 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// 「复盘」：切到底部第 5 个标签（复盘 Tab）。
+  /// 「复盘」：push 复盘页。
   ///
-  /// 用切 Tab 而不是 push 新页：复盘是五分区之一，push 会造出「Tab 里还套着
-  /// 一个复盘页」的双层栈，返回手势会把用户弹回首页而不是留在复盘列表。
+  /// 以前是切到第 5 个 Tab。Tab 瘦成 3 个后复盘不再是分区之一，
+  /// 切 Tab 已不可能，改 push（复盘页内部自带列表→详情的二级栈，
+  /// 返回手势会逐层退，不会把用户直接弹回首页）。
   void _openReview() {
-    final ValueChanged<int>? switchTab = widget.onSwitchTab;
-    if (switchTab != null) {
-      switchTab(4);
-    } else {
-      _toast('复盘', '请在底部标签栏切到「复盘」。');
-    }
+    Navigator.of(context).push<void>(appRoute<void>(context, const ReviewPage()));
+  }
+
+  /// 「设置」：push 设置页（原来在 trailing 里的诊断/日志入口已收进此页）。
+  void _openSettings() {
+    Navigator.of(context).push<void>(appRoute<void>(context, const SettingsPage()));
   }
 
   /// 「开始模考」：直接进组卷配置页（考试目标 / 模式 / 范围 / 题量 / 限时）。
@@ -557,28 +563,18 @@ class _HomePageState extends State<HomePage> {
             border: const Border(
               bottom: BorderSide(color: AppColors.separator, width: 0.5),
             ),
-            // 右上角两个入口：
-            //   ① 连接诊断（Wi-Fi）：后端连不上时点一下就能看到断在哪一层；
-            //   ② 运行日志（文档）：一键导出脱敏日志发给开发者，替代连电脑抓 logcat。
-            // 两者都只用图标 —— SliverNavigationBar 的 trailing 横向空间很紧。
-            trailing: Row(
-              mainAxisSize: MainAxisSize.min,
-              children: <Widget>[
-                CupertinoButton(
-                  padding: EdgeInsets.zero,
-                  minimumSize: Size.zero,
-                  onPressed: () => showDiagnoseDialog(context),
-                  child: const Icon(
-                    kDiagnoseIcon,
-                    size: 22,
-                    color: AppColors.accent,
-                  ),
-                ),
-                const SizedBox(width: 16),
-                LogExportButton(
-                  onPressed: () => showLogActionsSheet(context),
-                ),
-              ],
+            // 右上角只留一个齿轮：连接诊断 / 导出日志 两个调试入口已迁到设置页。
+            // 首页是每天看数据的地方，不该摆排障工具；设置页里它们还能跟
+            // 「切换 Token」「清除缓存」放在一起，排查时不用来回跳。
+            trailing: CupertinoButton(
+              padding: EdgeInsets.zero,
+              minimumSize: Size.zero,
+              onPressed: _openSettings,
+              child: const Icon(
+                CupertinoIcons.gear,
+                size: 22,
+                color: AppColors.accent,
+              ),
             ),
           ),
           SliverSafeArea(

@@ -21,9 +21,8 @@ void main() {
     // 底部 Tab 全部就位
     expect(find.text('首页'), findsOneWidget);
     expect(find.text('缺陷单'), findsOneWidget);
-    expect(find.text('验证'), findsOneWidget);
-    expect(find.text('模考'), findsOneWidget);
-    expect(find.text('复盘'), findsOneWidget);
+    // FE-UI：底部只剩三个 Tab（验证/模考/复盘 改为从「我的」push）
+    expect(find.text('我的'), findsOneWidget);
 
     // 大标题（largeTitle 与折叠后 middle 各一个，故用 findsWidgets）
     expect(find.text('题路'), findsWidgets);
@@ -60,6 +59,7 @@ void main() {
     expect(find.text('建题'), findsOneWidget);
     expect(find.text('转缺陷单'), findsOneWidget);
     expect(find.text('开始模考'), findsOneWidget);
+    expect(find.text('复盘'), findsOneWidget);
   });
 
   testWidgets('切换到缺陷单 Tab 显示列表（FE-03 替换了空状态）', (
