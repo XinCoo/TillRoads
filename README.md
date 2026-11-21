@@ -638,10 +638,10 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 
 ### 目录与依赖
 
-- `tillroad_app/lib/` 51 个 dart 文件：`main.dart` / `theme/` 1 / `config/` 3（`api_config`、`app_info`、`local_config`）/ `mock/` 2（`home_mock`、`defects_mock`）/ `api/` 5 / `logging/` 4 / `local/` 3 + `local/dao/` 5 / `pages/` 16 / `widgets/` 11。
+- `tillroad_app/lib/` 56 个 dart 文件：`main.dart` / `theme/` 1 / `config/` 3（`api_config`、`app_info`、`local_config`）/ `mock/` 2（`home_mock`、`defects_mock`）/ `api/` 5 / `logging/` 4 / `local/` 13（其中 `local/dao/` 5）/ `pages/` 16 / `widgets/` 11。
 - 运行时依赖 `cupertino_icons` + `http` + `shared_preferences` + `share_plus` + `sqflite` + `path`（后两个是本地优先 R1 引入，见下节）；dev 依赖 `flutter_lints` + `flutter_launcher_icons` + `sqflite_common_ffi`（**仅测试用**，不进产物）。**无状态管理库、无路由库、无图表库、无 ORM、无 build_runner**。
 - 兼容平台：`android` / `ios` / `windows`（Windows 仅为本机开发期验证用，交付目标是移动端；**Windows 上不启用本地库**，见下节）。
-- 已知 `flutter analyze` 输出：**0 error / 0 warning / 32 info**（R1 前是 30 info，新增 2 条同为 `deprecated_member_use`）。全部 info 都是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「纯 Cupertino」的约束冲突。
+- 已知 `flutter analyze` 输出：**0 error / 0 warning / 37 info**（R1 前是 30 info，R1 新增 2 条、R2 新增 5 条，均为同一 `deprecated_member_use`）。全部 info 都是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「纯 Cupertino」的约束冲突。
 
 ### 缺陷单界面（FE-03）
 
@@ -850,35 +850,47 @@ App 给外部测试用户后拿不到 adb logcat，所以自带一份「可导�
 
 **账户卡片的 ID 为什么是脱敏的**：后端已经把 `/users/:userId` 路径参数按 Bearer Token 改写成对应 user，客户端本来就拿不到也不应展示真实 userId，且无 `/me` 接口。所以直接用 `maskUuid(kDemoUserId)`（复用 `lib/logging/app_logger.dart`）显示 `1111****`，下方 12px 灰字「本机演示身份 · 真实身份由 token 决定」，**不新增任何 API 调用**。
 
-### 本地数据库（本地优先 R1，`tillroad_app/lib/local/`）
+### 本地优先（`tillroad_app/lib/local/`）
 
-> 设计文档：`docs/local-first-design.md`（第 8 章是 R1 实现记录）。**R1 只建地基，不接页面**——App 行为与本轮之前完全一致。
-
+> 设计文档：`docs/local-first-design.md`（第 8 章 R1 实现记录，第 9 章 R2 实现记录）。**R1 只建地基**（App 行为零变化）；**R2 起四页先读本地、云端降级为后台刷新与写入通道**。
 **选型：`sqflite` 而非 Drift。** 单纯比依赖数：`sqflite` 只引入 1 个直接依赖（`path` 是它的路径依赖），Drift 要 5 个（`drift` / `drift_dev` / `build_runner` / `sqlite3_flutter_libs` / `drift_flutter`）再加一个代码生成步骤。本项目的查询只有约 15 条简单 SQL，手写映射与现有 `lib/api/*.dart` 风格一致（那里也是手写 snake_case 映射，不用 `json_serializable`），引 ORM 换不来收益。
 
 | 文件 | 行数 | 职责 |
 |---|---|---|
-| `lib/config/local_config.dart` | 23 | `kLocalFirstEnabled`（**默认 `false`**，见下）+ `kLocalDbFileName` |
-| `lib/local/local_schema.dart` | 316 | `kLocalSchemaVersion = 1` + 10 个 `CREATE TABLE` + 22 个索引（字符串常量，测试靠 `kLocalTableNames` / `kLocalIndexNames` 断言） |
-| `lib/local/local_db.dart` | 145 | `LocalDb` 单例：惰性打开、并发只开一次、`close()`、`inspect()` 查 `sqlite_master` |
-| `lib/local/dao/dao_base.dart` | 128 | `SyncState` / `PendingStatus` / `Col` / `LocalQuery` + `nowIso()` / `toLocalValue()` |
-| `lib/local/dao/sync_table_dao.dart` | 154 | 基类 CRUD：`insert` / `insertAll` / `getByPk` / `getByServerId` / `list` / `update` / `delete` / `count` / `countUnsynced`（全部收 `DatabaseExecutor`，可传 `Transaction`） |
-| `lib/local/dao/table_daos.dart` | 251 | 8 个表子类 + `LocalDaos` 聚合（含 `pending` / `meta`） |
-| `lib/local/dao/local_meta_dao.dart` | 104 | `local_meta` 读写 + `MetaKey`（`token_fingerprint` / `last_sync_at` / `sync.<resource>.<field>`） |
-| `lib/local/dao/pending_operations_dao.dart` | 233 | 写队列：`enqueue` / `listPending` / `markDone` / `markFailed` / `incrementRetry` / `markConflict` / `markDead` |
-| `lib/local/local.dart` | 26 | barrel，页面层只需一个 import |
-| `test/local_db_test.dart` | 661 | 27 个用例（E1–E5） |
-
+| 文件 | 行数 | 职责 | 引入 |
+|---|---|---|---|
+| `lib/config/local_config.dart` | 25 | `kLocalFirstEnabled`（**R2 起为 `true`**，见下）+ `kLocalDbFileName` | R1 |
+| `lib/local/local_schema.dart` | 317 | `kLocalSchemaVersion = 1` + 10 个 `CREATE TABLE` + 22 个索引（字符串常量，测试靠 `kLocalTableNames` / `kLocalIndexNames` 断言） | R1 |
+| `lib/local/local_db.dart` | 146 | `LocalDb` 单例：惰性打开、并发只开一次、`close()`、`inspect()` 查 `sqlite_master` | R1 |
+| `lib/local/dao/dao_base.dart` | 129 | `SyncState` / `PendingStatus` / `Col` / `LocalQuery` + `nowIso()` / `toLocalValue()` | R1 |
+| `lib/local/dao/sync_table_dao.dart` | 180 | 基类 CRUD：`insert` / `insertAll` / `getByPk` / `getByServerId` / `list` / `update` / `delete` / `deleteSynced` / `deleteSyncedWhere` / `count` / `countUnsynced`（全部收 `DatabaseExecutor`，可传 `Transaction`） | R1 / R2 |
+| `lib/local/dao/table_daos.dart` | 320 | 8 个表子类 + `LocalDaos` 聚合（含 `pending` / `meta`）；R2 新增 `countOpenByLayer` / `listVerifiableWithEnteredAt` | R1 / R2 |
+| `lib/local/dao/local_meta_dao.dart` | 105 | `local_meta` 读写 + `MetaKey`（`token_fingerprint` / `last_sync_at` / `sync.<resource>.<field>`） | R1 |
+| `lib/local/dao/pending_operations_dao.dart` | 234 | 写队列：`enqueue` / `listPending` / `markDone` / `markFailed` / `incrementRetry` / `markConflict` / `markDead`（R4 才接推送） | R1 |
+| `lib/local/local.dart` | 68 | barrel，页面层只需一个 import | R1 / R2 |
+| `lib/local/sha256.dart` | 143 | 纯 Dart SHA-256，**不引 `crypto` 包**；只用来算 `token_fingerprint` | R2 |
+| `lib/local/verify_window.dart` | 215 | `VERIFY_WINDOWS` / `DUE_SOON_DAYS` / `computeUrgency` 的 Dart 移植，与 `server/verify_window.mjs` 同公式 | R2 |
+| `lib/local/first_fill.dart` | 599 | `ensureInitialData()` 首次全量填充 + `LocalCache` 行映射回写 + `kLocalDataRevision` 通知 | R2 |
+| `lib/local/local_queries.dart` | 330 | 六个本地读函数（缺陷单 / 验证任务 / 摘要 / 统计 / 当前考试档案），输出结构与云端 API 逐字对齐 | R2 |
+| `lib/local/local_refresh.dart` | 215 | 「本地已有 → 全量分页对账」的后台刷新，带并发合流（四页同刷只打一次网络） | R2 |
+| `test/local_db_test.dart` | 665 | R1 的 27 个用例（E1–E5） | R1 |
+| `test/verify_window_test.dart` | 267 | R2 的 29 个用例（边界 / 取整 / 非法入参 / wire 格式） | R2 |
 **10 张表**：`local_meta` / `exam_profiles` / `subjects` / `knowledge_nodes` / `defect_tickets` / `actions` / `verifications` / `mock_exams` / `review_cycles` / `pending_operations`。设计里的 `questions_cache`（T7）本轮**不建**（拍板第 6 条）；T11 `sync_state` 并入 `local_meta` 的 key/value（省一张表 + 一套 DAO）。
 
 **`defect_tickets` 本地不落 4 类列**：`actions` jsonb（与 `actions` 表重复的快照，双写会不一致）、`verification_state` jsonb（实测恒 `pending`，前端早已改读 `verifications` 数组）、`knowledge_node_title` / `subject_name`（服务端 LEFT JOIN 出来的展示字段）、`deleted_at`（本地是投影，软删行拉取时直接不落库）。
 
-**`kLocalFirstEnabled` 开关的作用**：默认 `false` ⇒ **R1 阶段没有任何代码路径会读本地库**，App 与之前逐字节等价。`main()` 里仍会 `await LocalDb.database` 确认库能打开（失败只记日志 + 把开关强制置 `false`，不拖垮启动）。R2 才把它翻成 `true` 并把页面读取接过去。选 **可变顶层变量而非 `const`** 就是为了支持这种运行时降级（与既有 `kUseMock` 同一个做法）。
+**`kLocalFirstEnabled` 开关的作用**：R1 阶段为 `false`，**R2 起为 `true`**——首页 / 缺陷单 / 验证 / 我的四页先读本地库，云端降级为后台刷新与写入通道。改回 `false` 即整体回退到「每次打开都直连云端」的旧行为（四页里都保留了 `if (!kLocalFirstEnabled) { await _loadFromCloud(); return; }` 这一行分支）。`main()` 里仍会 `await LocalDb.database` 确认库能打开（失败只记日志 + 把开关强制置 `false`，不拖垮启动）。选 **可变顶层变量而非 `const`** 就是为了支持这种运行时降级（与既有 `kUseMock` 同一个做法）。
+
+**R2 的三段式读取**（四页统一）：①读本地 DAO → `setState` 立即渲染；②`unawaited(refreshLocalFromCloud())` 后台拉全量 → 事务回写 → `kLocalDataRevision.value++`；③页面监听到 revision 变化后重读本地并刷新 UI。刷新失败只 `warn`，**不清本地数据、不改 UI**。
+
+**「本地为空」与「还没同步下来」严格区分**：四页都先判 `hasData || await isFirstFillComplete()`（后者读 `local_meta` 的 `sync.first_fill.completed`）。首次填充未完成时显示骨架 + 一行「正在连接服务器，首次同步中…」，而不是误报「你还没有缺陷单」。
+
+**本地派生量与云端同口径**：urgency 用同一套 7/14/21 窗口公式本地复算（验证页的筛选因此从「走后端」改为本地过滤，不再产生网络往返）；缺陷分布 / 验证摘要 / 缺陷单展示名全部在本地 JOIN 或聚合出与云端**形状完全相同**的结果，页面只有一条渲染路径。
 
 **数据库文件位置**：`getDatabasesPath()/tillroad_local.db`。Android 上即 `/data/data/com.tillroad.tillroad_app/databases/tillroad_local.db`（与其他 sqflite 应用一致，root 设备或 `adb shell run-as` 可见）。
 
 **Windows 不支持**：`sqflite` 的桌面实现要额外的 `sqflite_common_ffi` + `sqlite3_flutter_libs`，本轮按拍板第 5 条不做，桌面端 `kLocalFirstEnabled` 保持 `false`、继续直连云端。测试能跑是因为 `sqflite_common_ffi` 只进了 `dev_dependencies`（`test/local_db_test.dart` 里通过 `LocalDb.debugFactoryOverride` 注入）。
-
+**分页终止只能看 `items.length < limit`**：后端 `defect-tickets` 响应里没有 `total`，`mock-exams` / `review-cycles` 的 `total` 就是 `items.length`（假 total）。所以首次填充与后台刷新都用 `items.length < 200` 判断结束，且 **200 必须与服务端 `pageParams` 的上限一致**——写成 300 会被服务端夹回 50，每页都「不满」而立刻终止，数据静默缺失。
 **不声明 FOREIGN KEY**：本地是「云端投影 + 待推送队列」，父子行到达顺序由同步批次决定，硬外键会让「先到子行、父行还没拉下来」的中间态直接写失败。引用完整性靠 R3 的「先父后子」拉取顺序 + 查询不用外键假设 + 队列的 `dead` 状态兜底。
 
 ---
@@ -971,7 +983,9 @@ Select-String -Path tillroad_app\build\app\intermediates\merged_manifest\release
 - ✅ **FE 网络修复**：release APK 连不上 Railway（`Failed host lookup / errno 7`）→ 根因是 `src/main/AndroidManifest.xml` 缺 `INTERNET` 权限（模板只在 debug/profile 里声明）；一并做 base URL 清洗（`normalizeBaseUrl`，剥引号/尾斜杠/校协议）+ 安全拼接（`buildApiUri`，不用 `Uri.resolve` 以保留 base 子路径）+ 首页导航栏「连接诊断」入口（`diagnose()` 分七档）；release APK 51,884,906 B，真机验证缺陷分布拿到真实数据、诊断弹窗显示「通过 / 1449ms / 200」；截图 `fe-net-home.png`、`fe-net-diagnose.png`
 - ✅ **运行日志导出**：外部测试用户拿不到 adb logcat，所以 App 自带「可导出、已脱敏」日志：`lib/logging/app_logger.dart`（500 条环形缓冲 + **写缓冲区之前**脱敏）+ `log_file_writer.dart`（按天滚动 / 保留 3 天 / 总量超 5MB 删最旧）+ `log_export.dart`（内存 + 近 3 天文件 + 设备头 → 单个 `.txt`）+ `nav_observer.dart`；首页导航栏文档图标 → `CupertinoActionSheet`（导出 / 清空 / 取消）→ 确认弹窗 → `share_plus` 系统分享面板；`main.dart` 接 `FlutterError.onError` + `PlatformDispatcher.onError`，`api_client._send()` 一处覆盖全部端点；唯一新增依赖 `share_plus`；真机验证联网成功日志、断网 error 日志（`SocketException ... errno = 7`）与导出文件（无 `tk_test_`、无完整 UUID）；截图 `fe-log-entry.png`、`fe-log-share.png`
 - ✅ **FE-UI 重构**：底部 Tab 从 5 个收敛到 **3 个**（首页 / 缺陷单 / 我的），验证·模考·复盘三页**文件全部保留**、降为 `appRoute()` push 的二级页；新建 `lib/pages/profile_page.dart`（账户卡片 `maskUuid` 脱敏 ID + 数据概览四格 + 功能四入口）与 `lib/pages/settings_page.dart`（连接与诊断 / 日志 / 账户 / 危险操作 / 关于 五分区）；首页 trailing 由「诊断 + 日志」两图标改为单个齿轮 → 设置页；所有旧 `_switchTab(2/3/4)` 写死索引改为按类型 push（否则索引 2 现在是「我的」，点「今日待验证」会静默跳到错误分区）；数据层 / `api_client.dart` / 后端**零改动、零新依赖**；`flutter analyze` 30 info / **0 error / 0 warning**，`flutter test` **15/15**；Android 17 真机 7 张截图（含断网降级态），数据概览 9 / 1 / 11% / 进行中 3 与生产接口返回完全吻合
-- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两个节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）
+- ✅ **本地优先 R1**：建成本地 SQLite 库地基（10 表 + 22 索引 + 5 个 DAO 文件 + `kLocalFirstEnabled` 开关），`kLocalFirstEnabled` 默认 `false`、App 行为零变化；`sqflite` + `path` 进运行时依赖，`sqflite_common_ffi` 仅作 dev；`flutter test` **42/42**、`flutter analyze` 0 error / 32 info；Android 真机 `tillroad_local.db` 192512 B、`user_version=1`、10 表 22 索引全部实测
+- ✅ **本地优先 R2**：四页（首页 / 缺陷单 / 验证 / 我的）改为「先读本地 → 后台刷新 → 事务回写」，`kLocalFirstEnabled` 翻为 `true`；新增 `verify_window.dart`（后端 7/14/21 公式 Dart 移植）+ `first_fill.dart`（首次全量填充，父→子，`items.length < 200` 判定分页）+ `local_queries.dart`（本地聚合出与云端同形状的数据）+ `local_refresh.dart`（后台对账，四页并发合流）；修掉两个真机才暴露的真 bug：①子表回写复用整表 `deleteSynced` 把别的缺陷单的 actions/verifications 删光（改 `deleteSyncedWhere` 按 `defect_ticket_local_id` 限定）②首次填充中首屏误报「还没有设置考试目标」（补 `_syncPending` + 「正在连接服务器，首次同步中…」）；`flutter test` **71/71**，Android 本地行数与云端逐项一致（9 / 6 / 11），冷启动到首帧完整内容 **约 4s**（改造前需等 Neon 10–30s）
+- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两个节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）；⑥本地优先 R3 的增量对账与 R4 的写队列（含 R-9 本地状态机校验）尚未实现
 详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
 
 ---

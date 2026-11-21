@@ -1,8 +1,12 @@
+import 'dart:async' show unawaited;
+
 import 'package:flutter/cupertino.dart';
 
 import '../api/api_client.dart';
 import '../api/defect_api.dart';
 import '../config/api_config.dart';
+import '../config/local_config.dart';
+import '../local/local.dart';
 import '../mock/defects_mock.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart';
@@ -45,22 +49,32 @@ class _DefectsPageState extends State<DefectsPage> {
   @override
   void initState() {
     super.initState();
+    if (kLocalFirstEnabled) kLocalDataRevision.addListener(_onLocalDataChanged);
     _load();
+  }
+
+  /// 首次填充 / 后台刷新写完本地表后重读（无需用户下拉）。
+  void _onLocalDataChanged() {
+    if (!mounted) return;
+    unawaited(_readLocal(firstPaint: false));
   }
 
   @override
   void dispose() {
+    if (kLocalFirstEnabled) kLocalDataRevision.removeListener(_onLocalDataChanged);
     _api.close();
     super.dispose();
   }
-
+  /// 三段式加载（本地优先 R2）。
+  ///
+  /// `kUseMock` 与 `kLocalFirstEnabled == false` 两条旧路径保持原样：
+  /// 前者是离线演示，后者是出问题时改一行开关就能回退的逃生通道。
   Future<void> _load() async {
-    setState(() {
-      _all = null;
-      _error = null;
-    });
-
     if (kUseMock) {
+      setState(() {
+        _all = null;
+        _error = null;
+      });
       // 模拟一点延迟，让加载态在离线演示时也能被看到
       await Future<void>.delayed(const Duration(milliseconds: 200));
       if (!mounted) return;
@@ -68,6 +82,21 @@ class _DefectsPageState extends State<DefectsPage> {
       return;
     }
 
+    if (!kLocalFirstEnabled) {
+      await _loadFromCloud();
+      return;
+    }
+
+    await _readLocal(firstPaint: true);
+    unawaited(_refreshFromCloud());
+  }
+
+  /// 旧路径：直接请求云端（一次拉全量，筛选仍在内存做）。
+  Future<void> _loadFromCloud() async {
+    setState(() {
+      _all = null;
+      _error = null;
+    });
     try {
       final list = await _api.fetchDefectTickets(kDemoUserId);
       if (!mounted) return;
@@ -76,6 +105,36 @@ class _DefectsPageState extends State<DefectsPage> {
       if (!mounted) return;
       setState(() => _error = e);
     }
+  }
+
+  /// 本地读取。[firstPaint] 为 true 时才清空 `_all` 进加载态；
+  /// 后台刷新触发的重读不能把已有列表清掉（否则会闪一下白屏）。
+  Future<void> _readLocal({required bool firstPaint}) async {
+    if (firstPaint) {
+      setState(() {
+        _all = null;
+        _error = null;
+      });
+    }
+    try {
+      final List<DefectTicket> list = await loadDefectTickets(kDemoUserId);
+      // 本地为空且首次填充还没跑完 → 继续保持加载态（_all 仍为 null）。
+      // 直接给空列表会把「还没同步下来」误报成「你确实没有缺陷单」（C5）。
+      if (list.isEmpty && !await isFirstFillComplete()) return;
+      if (!mounted) return;
+      setState(() {
+        _all = list;
+        _error = null;
+      });
+    } catch (e) {
+      debugPrint('[defects] 本地读取失败：$e');
+      if (firstPaint && mounted) setState(() => _all = <DefectTicket>[]);
+    }
+  }
+
+  /// 后台刷新：失败只记日志，本地列表继续可用（不弹错、不变错误页）。
+  Future<void> _refreshFromCloud() async {
+    await refreshLocalFromCloud();
   }
 
   List<DefectTicket> get _visible {

@@ -840,3 +840,133 @@ App 启动
 | R3 | 首次同步触发点 | `main.dart` 的 `_initLocalDb()` 之后（后台 `unawaited`，不阻塞 `runApp`）；判据读 `local_meta` 的 `token_fingerprint` 与各资源 `sync.*.row_count` |
 | R3 | 拉取顺序 | 严格按「父→子」：`exam_profiles → subjects → knowledge_nodes → defect_tickets → actions → verifications → mock_exams → review_cycles` |
 | R4 | 写队列推送 | `pending_operations` 按 `op_id ASC` 出队；同 `entity_local_id` 队头阻塞；`begin-verification` 打 `requires_online_refresh` |
+
+---
+
+## 9. R2 实现记录（四个页面读取切换 + 最小首次填充）
+
+> 同 §8：本章是**实现回填**，§0–§7 的设计原文未改动。
+
+### 9.1 实际落地的东西
+
+| 新增/改动 | 文件 | 行数 | 作用 |
+| --- | --- | --- | --- |
+| 新增 | `tillroad_app/lib/local/sha256.dart` | 143 | 纯 Dart SHA-256（FIPS 180-4），**不引 `crypto` 包**；只用于算 `token_fingerprint` |
+| 新增 | `tillroad_app/lib/local/verify_window.dart` | 215 | `VERIFY_WINDOWS` / `DUE_SOON_DAYS` / `computeUrgency` 的 Dart 移植，与 `server/verify_window.mjs` 同公式 |
+| 新增 | `tillroad_app/lib/local/first_fill.dart` | 599 | `ensureInitialData()` 首次全量填充 + `LocalCache` 行映射与回写 + `kLocalDataRevision` |
+| 新增 | `tillroad_app/lib/local/local_queries.dart` | 330 | 六个本地读函数，输出结构与云端 API 逐字对齐 |
+| 新增 | `tillroad_app/lib/local/local_refresh.dart` | 215 | 「本地已有 → 全量分页对账」的后台刷新，带并发合流 |
+| 新增（测试） | `tillroad_app/test/verify_window_test.dart` | 267 | 29 个用例 |
+| 改动 | `lib/local/dao/sync_table_dao.dart` | +2 方法 | `deleteSynced`（R2 早段）+ `deleteSyncedWhere`（修 bug 后补） |
+| 改动 | `lib/local/dao/table_daos.dart` | +2 方法 | `countOpenByLayer`、`listVerifiableWithEnteredAt` |
+| 改动 | `lib/local/local.dart` | 68 | barrel 增加 `verify_window` / `first_fill` / `sha256` / `local_queries` / `local_refresh` 五组 export |
+| 改动 | `lib/config/local_config.dart` | 25 | `kLocalFirstEnabled` → **true** |
+| 改动 | `lib/main.dart` | 248 | `_initLocalDb()` 之后 `unawaited(ensureInitialData())` |
+| 改动 | `lib/pages/home_page.dart` | 1042 | 三段式 + `_syncPending` 提示行 |
+| 改动 | `lib/pages/defects_page.dart` | 467 | 三段式 |
+| 改动 | `lib/pages/verify_page.dart` | 865 | 三段式，**筛选从走后端改为本地过滤** |
+| 改动 | `lib/pages/profile_page.dart` | 947 | 三段式 |
+| 改动 | `test/local_db_test.dart` | 1 处断言 | 开关默认值断言改为 `isTrue` |
+
+### 9.2 三段式加载的固定骨架
+
+四个页面的 `_load()` / `_loadAll()` 统一成这个形状（以缺陷单页为例）：
+
+```dart
+Future<void> _load() async {
+  if (kUseMock) { /* 原 mock 路径一字未改 */ return; }
+  if (!kLocalFirstEnabled) { await _loadFromCloud(); return; }   // ② 一行回退
+  await _readLocal(firstPaint: true);                             // ① 本地优先
+  unawaited(_refreshFromCloud());                                 // ③ 后台刷新
+}
+```
+
+- **①读本地**：DAO 直读，`setState` 渲染，不等网络。
+- **②回退**：`kLocalFirstEnabled=false` 时走 R2 之前的原始实现（`_loadFromCloud()` 就是原来的代码体）。
+- **③后台刷新**：`refreshLocalFromCloud()` 拉全量 → 事务回写 → `kLocalDataRevision.value++` → 各页 `addListener` 重读本地 → UI 自动更新。**刷新失败只 `warn`，不清本地数据、不改 UI。**
+
+### 9.3 「本地为空」与「还没同步下来」必须分开
+
+任务书 C5 的落地点。四个页面都有同一段判断：
+
+```dart
+final bool fillDone = hasData || await isFirstFillComplete();
+if (!fillDone) { /* 保持加载态/骨架，return */ }
+```
+
+`isFirstFillComplete()` 读 `local_meta` 的 `sync.first_fill.completed`。这样：
+- 全新安装、网络还没回来 → 骨架 + 「正在连接服务器，首次同步中…」；
+- 同步完成但确实没有数据 → 正常空状态。
+
+**如果只判「本地列表为空」，会把前者渲染成「你还没有缺陷单」，这是错的。**
+
+### 9.4 本地聚合与云端聚合的口径对齐
+
+`local_queries.dart` 不是「差不多就行」，而是逐字对齐后端：
+
+| 派生量 | 云端实现 | 本地实现 | 对齐要点 |
+| --- | --- | --- | --- |
+| 缺陷分布 | `defectStats` 的 by_layer | `countOpenByLayer` | 只算 `status <> 'CLOSED'`；空白 `error_layer` 归 `unclassified`；排序 `n DESC, layer ASC`（第二键必需，否则同数行每次刷新换位置） |
+| 验证摘要 | `verificationSummary` | `loadVerificationSummary` | 复用 `loadVerificationTasks` 后内存聚合，两者永不漂移 |
+| urgency | `computeUrgency`（JS） | `computeUrgency`（Dart） | 常量 7/14/21 + `<=3` 判临期；`elapsedDays = (now-start) ~/ 86400000` 向下取整 |
+| entered_at | `ENTERED_AT_SQL` | `listVerifiableWithEnteredAt` | V2 取本轮 V1 pass 的 `created_at`，V3 取 V2 pass，**V1 退化用 `updated_at`**（偏差方向「晚报不误报逾期」） |
+| 缺陷单展示名 | `SELECT_WITH_DISPLAY` 的 LEFT JOIN | 同结构 LEFT JOIN | 考点/科目未同步时回落「考点 &lt;uuid8&gt;」，与 `defect_api.dart:95` 的兜底逐字一致 |
+
+`loadDefectStats` 的输出形状与 `GET /users/:id/defect-stats` **完全一致**（`by_layer` / `by_status` 八态 / `open_total` / `closed_total` / `total`），所以 `home_page._distributionsFrom` / `_openCount` 只有一条渲染路径。
+
+### 9.5 分页终止只能看 `items.length < limit`
+
+再次强调（设计 §3.3 已写，R2 落地时确认）：**不能信 `total`**。
+
+- `GET /users/:id/defect-tickets` 的响应里根本没有 `total`；
+- `mock-exams` 的 `total` 是 `items.length`（`server/routes/mock_exams.mjs:155`），永远等于当页条数；
+- `review-cycles` 同病。
+
+所以 `_pullAll()` 的循环条件是 `items.length < kRefreshPageSize`，且 `kRefreshPageSize` 必须 **= 200**（服务端 `pageParams` 的上限）；写成 300 会被服务端夹回 50，导致每页都「不满」而立刻终止——数据静默缺失。
+
+### 9.6 跑真机时抓到并修掉的两个真实缺陷
+
+#### 缺陷 1：子表回写把别的缺陷单的动作/验证记录全删了
+
+- **现象**：首次填充完成后本地 `actions = 0`、`verifications = 2`，云端是 6 / 11。
+- **根因**：`LocalCache.writeActions/writeVerifications` 复用了目录表的 `_rewrite()`，而它内部是**整表** `deleteSynced`。子表按「一张单写一次」被循环调用；云端 9 张单里有 6 张没有动作 → 处理到某张空单时执行整表清空，把前面写进去的 6 条真实动作删光。
+- **修法**：新增 `SyncTableDao.deleteSyncedWhere(db, where, args)`，子表改写走 `_rewriteChildren(dao, ticketLocalId, rows)`——事务内只删 `defect_ticket_local_id = ?` 且 `sync_state = 0` 的行。
+- **顺带修的第二个 bug**：`_fillTicketChildren` 原先用「已写入行数」当补拉上限，而没有动作的单行数永不增长 → 换成独立计数器 `fetched`（已补拉张数）；返回值从 `int` 改为 `({int actions, int verifications})`，两类行数分别记 `sync.actions.row_count` / `sync.verifications.row_count`。
+- **验证**：`pm clear` 后重跑 → `actions 6 / verifications 11`，与云端逐行一致。
+
+#### 缺陷 2：首次填充中首屏显示「还没有设置考试目标」
+
+- **现象**：`pm clear` 后离线冷启动，倒计时卡片显示「还没有设置考试目标」，违反任务书 C5。
+- **根因**：`home_page._loadFromLocal()` 无条件置 `_profileLoaded = true`，而 `_buildCountdown` 的骨架分支条件是 `!_profileLoaded && profile == null && _profileError == null`，被这行短路了。
+- **修法**：新增 `bool _syncPending`；未同步完成时保持 `_profileLoaded = false` 并置 `_syncPending = true`，同时在倒计时与「今日待验证」之间插一行 `CupertinoActivityIndicator + 「正在连接服务器，首次同步中…」`。
+- **截图**：`screenshots/r2-offline-firstfill-failed.png`（178219 B）。
+
+### 9.7 与设计文档的偏差
+
+| 项 | 设计 | 实现 | 理由 |
+| --- | --- | --- | --- |
+| 本地主键 | `local_id` 本地生成 UUID，`server_id` 另存 | **`local_id = server_id`**（目录表与子表全部如此） | `actions` / `verifications` 的 `defect_ticket_local_id` 指向它。每次重新生成 UUID 会让子表引用失效；取云端 id 后重复同步天然幂等。R4 离线新建的行仍用随机 UUID + `sync_state=1` |
+| `sync_state.token_fingerprint` | 放在 sync_state 表 | 放在 `local_meta`（键 `token_fingerprint`） | 与 §8.3 一致 |
+| 首次填充的轮次归属 | 设计 §6.3 把首次同步放在 R3 | **R2 就做了最小版本**（`ensureInitialData`） | 不做的话 R2 四页在全新安装时永远是空的，无法真机验收。R3 的增量对账仍是独立一轮 |
+| 增量拉取 | 设计 §3.3 给了 A/B/C 三方案 | 只实现 A（全量分页对账） | 拍板第 1 条「仅事件驱动」+ 后端无 `updated_since`，B/C 都要后端改动 |
+| `questions_cache` | 设计 T7 | 仍未建 | 拍板第 6 条 |
+| 页面筛选 | verify 页筛选「走后端」 | **改为本地过滤** | 本地已按同一 urgency 公式复算，再打网络纯属浪费；语义不变 |
+
+### 9.8 测试与验证
+
+- `flutter test` → **71 tests / All passed**（R1 的 27 + verify_window 29 + widget 5 + logging 10）。
+- `flutter test test/verify_window_test.dart` → **29/29**：daysLeft = 0/1/3/4 边界、逾期取绝对值、enteredAt 在未来、23h/47h 向下取整、非法入参抛 `ArgumentError`、`+08:00` 归一 UTC、`wire` 七键 snake_case。
+- `flutter analyze --no-fatal-infos` → **37 issues / 0 error / 0 warning**（全部为既有 `deprecated_member_use: package:flutter/cupertino.dart`）。
+- Android 17 模拟器 + Railway/Neon 真机：
+  - 首次填充（`pm clear` 后）本地行数：`exam_profiles 1 / subjects 2 / knowledge_nodes 8 / defect_tickets 9 / actions 6 / verifications 11 / mock_exams 7 / review_cycles 3 / pending_operations 0 / local_meta 13`。
+  - 与云端逐项比对：tickets 9=9、actions 6=6、verifications 11=11，状态分布一致。
+  - 冷启动到首帧完整内容 **约 4s**（改造前需等 Neon，10–30s 或超时）。
+  - `local_meta` 实测：`token_fingerprint=4af6f1db139716d7`、`schema_version=1`、`sync.first_fill.completed=1`、`sync.first_fill.error=`（空）、七个 `sync.*.row_count` 与上述行数逐一相符。
+
+### 9.9 R2 明确没做的事
+
+- 没有写队列、没有离线写入、没有冲突仲裁 UI（R4）。
+- 没有增量游标（R3）；刷新一律全量分页对账。
+- 没有移植状态机 / 禁用语校验（R-9 仍在，但因写操作直连云端，本轮不受影响）。
+- 模考提交、复盘生成仍**必须在线**（设计 §4 已定）。
+- 后端、`schema.sql`、`api_client.dart` 零改动。

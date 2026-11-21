@@ -26,6 +26,8 @@
 // 所以 `CLOSED / total` 就是严格意义上的验证完成率。
 // 而 `verification-summary.total` 作为「进行中 N」的副标题展示，
 // 两个数字并排才能看出「已完成 / 还在队列里」的真实比例。
+import 'dart:async' show unawaited;
+
 import 'package:flutter/cupertino.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -35,6 +37,8 @@ import '../api/defect_api.dart';
 // 不是一回事，这里不需要任务级模型，用 show 收窄可避免将来 ambiguous_import。
 import '../api/verification_api.dart' show VerificationApi, VerificationSummary;
 import '../config/api_config.dart';
+import '../config/local_config.dart';
+import '../local/local.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart';
 import 'api_token_page.dart';
@@ -67,29 +71,84 @@ class _ProfilePageState extends State<ProfilePage> {
   @override
   void initState() {
     super.initState();
+    if (kLocalFirstEnabled) kLocalDataRevision.addListener(_onLocalDataChanged);
     if (!kUseMock) {
       _loadAll();
     }
   }
 
+  /// 首次填充 / 后台刷新写完本地表后重读（无需用户下拉）。
+  void _onLocalDataChanged() {
+    if (!mounted) return;
+    unawaited(_loadFromLocal());
+  }
+
   @override
   void dispose() {
+    if (kLocalFirstEnabled) kLocalDataRevision.removeListener(_onLocalDataChanged);
     _defectApi.close();
     _verifyApi.close();
     super.dispose();
   }
 
+  /// 三段式加载（本地优先 R2）。
+  ///
+  /// `kLocalFirstEnabled = false` 时走旧路径（两路并发直连），完全不变。
   Future<void> _loadAll() async {
-    // 两路各自吞异常（见各 loader），所以 Future.wait 不会整体抛出，
-    // 一路超时也不影响另一路已经拿到的数字。
-    await Future.wait<void>(<Future<void>>[_loadStats(), _loadSummary()]);
-    if (!mounted) return;
-    setState(() => _loading = false);
+    if (!kLocalFirstEnabled) {
+      // 旧路径：两路各自吞异常（见各 loader），所以 Future.wait 不会整体抛出，
+      // 一路超时也不影响另一路已经拿到的数字。
+      await Future.wait<void>(<Future<void>>[_loadStats(), _loadSummary()]);
+      if (!mounted) return;
+      setState(() => _loading = false);
+      return;
+    }
+    await _loadFromLocal();
+    unawaited(_refreshFromCloud());
+  }
+
+  /// 本地读取：本页只需要两样东西——缺陷聚合 + 进行中的验证数。
+  ///
+  /// 本地为空时保持 `_loading`（四格显示骨架）而不显示「0 条」：
+  /// 还没同步下来不等于你确实没有数据（任务书 C5）。
+  Future<void> _loadFromLocal() async {
+    try {
+      final bool hasData = await localHasAnyData();
+      if (!hasData && !await isFirstFillComplete()) {
+        if (!mounted) return;
+        setState(() => _loading = true);
+        return;
+      }
+      final Map<String, Object?> stats = await loadDefectStats(kDemoUserId);
+      final VerificationSummary summary = await loadVerificationSummary(kDemoUserId);
+      if (!mounted) return;
+      setState(() {
+        _stats = stats;
+        _summary = summary;
+        _loading = false;
+      });
+    } catch (e) {
+      debugPrint('[profile] 本地读取失败：$e');
+      if (!mounted) return;
+      setState(() => _loading = false);
+    }
+  }
+
+  /// 后台刷新：失败只记日志，四格继续显示本地数字。
+  Future<void> _refreshFromCloud() async {
+    await refreshLocalFromCloud();
   }
 
   Future<void> _refresh() async {
     if (kUseMock) return;
     setState(() => _loading = true);
+    if (kLocalFirstEnabled) {
+      await _loadFromLocal();
+      await refreshLocalFromCloud();
+      await _loadFromLocal();
+      if (mounted) setState(() => _loading = false);
+      return;
+    }
     await _loadAll();
   }
 

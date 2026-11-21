@@ -24,3 +24,44 @@ export 'package:tillroad_app/config/local_config.dart'
     show kLocalDbFileName, kLocalFirstEnabled;
 export 'local_schema.dart'
     show kLocalIndexNames, kLocalSchemaStatements, kLocalSchemaVersion, kLocalTableNames;
+export 'verify_window.dart'
+    show
+        Urgency,
+        UrgencyResult,
+        computeUrgency,
+        computeUrgencyForStage,
+        isUrgency,
+        isVerifyStage,
+        kDayMs,
+        kDueSoonDays,
+        kVerifyStages,
+        kVerifyWindows,
+        parseLocalTime,
+        windowDaysFor;
+export 'first_fill.dart'
+    show
+        LocalCache,
+        ensureInitialData,
+        isFirstFillComplete,
+        kFillPageSize,
+        kLocalDataRevision,
+        kFillMaxDetailTickets,
+        localDefectCount;
+export 'local_refresh.dart'
+    show
+        clearLocalCache,
+        isRefreshingFromCloud,
+        kChildRefreshStatuses,
+        kMaxChildRefresh,
+        kRefreshMaxPages,
+        kRefreshPageSize,
+        refreshLocalFromCloud;
+export 'local_queries.dart'
+    show
+        loadActiveExamProfile,
+        loadDefectStats,
+        loadDefectTickets,
+        loadVerificationSummary,
+        loadVerificationTasks,
+        localHasAnyData;
+export 'sha256.dart' show Sha256;

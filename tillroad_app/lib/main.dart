@@ -9,6 +9,7 @@ import 'api/api_client.dart' show ApiClient;
 import 'config/api_config.dart';
 import 'config/app_info.dart';
 import 'config/local_config.dart';
+import 'local/first_fill.dart' show ensureInitialData;
 import 'local/local_db.dart' show LocalDb;
 import 'logging/app_logger.dart';
 import 'logging/nav_observer.dart';
@@ -25,6 +26,11 @@ Future<void> main() async {
   _installErrorHandlers();
   // 本地库初始化（R1）。失败不拖垮启动：降级为「不启用本地优先」并记日志。
   await _initLocalDb();
+  // 最小首次填充（R2）：后台跑，不阻塞 runApp（拍板第 3 条）。
+  // 本地空时页面显示骨架，填充完成后 `kLocalDataRevision` 通知重读。
+  if (kLocalFirstEnabled && !kUseMock) {
+    unawaited(ensureInitialData());
+  }
   if (!kUseMock) {
     unawaited(_prewarm());
   }

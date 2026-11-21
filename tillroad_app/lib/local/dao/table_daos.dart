@@ -104,6 +104,74 @@ class DefectTicketsDao extends SyncTableDao {
       statuses: const <String>['V1', 'V2', 'V3'],
     );
   }
+
+  /// 未关闭单的归因分布：`{error_layer: count}`（R2 首页「缺陷分布」用）。
+  ///
+  /// 口径**逐字对齐**后端 `defectStats`（`server/repositories/defect_tickets.mjs:250`）：
+  ///   · 只计未关闭（`status <> 'CLOSED'`）；
+  ///   · 空串/纯空白归到 `unclassified`（服务端的 `UNCLASSIFIED_LAYER`）；
+  ///   · `count DESC, layer ASC` —— 第二键是必需的，否则同数的行顺序不定，
+  ///     首页那四行每刷一次就会换位置。
+  Future<Map<String, int>> countOpenByLayer(DatabaseExecutor db, String userId) async {
+    final List<Map<String, Object?>> rows = await db.rawQuery(
+      '''SELECT COALESCE(NULLIF(TRIM(error_layer), ''), 'unclassified') AS layer,
+              COUNT(*) AS n
+         FROM $table
+        WHERE ${Col.userId} = ? AND ${Col.status} <> 'CLOSED'
+        GROUP BY 1
+        ORDER BY n DESC, 1 ASC''',
+      <Object?>[userId],
+    );
+    final Map<String, int> out = <String, int>{};
+    for (final Map<String, Object?> row in rows) {
+      final Object? layer = row['layer'];
+      final Object? n = row['n'];
+      if (layer is String && n is int) out[layer] = n;
+    }
+    return out;
+  }
+
+  /// 待验证单 + 本地算出的「进入当前验证阶段时间」。
+  ///
+  /// 为什么需要它：urgency 的起点不是 `updated_at`，而是「上一次通过验证的时间」。
+  /// 后端用 `ENTERED_AT_SQL`（`server/repositories/defect_tickets.mjs:352`）做这件事，
+  /// 本地必须同口径复现，否则「云端说还剩 1 天、本地说已逾期」——
+  /// 这是设计 §6.4 R-7 明确列出的风险。
+  ///
+  /// 取法（与后端一致）：
+  ///   · V2 → 本 round 的 V1 `pass` 记录 `created_at`；
+  ///   · V3 → 本 round 的 V2 `pass` 记录 `created_at`；
+  ///   · V1（或上一阶段还没记录）→ 退化用 `updated_at`。
+  /// 退化的偏差方向是「晚报而不误报逾期」：刚进 V1 时 updated_at 最接近真实时点。
+  ///
+  /// 返回的每行额外带 `entered_at`（ISO 8601 UTC 字符串，永不为 null）。
+  Future<List<Map<String, Object?>>> listVerifiableWithEnteredAt(
+    DatabaseExecutor db,
+    String userId,
+  ) async {
+    return db.rawQuery(
+      '''SELECT dt.*,
+               COALESCE(
+                 (SELECT v.created_at
+                    FROM verifications v
+                   WHERE v.defect_ticket_local_id = dt.local_id
+                     AND v.round = dt.verification_round
+                     AND v.result = 'pass'
+                     AND v.stage = CASE dt.status
+                                     WHEN 'V2' THEN 'V1'
+                                     WHEN 'V3' THEN 'V2'
+                                   END
+                   ORDER BY v.created_at DESC, v.local_id DESC
+                   LIMIT 1),
+                 dt.updated_at
+               ) AS entered_at
+          FROM $table dt
+         WHERE dt.${Col.userId} = ?
+           AND dt.${Col.status} IN ('V1', 'V2', 'V3')
+         ORDER BY dt.created_at ASC, dt.local_id ASC''',
+      <Object?>[userId],
+    );
+  }
 }
 
 /// T5 `actions`。

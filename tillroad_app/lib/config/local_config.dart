@@ -5,8 +5,9 @@
 
 /// 是否启用「本地优先」数据读取。
 ///
-/// **R1 阶段恒为 false**：本轮只建库、建表、封装 DAO，没有任何页面或 api 层
-/// 读这个开关，所以 App 行为与 R1 之前完全一致。R2 接页面时才把它翻成 true。
+/// **R2 起为 true**：首页 / 缺陷单 / 验证 / 我的 四个页面先读本地库、
+/// 云端降级为后台刷新与写入通道。改回 `false` 即可整体回退到「每页直连云端」
+/// 的旧行为（四个页面都保留了那条分支，没有删）。
 ///
 /// 为什么不是 `const`（任务书 A2 写的是 `const bool`）：
 ///   任务书 D2 要求「初始化失败时把 kLocalFirstEnabled 强制降为 false」。
@@ -17,7 +18,7 @@
 ///   R2 才需要「桌面回退直连」的分支；R1 若引入平台判断，会让
 ///   `flutter test`（宿主是桌面）拿不到确定值，测试反而更难写。
 ///   平台收窄放到 R2 的同步引擎入口处，此处只保留一个纯开关。
-bool kLocalFirstEnabled = false;
+bool kLocalFirstEnabled = true;
 
 /// 本地 SQLite 数据库文件名（sqflite 会放在平台标准目录下）。
 const String kLocalDbFileName = 'tillroad_local.db';

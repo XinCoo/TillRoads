@@ -1,9 +1,13 @@
+import 'dart:async' show unawaited;
+
 import 'package:flutter/cupertino.dart';
 
 import '../api/api_client.dart';
 import '../api/defect_api.dart';
 import '../api/verification_api.dart';
 import '../config/api_config.dart';
+import '../config/local_config.dart';
+import '../local/local.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart';
 import '../widgets/defect_badges.dart';
@@ -72,22 +76,35 @@ class _VerifyPageState extends State<VerifyPage> {
   @override
   void initState() {
     super.initState();
+    if (kLocalFirstEnabled) kLocalDataRevision.addListener(_onLocalDataChanged);
     _load();
   }
 
+  /// 首次填充 / 后台刷新写完本地表后重读（无需用户下拉）。
+  void _onLocalDataChanged() {
+    if (!mounted) return;
+    unawaited(_readLocal(firstPaint: false));
+  }
   @override
   void dispose() {
+    if (kLocalFirstEnabled) kLocalDataRevision.removeListener(_onLocalDataChanged);
     _api.close();
     _defectApi.close();
     super.dispose();
   }
 
+  /// 三段式加载（本地优先 R2）。
+  ///
+  /// 注意与 FE-04 时期的差异：那时「筛选走后端」，因为后端支持多值
+  /// `status`/`urgency`，切筛选等于重新请求。本地优先下筛选改为**本地过滤**
+  /// （[loadVerificationTasks] 接受 stage/urgency 参数，与后端同一套 urgency
+  /// 公式），效果一致但不再产生网络往返。
   Future<void> _load() async {
-    setState(() {
-      _items = null;
-      _error = null;
-    });
     if (kUseMock) {
+      setState(() {
+        _items = null;
+        _error = null;
+      });
       // 离线演示：延迟一点点让加载态可见（与 FE-03 列表页一致）。
       await Future<void>.delayed(const Duration(milliseconds: 200));
       if (!mounted) return;
@@ -97,6 +114,22 @@ class _VerifyPageState extends State<VerifyPage> {
       });
       return;
     }
+
+    if (!kLocalFirstEnabled) {
+      await _loadFromCloud();
+      return;
+    }
+
+    await _readLocal(firstPaint: true);
+    unawaited(_refreshFromCloud());
+  }
+
+  /// 旧路径：两次并发请求（列表随筛选、摘要始终全量）。
+  Future<void> _loadFromCloud() async {
+    setState(() {
+      _items = null;
+      _error = null;
+    });
     try {
       final results = await Future.wait(<Future<Object>>[
         _api.fetchVerificationTasks(
@@ -118,6 +151,40 @@ class _VerifyPageState extends State<VerifyPage> {
       if (!mounted) return;
       setState(() => _error = e);
     }
+  }
+
+  /// 本地读取 + 本地筛选。摘要始终不带筛选（与旧路径同一个语义）。
+  Future<void> _readLocal({required bool firstPaint}) async {
+    if (firstPaint) {
+      setState(() {
+        _items = null;
+        _error = null;
+      });
+    }
+    try {
+      final List<VerificationTask> items = await loadVerificationTasks(
+        kDemoUserId,
+        stage: _stage.wire,
+        urgency: _urgency.wire,
+      );
+      final VerificationSummary summary = await loadVerificationSummary(kDemoUserId);
+      // 本地空且首次填充没跑完 → 保持加载态，不报「暂无待验证任务」（C5）。
+      if (items.isEmpty && !await isFirstFillComplete()) return;
+      if (!mounted) return;
+      setState(() {
+        _items = items;
+        _summary = summary;
+        _error = null;
+      });
+    } catch (e) {
+      debugPrint('[verify] 本地读取失败：$e');
+      if (firstPaint && mounted) setState(() => _items = <VerificationTask>[]);
+    }
+  }
+
+  /// 后台刷新：失败只记日志，本地列表继续可用。
+  Future<void> _refreshFromCloud() async {
+    await refreshLocalFromCloud();
   }
 
   Future<void> _applyUrgency(_UrgencyFilter f) async {

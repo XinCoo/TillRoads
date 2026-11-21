@@ -1,3 +1,5 @@
+import 'dart:async' show unawaited;
+
 import 'package:flutter/cupertino.dart';
 
 import '../api/api_client.dart' show ApiException;
@@ -7,6 +9,8 @@ import '../api/defect_api.dart';
 import '../api/verification_api.dart'
     show VerificationApi, VerificationSummary;
 import '../config/api_config.dart';
+import '../config/local_config.dart';
+import '../local/local.dart';
 import '../mock/home_mock.dart';
 import '../pages/defect_create_page.dart';
 import '../pages/mock_create_page.dart';
@@ -71,32 +75,114 @@ class _HomePageState extends State<HomePage> {
   VerificationSummary? _summary;
   ApiException? _summaryError;
 
-  /// —— 缺陷分布 ——
+  // ── 缺陷分布 ──
   Map<String, Object?>? _stats;
   ApiException? _statsError;
+
+  /// 首次填充还没跑完（本地空 + `sync.first_fill.completed != '1'`）。
+  /// 此时倒计时/分布都显示骨架，并给一行「正在连接服务器」的提示，
+  /// 而不是先报「还没有设置考试目标」再把用户吓一跳（任务书 C5 / E4）。
+  bool _syncPending = false;
 
   @override
   void initState() {
     super.initState();
+    if (kLocalFirstEnabled) kLocalDataRevision.addListener(_onLocalDataChanged);
     _loadAll();
+  }
+
+  /// 首次填充 / 后台刷新写完了本地表，重读一次（无需用户下拉）。
+  void _onLocalDataChanged() {
+    if (!mounted) return;
+    unawaited(_loadFromLocal());
   }
 
   @override
   void dispose() {
+    if (kLocalFirstEnabled) kLocalDataRevision.removeListener(_onLocalDataChanged);
     _verifyApi.close();
     _defectApi.close();
     super.dispose();
   }
 
-  /// 三路并发。每路自己吞掉异常并记在各自的 error 字段上，
-  /// 所以 `Future.wait` 不会因一路失败而整体抛出（也就不会让另两路白拉）。
+  /// 三段式加载（本地优先 R2）：
+  ///   ① 读本地 → 有数据立刻渲染（不等网络，冷启动不再卡 Neon 10–30s）；
+  ///   ② 后台打云端刷新（不显示全屏 loading）；
+  ///   ③ 刷新写回本地后由 `kLocalDataRevision` 触发重读。
+  ///
+  /// `kLocalFirstEnabled = false` 时走旧路径（三路并发直连），完全不变。
   Future<void> _loadAll() async {
     if (kUseMock) return;
+    if (!kLocalFirstEnabled) {
+      await _loadFromCloud();
+      return;
+    }
+    await _loadFromLocal();
+    unawaited(_refreshFromCloud());
+  }
+
+  /// 旧路径：三路并发。每路自己吞掉异常并记在各自的 error 字段上，
+  /// 所以 `Future.wait` 不会因一路失败而整体抛出（也就不会让另两路白拉）。
+  Future<void> _loadFromCloud() async {
     await Future.wait<void>(<Future<void>>[
       _loadProfile(),
       _loadSummary(),
       _loadStats(),
     ]);
+  }
+
+  /// 本地读取：一次 `Future.wait` 读三块，全部同步完成后再 `setState`，
+  /// 避免「倒计时到了、分布还在跳」的中间态。
+  Future<void> _loadFromLocal() async {
+    try {
+      final bool hasData = await localHasAnyData();
+      // 首次填充是否已跑完：未跑完时「本地为空」只意味着「还没拉下来」，
+      // 不能当成「确定没有数据」——两者的 UI 语义完全不同（任务书 C5）。
+      final bool fillDone = hasData || await isFirstFillComplete();
+      if (!fillDone) {
+        if (!mounted) return;
+        setState(() {
+          _profile = null;
+          _summary = null;
+          _stats = null;
+          _profileError = null;
+          _summaryError = null;
+          _statsError = null;
+          // 关键：保持 false，让倒计时继续显示骨架而不是「还没有设置考试目标」。
+          _profileLoaded = false;
+          _syncPending = true;
+        });
+        return;
+      }
+      final Map<String, Object?>? profile = await loadActiveExamProfile(kDemoUserId);
+      final VerificationSummary summary = await loadVerificationSummary(kDemoUserId);
+      final Map<String, Object?> stats = await loadDefectStats(kDemoUserId);
+      if (!mounted) return;
+      setState(() {
+        // 三块已是「本地真实值」，不再标降级：离线也能读到的数据不该带「离线数据」标记。
+        _profile = profile;
+        _summary = summary;
+        _stats = stats;
+        _profileError = null;
+        _summaryError = null;
+        _statsError = null;
+        _profileLoaded = true;
+        _syncPending = false;
+      });
+    } catch (e) {
+      // 本地库异常（极少见：磁盘满、文件损坏）→ 记日志并保持骨架，
+      // 不要在这里把页面变成错误页：后台刷新若成功仍可救回来。
+      debugPrint('[home] 本地读取失败：$e');
+    }
+  }
+
+  /// 后台刷新：失败只在日志里 warn，本地数据继续可用。
+  Future<void> _refreshFromCloud() async {
+    try {
+      await refreshLocalFromCloud();
+    } catch (e) {
+      debugPrint('[home] 后台刷新异常：$e');
+    }
   }
 
   Future<void> _loadProfile() async {
@@ -167,7 +253,11 @@ class _HomePageState extends State<HomePage> {
     }
   }
 
-  /// 下拉刷新：三路一起重拉。
+  /// 下拉刷新。
+  ///
+  /// 本地优先模式下：**先读本地（立即出结果）→ 再等一次云端刷新完成**，
+  /// 这样下拉手势会真的转圈到网络回来，用户能看到「刷新了」的反馈，
+  /// 而中途本地数据一直在（不会白屏）。
   Future<void> _refreshAll() async {
     if (kUseMock) {
       // 离线演示时给一点延迟，让刷新动画有反馈
@@ -180,6 +270,12 @@ class _HomePageState extends State<HomePage> {
       _statsError = null;
       _profileLoaded = false;
     });
+    if (kLocalFirstEnabled) {
+      await _loadFromLocal();
+      await refreshLocalFromCloud();
+      await _loadFromLocal();
+      return;
+    }
     await _loadAll();
   }
 
@@ -600,8 +696,26 @@ class _HomePageState extends State<HomePage> {
                       child: _buildCountdown(),
                     ),
                   ),
+                  // 首次填充进行中：明说一句「正在连接服务器」，
+                  // 避免用户把骨架当成卡死（任务书 E4）。
+                  if (_syncPending) ...<Widget>[
+                    const SizedBox(height: 8),
+                    Row(
+                      children: <Widget>[
+                        const CupertinoActivityIndicator(radius: 6),
+                        const SizedBox(width: 8),
+                        Text(
+                          '正在连接服务器，首次同步中…',
+                          style: const TextStyle(
+                            fontFamily: kFontFamily,
+                            fontSize: 13,
+                            color: AppColors.secondaryLabel,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ],
                   const SizedBox(height: 20),
-
                   SectionHeader(
                     text: '今日待验证',
                     trailing: _summaryTrailing(),

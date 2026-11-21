@@ -137,6 +137,31 @@ abstract class SyncTableDao {
   /// 清空整表（R3 的对账与「清空本地库」用）。
   Future<int> deleteAll(DatabaseExecutor db) => db.delete(table);
 
+  /// 只删「与云端一致」的行（保留待推送 / 冲突行）。
+  ///
+  /// R2 的回写用它而不是 [deleteAll]：整表清空会把 R4 之后离线新建、
+  /// 还没拿到 server_id 的行一起删掉（那批行 sync_state = 1/2/4）。
+  /// R2 阶段本地其实没有这类行，但先把语义定死，R4 接队列时不用回头改页面。
+  Future<int> deleteSynced(DatabaseExecutor db) =>
+      db.delete(table, where: '${Col.syncState} = 0');
+
+  /// 只删「某个父实体下、且与云端一致」的子行。
+  ///
+  /// 子表（actions / verifications）回写必须用这个而不是 [deleteSynced]：
+  /// 某张缺陷单没有动作时，若调整表 [deleteSynced] 会把**别的单**刚写进去的
+  /// 动作一并抹掉（R2 首次填充实测：9 张单里 6 张无动作，于是 6 条真实动作
+  /// 全被后处理的空列表删光，本地 actions 变成 0 行）。
+  Future<int> deleteSyncedWhere(
+    DatabaseExecutor db,
+    String where,
+    List<Object?> args,
+  ) =>
+      db.delete(
+        table,
+        where: '${Col.syncState} = 0 AND ($where)',
+        whereArgs: args,
+      );
+
   /// 总行数（设置页「本地行数」展示用）。
   Future<int> count(DatabaseExecutor db) async {
     final List<Map<String, Object?>> rows =

@@ -654,8 +654,11 @@ void main() {
 
   // ── 开关 ────────────────────────────────────────────────────────────────
   group('kLocalFirstEnabled 开关', () {
-    test('默认 false（R1 不启用本地优先）', () {
-      expect(kLocalFirstEnabled, isFalse);
+    test('R2 起默认启用本地优先', () {
+      // R1 时这里是 false（只建库不接页面）；R2 把开关翻成 true 并接上四个页面。
+      // 这条断言存在的意义：开关被误改回 false 时，本地优先会静默失效——
+      // 四个页面仍工作（走旧直连路径），没有别的测试会失败。
+      expect(kLocalFirstEnabled, isTrue);
     });
   });
 }
