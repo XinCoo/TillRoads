@@ -638,10 +638,10 @@ SELECT id, subject_id, knowledge_node_id, type, stem, options, difficulty, is_su
 
 ### 目录与依赖
 
-- `tillroad_app/lib/` 42 个 dart 文件：`main.dart` / `theme/` 1 / `config/` 2（`api_config`、`app_info`）/ `mock/` 2（`home_mock`、`defects_mock`）/ `api/` 5 / `logging/` 4 / `pages/` 16 / `widgets/` 11。
-- 运行时依赖 `cupertino_icons` + `http` + `shared_preferences` + `share_plus`；dev 依赖 `flutter_lints` + `flutter_launcher_icons`。**无状态管理库、无路由库、无图表库**。
-- 兼容平台：`android` / `ios` / `windows`（Windows 仅为本机开发期验证用，交付目标是移动端）。
-- 已知 `flutter analyze` 输出：**0 error / 0 warning / 30 info**，30 条全是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「纯 Cupertino」的约束冲突。
+- `tillroad_app/lib/` 51 个 dart 文件：`main.dart` / `theme/` 1 / `config/` 3（`api_config`、`app_info`、`local_config`）/ `mock/` 2（`home_mock`、`defects_mock`）/ `api/` 5 / `logging/` 4 / `local/` 3 + `local/dao/` 5 / `pages/` 16 / `widgets/` 11。
+- 运行时依赖 `cupertino_icons` + `http` + `shared_preferences` + `share_plus` + `sqflite` + `path`（后两个是本地优先 R1 引入，见下节）；dev 依赖 `flutter_lints` + `flutter_launcher_icons` + `sqflite_common_ffi`（**仅测试用**，不进产物）。**无状态管理库、无路由库、无图表库、无 ORM、无 build_runner**。
+- 兼容平台：`android` / `ios` / `windows`（Windows 仅为本机开发期验证用，交付目标是移动端；**Windows 上不启用本地库**，见下节）。
+- 已知 `flutter analyze` 输出：**0 error / 0 warning / 32 info**（R1 前是 30 info，新增 2 条同为 `deprecated_member_use`）。全部 info 都是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「纯 Cupertino」的约束冲突。
 
 ### 缺陷单界面（FE-03）
 
@@ -849,6 +849,38 @@ App 给外部测试用户后拿不到 adb logcat，所以自带一份「可导�
 **「退出」为什么用 push 而不是 pushAndRemoveUntil**：本页只是 Tab 的根页，把 `RootTabs` 从根 Navigator 上剥掉之后就再也回不来（本页无权重建 `ApiTokenGate`）。push 到 Token 页、保存后 `pop` 回本页，与「换一个凭证继续用」的预期一致。真正的整栈替换只发生在「清除所有数据」，那时确实需要重新走一遍启动门。
 
 **账户卡片的 ID 为什么是脱敏的**：后端已经把 `/users/:userId` 路径参数按 Bearer Token 改写成对应 user，客户端本来就拿不到也不应展示真实 userId，且无 `/me` 接口。所以直接用 `maskUuid(kDemoUserId)`（复用 `lib/logging/app_logger.dart`）显示 `1111****`，下方 12px 灰字「本机演示身份 · 真实身份由 token 决定」，**不新增任何 API 调用**。
+
+### 本地数据库（本地优先 R1，`tillroad_app/lib/local/`）
+
+> 设计文档：`docs/local-first-design.md`（第 8 章是 R1 实现记录）。**R1 只建地基，不接页面**——App 行为与本轮之前完全一致。
+
+**选型：`sqflite` 而非 Drift。** 单纯比依赖数：`sqflite` 只引入 1 个直接依赖（`path` 是它的路径依赖），Drift 要 5 个（`drift` / `drift_dev` / `build_runner` / `sqlite3_flutter_libs` / `drift_flutter`）再加一个代码生成步骤。本项目的查询只有约 15 条简单 SQL，手写映射与现有 `lib/api/*.dart` 风格一致（那里也是手写 snake_case 映射，不用 `json_serializable`），引 ORM 换不来收益。
+
+| 文件 | 行数 | 职责 |
+|---|---|---|
+| `lib/config/local_config.dart` | 23 | `kLocalFirstEnabled`（**默认 `false`**，见下）+ `kLocalDbFileName` |
+| `lib/local/local_schema.dart` | 316 | `kLocalSchemaVersion = 1` + 10 个 `CREATE TABLE` + 22 个索引（字符串常量，测试靠 `kLocalTableNames` / `kLocalIndexNames` 断言） |
+| `lib/local/local_db.dart` | 145 | `LocalDb` 单例：惰性打开、并发只开一次、`close()`、`inspect()` 查 `sqlite_master` |
+| `lib/local/dao/dao_base.dart` | 128 | `SyncState` / `PendingStatus` / `Col` / `LocalQuery` + `nowIso()` / `toLocalValue()` |
+| `lib/local/dao/sync_table_dao.dart` | 154 | 基类 CRUD：`insert` / `insertAll` / `getByPk` / `getByServerId` / `list` / `update` / `delete` / `count` / `countUnsynced`（全部收 `DatabaseExecutor`，可传 `Transaction`） |
+| `lib/local/dao/table_daos.dart` | 251 | 8 个表子类 + `LocalDaos` 聚合（含 `pending` / `meta`） |
+| `lib/local/dao/local_meta_dao.dart` | 104 | `local_meta` 读写 + `MetaKey`（`token_fingerprint` / `last_sync_at` / `sync.<resource>.<field>`） |
+| `lib/local/dao/pending_operations_dao.dart` | 233 | 写队列：`enqueue` / `listPending` / `markDone` / `markFailed` / `incrementRetry` / `markConflict` / `markDead` |
+| `lib/local/local.dart` | 26 | barrel，页面层只需一个 import |
+| `test/local_db_test.dart` | 661 | 27 个用例（E1–E5） |
+
+**10 张表**：`local_meta` / `exam_profiles` / `subjects` / `knowledge_nodes` / `defect_tickets` / `actions` / `verifications` / `mock_exams` / `review_cycles` / `pending_operations`。设计里的 `questions_cache`（T7）本轮**不建**（拍板第 6 条）；T11 `sync_state` 并入 `local_meta` 的 key/value（省一张表 + 一套 DAO）。
+
+**`defect_tickets` 本地不落 4 类列**：`actions` jsonb（与 `actions` 表重复的快照，双写会不一致）、`verification_state` jsonb（实测恒 `pending`，前端早已改读 `verifications` 数组）、`knowledge_node_title` / `subject_name`（服务端 LEFT JOIN 出来的展示字段）、`deleted_at`（本地是投影，软删行拉取时直接不落库）。
+
+**`kLocalFirstEnabled` 开关的作用**：默认 `false` ⇒ **R1 阶段没有任何代码路径会读本地库**，App 与之前逐字节等价。`main()` 里仍会 `await LocalDb.database` 确认库能打开（失败只记日志 + 把开关强制置 `false`，不拖垮启动）。R2 才把它翻成 `true` 并把页面读取接过去。选 **可变顶层变量而非 `const`** 就是为了支持这种运行时降级（与既有 `kUseMock` 同一个做法）。
+
+**数据库文件位置**：`getDatabasesPath()/tillroad_local.db`。Android 上即 `/data/data/com.tillroad.tillroad_app/databases/tillroad_local.db`（与其他 sqflite 应用一致，root 设备或 `adb shell run-as` 可见）。
+
+**Windows 不支持**：`sqflite` 的桌面实现要额外的 `sqflite_common_ffi` + `sqlite3_flutter_libs`，本轮按拍板第 5 条不做，桌面端 `kLocalFirstEnabled` 保持 `false`、继续直连云端。测试能跑是因为 `sqflite_common_ffi` 只进了 `dev_dependencies`（`test/local_db_test.dart` 里通过 `LocalDb.debugFactoryOverride` 注入）。
+
+**不声明 FOREIGN KEY**：本地是「云端投影 + 待推送队列」，父子行到达顺序由同步批次决定，硬外键会让「先到子行、父行还没拉下来」的中间态直接写失败。引用完整性靠 R3 的「先父后子」拉取顺序 + 查询不用外键假设 + 队列的 `dead` 状态兜底。
+
 ---
 
 ## 部署到 Railway

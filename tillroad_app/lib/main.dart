@@ -8,6 +8,8 @@ import 'package:flutter/foundation.dart'
 import 'api/api_client.dart' show ApiClient;
 import 'config/api_config.dart';
 import 'config/app_info.dart';
+import 'config/local_config.dart';
+import 'local/local_db.dart' show LocalDb;
 import 'logging/app_logger.dart';
 import 'logging/nav_observer.dart';
 import 'pages/defects_page.dart';
@@ -21,6 +23,8 @@ Future<void> main() async {
   // 日志初始化要尽可能早：越早接上，越不容易丢掉启动阶段的异常。
   await AppLogger.instance.init();
   _installErrorHandlers();
+  // 本地库初始化（R1）。失败不拖垮启动：降级为「不启用本地优先」并记日志。
+  await _initLocalDb();
   if (!kUseMock) {
     unawaited(_prewarm());
   }
@@ -29,6 +33,32 @@ Future<void> main() async {
     'APP',
     '启动 $kAppName v$kAppVersion（API=$kApiBaseUrl，mock=$kUseMock）',
   );
+}
+
+/// 初始化本地 SQLite（本地优先架构 R1）。
+///
+/// 任务书 D2：初始化失败时**不崩溃**——捕获异常、记 `AppLogger.error`，
+/// 并把 `kLocalFirstEnabled` 强制置 false（桌面平台没有 sqflite 实现，
+/// 这里就是它的降级点）。
+///
+/// 为什么要在这里等一次 `database`：只有真的 open 过，建表脚本才会跑。
+/// 若拖到页面里首次使用时才打开，R1 的「启动即建库」验收就没法验证。
+Future<void> _initLocalDb() async {
+  try {
+    await LocalDb.instance.database;
+    AppLogger.instance.info(
+      'DB',
+      '本地库就绪（$kLocalDbFileName，本地优先=$kLocalFirstEnabled）',
+    );
+  } catch (e, stack) {
+    LocalDb.instance.lastError = e.toString();
+    kLocalFirstEnabled = false;
+    AppLogger.instance.error(
+      'DB',
+      '本地库初始化失败，已降级为直连云端：$e',
+      stackTrace: stack.toString(),
+    );
+  }
 }
 
 /// 全局异常捕获（任务 B1）。

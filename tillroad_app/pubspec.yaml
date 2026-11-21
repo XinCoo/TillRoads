@@ -28,12 +28,24 @@ dependencies:
   shared_preferences: ^2.5.3
   share_plus: ^13.3.1
 
+  # 本地优先架构 R1（docs/local-first-design.md §3.0）：
+  # sqflite —— 本地 SQLite 的唯一运行时依赖。刻意不引 Drift：Drift 要 5 个包
+  # 且必须 build_runner 代码生成，与本工程「手写 snake_case 映射、不引 json_serializable」
+  # 的既有取向相反；本项目的本地查询只有十几条简单 SQL，用不到 ORM 的表达力。
+  sqflite: ^2.3.0
+  # path —— sqflite 拼数据库文件路径用（`join(await getDatabasesPath(), 文件名)`）。
+  # 它本来是 flutter_test 的传递依赖，显式声明是因为 lib/ 里直接 import 它。
+  path: ^1.9.0
+
 dev_dependencies:
   flutter_test:
     sdk: flutter
 
   flutter_lints: ^6.0.0
   flutter_launcher_icons: ^0.14.4
+  # sqflite 在 `flutter test` 的宿主环境没有平台实现，必须用 FFI 桥接到宿主的 sqlite3。
+  # 仅测试用，绝不进运行时依赖（否则桌面/移动端会各多带一份原生库）。
+  sqflite_common_ffi: ^2.3.0
 
 # 图标生成器配置：源图为 1024×1024 PNG（由 12500×12500 毛笔字 logo 裁字形后居中重排得到）
 # - app_icon.png            纯白底（无 alpha）→ iOS 不接受带透明通道的图标
