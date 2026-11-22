@@ -59,6 +59,9 @@ async function createMockExam(ctx) {
         duration_limit_ms: body.duration_limit_ms ?? null,
         subject_id: body.subject_id,
         knowledge_node_id: body.knowledge_node_id,
+        // ★ m17431：归属只认 token 映射出来的 userId（不信任请求体里的 user_id），
+        //   组卷时只在「公共题 + 自己的题」里抽，别人的私有题不会被抽到。
+        owner_user_id: ctx.authUserId ?? null,
       }),
     );
 

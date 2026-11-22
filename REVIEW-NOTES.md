@@ -1702,3 +1702,86 @@ LIMIT 1
 - **没做 dead 队列的 UI 管理入口**：dead 行只能在数据库里看。
 - **没改写操作的云端契约**：五页在 `kLocalDbReady == false` 时行为与 R2 之前完全一致。
 - 模考提交、复盘生成仍**必须在线**。
+
+---
+
+## 37. m17431 归档：题库导入入口 + owner_user_id 多用户隔离
+
+### 37.1 要解决的两个缺口
+
+1. **前端没有导入入口**：后端 BE-02 的导入管线（`POST /questions/import`，支持 md/txt/csv/pdf/xlsx）早就有了，但 App 里从没做过入口 —— 测试人员装上 APK 只能看到预置的 9 条缺陷单，导不进自己的题。
+2. **多用户会串题**：`questions` 表是全局的，`content_hash` 全局查重，且组卷抽题不区分人。结果是「题库变成第一个人的题库」—— A 导入的题 B 也能看见，也会被 B 的模考抽走。
+
+### 37.2 后端：最小迁移 + 三处口径对齐
+
+迁移单独成文件（**不改 `schema.sql`、不改 0001**），幂等：
+
+```sql
+-- migrations/0002_questions_owner.sql
+ALTER TABLE questions
+  ADD COLUMN IF NOT EXISTS owner_user_id uuid REFERENCES users(id);
+
+CREATE INDEX IF NOT EXISTS idx_q_owner
+  ON questions(owner_user_id)
+  WHERE owner_user_id IS NOT NULL;
+```
+
+回滚 `migrations/0002_questions_owner_down.sql`（`DROP INDEX IF EXISTS` + `DROP COLUMN IF EXISTS`）。
+
+三处必须同一口径，否则会出现「导进去了但查重不认」这类分裂：
+
+| 位置 | 改动 |
+|---|---|
+| `server/repositories/questions.mjs` 的 `findHashConflict` / `create` | 查重加 `owner_user_id = $2`（用户题）或 `owner_user_id IS NULL`（公共题）；`WRITABLE_COLUMNS` 加 `owner_user_id`，另拆 `UPDATE_COLUMNS` 排除它 —— **归属只由服务端按 token 决定** |
+| `server/import/dedupe.mjs` | 批量查重 `content_hash = ANY($1::text[]) AND owner_user_id = $2` |
+| `server/repositories/mock_exams.mjs` 的 `create` | 抽题条件加 `(owner_user_id IS NULL OR owner_user_id = $1)`；可用题量统计同步 |
+
+鉴权：`server/routes/questions_import.mjs` 的 `runImport(pool, body, ownerUserId)` 从 `ctx.authUserId` 取 userId 传下去，**不信任请求体里的 `user_id`**。
+
+新端点 `server/routes/questions.mjs`：**`GET /questions`**（原先后端**根本没有**题库列表端点）+ 别名 `GET /subjects/:id/questions`；返回 `{items,total,limit,offset}`，items **不含 `answer` / `analysis`**。
+
+### 37.3 真库里抓到的四个真 bug
+
+这四个都是我在改代码时自己「删多了」或「漏了」造成的，只有真库能暴露：
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 导入直接 500 `ReferenceError: hashes is not defined` | `dedupe.mjs` 里 `const hashes = ...` 与空数组早退被一次 edit 整段删掉 | 补回两段 |
+| 2 | A/B 都判不出重 | `questions.create` 里 `if (dup) throw duplicateQuestionError(...)` 被删掉 | 补回 |
+| 3 | 更新题目不再查重 | `questions.update` 里同一段 `if (dup) throw ...` 被删掉 | 补回，并按**该行自己的归属**分域 |
+| 4 | 导入成功但 `owner_user_id` 全是 NULL | `createCtx` 加了 `owner_user_id`，但 `toCreateInput()` **没把它写进返回对象** | 在返回对象里补 `owner_user_id: ctx.owner_user_id ?? null` |
+
+另外发现「A 的题被 B 抽到 5 道」的**误判**：验证脚本一开始用题干字符串判归属，而 A/B 导入的是同一份文件（题干完全相同）。改成**按题目 id 回查 `owner_user_id`** 后结论正确。
+
+### 37.4 前端：两个新页面 + 一个新依赖
+
+- `lib/api/question_api.dart`：`BankQuestion`（含 `typeLabel` / `sourceLabel` / `preview` / `isMine`）、`ImportResult`、`QuestionApi.fetchQuestions` / `importQuestions`。
+- `lib/pages/question_bank_page.dart`：大标题「题库」+ 右上「导入」；按科目分组；空态「还没有题目，点右上角导入」；加载 / 错误 + 重试三态。
+- `lib/pages/question_import_page.dart`：选文件 → 选科目 → 选考点（可选）→ base64 上传 → 结果页（新增 / 判重 / 解析失败三行数字 + 已存在题干列表）；`413` / `422` / `415` / `400` 各自映射成人话提示；前端先校验 ≤10MB。
+- `lib/pages/profile_page.dart`：功能列表在「我的复盘」与「设置」之间插入「题库管理」。
+- 唯一新依赖 **`file_picker`**。⚠️ 版本必须是 **^13.4.1**：8.x 依赖 `win32 ^5`，与 `share_plus 13.x`（`win32 ^6`）冲突，pub 解析不出来。13.x 的 API 也变了 —— `FilePicker.pickFiles(...)` 是**静态方法**直接返回 `List<PlatformFile>`，大小用 `await file.length()`、内容用 `await file.readAsBytes()`。
+
+### 37.5 验收证据
+
+Neon 真库（共享科目场景，把一个 subject 同时挂到 A、B 两个 profile）：
+
+| 步骤 | 结果 |
+|---|---|
+| A 导入 12 题 | 200，imported 12 / dups 0，`owner_user_id` 全为 A |
+| B 导入**同一份文件** | 200，imported 12 / dups 0（**不判重**） |
+| A 再导入同一份文件 | 200，imported 0 / dups 12（**判重**） |
+| 同 hash 在两个 owner 下各存一份 | 12 组（各 2 条） |
+| B 组卷（full，5 题） | 抽题归属 `{B:5}`，**A 私有题命中 0** |
+| `GET /questions` | A 只看到 A + 公共；B 只看到 B + 公共；**A 私有题泄漏给 B = 0** |
+
+Android 17 模拟器真机（debug APK + `adb reverse tcp:3000`）：「我的 → 题库管理 → 导入 → 选文件（系统选择器）→ 选科目 → 开始导入 → 新增 12 → 列表显示「选择题 / 导入 / 我导入的」→ 再导入同一文件 → 判重 12」。B 用户（`tk_test_002`）另装一个 APK 导入同一份文件 → imported 12（owner 不同不判重）。
+
+错误码直连验证：413 `PAYLOAD_TOO_LARGE` / 422 `UNSUPPORTED_PDF`（扫描版）/ 415 `UNSUPPORTED_MEDIA` / 400 `EMPTY_CONTENT`。
+
+截图：`screenshots/fe08-profile-entry.png`（题库管理入口）/ `fe08-import-before.png`（导入页选文件前）/ `fe08-importing.png`（上传中）/ `fe08-import-result.png`（新增 12）/ `fe08-import-duplicates.png`（判重 12）/ `fe08-import-userb.png`（B 用户导入 12）/ `fe08-bank-list.png`（题库列表带「我导入的」）。
+
+### 37.6 数字与遗留
+
+- `npm test` → 317 tests / 194 pass / 0 fail / 123 skipped（集成测试本机仍 skip，CI 用 PG15 容器）。
+- `flutter analyze` → **0 error / 0 warning / 57 info**；`flutter test` → **106/106**。
+- 遗留：题库编辑 / 删除 / 按考点筛选、AI 生成题入口、题库本地缓存（R5 拍板）、`questions` 表的 owner 列**不回填**存量种子题（它们保持公共题 `owner_user_id IS NULL`）。

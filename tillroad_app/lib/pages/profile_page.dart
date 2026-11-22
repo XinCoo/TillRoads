@@ -43,6 +43,7 @@ import '../theme/app_theme.dart';
 import '../widgets/common.dart';
 import 'api_token_page.dart';
 import 'mock_page.dart';
+import 'question_bank_page.dart';
 import 'review_page.dart';
 import 'settings_page.dart';
 import 'verify_page.dart';
@@ -429,6 +430,12 @@ class _ProfilePageState extends State<ProfilePage> {
     Navigator.of(context).push<void>(appRoute<void>(context, const ReviewPage()));
   }
 
+  void _openQuestionBank() {
+    Navigator.of(
+      context,
+    ).push<void>(appRoute<void>(context, const QuestionBankPage()));
+  }
+
   void _openSettings() {
     Navigator.of(
       context,
@@ -717,6 +724,11 @@ class _ProfilePageState extends State<ProfilePage> {
         icon: CupertinoIcons.chart_bar,
         title: '我的复盘',
         onTap: _openReview,
+      ),
+      _EntryRow(
+        icon: CupertinoIcons.doc_text,
+        title: '题库管理',
+        onTap: _openQuestionBank,
       ),
       _EntryRow(
         icon: CupertinoIcons.gear,

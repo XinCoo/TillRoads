@@ -31,13 +31,14 @@ export function contentHashOf(question = {}) {
  *
  * @param {Array<object>} questions splitQuestions 的产出（可带 formula_text）
  * @param {{query: Function}} client pg Pool / PoolClient / fake client
+ * @param {string|null} [ownerUserId] 归属用户（m17431）。传了就在「该用户自己的题」域里查重；
+ *   不传（公共题 / seed 数据）就在公共题域里查重。
  * @returns {Promise<{newQuestions: Array<object>, duplicates: Array<{content_hash: string, existing_id: string, stem: string}>}>}
  *
  * 为什么用一次 IN 查询而不是逐题 SELECT：一份 20 题的样本会产生 20 次往返，
- * 而 IN 一次就够。同时在批内也去重（同一份文件里出现两遍同一道题，
  * 第二次也应算重复，否则入库时唯一性判断会打架）。
  */
-export async function dedupe(questions = [], client) {
+export async function dedupe(questions = [], client, ownerUserId = null) {
   const prepared = [];
   const seenInBatch = new Map(); // hash -> stem，用于批内去重
 
@@ -63,13 +64,25 @@ export async function dedupe(questions = [], client) {
   }
 
   const hashes = prepared.map((q) => q.content_hash);
-  const { rows } = await client.query(
-    `SELECT id, content_hash
-       FROM questions
-      WHERE content_hash = ANY($1::text[])
-        AND deleted_at IS NULL`,
-    [hashes],
-  );
+
+  // ★ m17431：批量查重**按 owner 分域**。
+  //   - ownerUserId 非空：只在该用户自己的题里找重复（`owner_user_id = $2`）。
+  //     用户 A 导入过的题，用户 B 导入同一份文件不会被判重。
+  //   - ownerUserId 为空（公共题）：只在公共题里找（`owner_user_id IS NULL`），
+  //     公共题不参与用户去重。
+  const sql = ownerUserId
+    ? `SELECT id, content_hash
+         FROM questions
+        WHERE content_hash = ANY($1::text[])
+          AND deleted_at IS NULL
+          AND owner_user_id = $2`
+    : `SELECT id, content_hash
+         FROM questions
+        WHERE content_hash = ANY($1::text[])
+          AND deleted_at IS NULL
+          AND owner_user_id IS NULL`;
+  const params = ownerUserId ? [hashes, ownerUserId] : [hashes];
+  const { rows } = await client.query(sql, params);
 
   const existing = new Map(rows.map((r) => [r.content_hash, r.id]));
 

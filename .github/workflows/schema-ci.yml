@@ -94,7 +94,26 @@ jobs:
           psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql 2>&1 | tee /tmp/up3.log
           grep -q 'SCHEMA_VERIFY_OK' /tmp/up3.log
 
-  # -------------------------------------------------------------------------
+      # m17431：增量迁移 0002（questions.owner_user_id）。
+      # 独立脚本、可重复执行；这里连跑两次验证幂等，再跑 down 验证可逆。
+      - name: Up #4 — apply incremental migration 0002 (questions.owner_user_id)
+        run: |
+          set -euo pipefail
+          psql -v ON_ERROR_STOP=1 -f migrations/0002_questions_owner.sql 2>&1 | tee /tmp/up4.log
+          psql -v ON_ERROR_STOP=1 -f migrations/0002_questions_owner.sql 2>&1 | tee /tmp/up4b.log
+          psql -v ON_ERROR_STOP=1 -Atc "select count(*) from information_schema.columns where table_name='questions' and column_name='owner_user_id'" | grep -qx '1'
+          psql -v ON_ERROR_STOP=1 -Atc "select count(*) from pg_indexes where indexname='idx_q_owner'" | grep -qx '1'
+
+      - name: Down #4 — rollback incremental migration 0002 (可下)
+        run: |
+          set -euo pipefail
+          psql -v ON_ERROR_STOP=1 -f migrations/0002_questions_owner_down.sql
+          psql -v ON_ERROR_STOP=1 -Atc "select count(*) from information_schema.columns where table_name='questions' and column_name='owner_user_id'" | grep -qx '0'
+
+      - name: Up #5 — re-apply incremental migration 0002 (可上)
+        run: psql -v ON_ERROR_STOP=1 -f migrations/0002_questions_owner.sql
+
+bTc
   # BE-01 第 2 步新增: Node 单测 + 一条 PG smoke 集成测试。
   # 与 schema job 用 needs 串联: 先确认 schema 可上/幂等/可逆, 再跑 Node 测试。
   # services 是 job 级作用域(不能跨 job 共享同一容器), 这里复用同一份

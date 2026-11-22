@@ -34,7 +34,9 @@ const skipOpt = RUN
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(HERE, '..', '..');
-const SCHEMA_SQL = readFileSync(join(ROOT, 'schema.sql'), 'utf8');
+// ★ m17431：schema 解冻后要连「基线 schema + 增量迁移」一起跑
+//   （owner_user_id 列在 migrations/0002_questions_owner.sql 里，不在 schema.sql 里）。
+import { FULL_SCHEMA_SQL } from './../db/test_schema.mjs';
 const FIXTURES = join(ROOT, 'tests', 'fixtures', 'questions');
 
 let pool;
@@ -76,7 +78,7 @@ before(async () => {
 
   try {
     await withTransaction(pool, async (client) => {
-      await client.query(SCHEMA_SQL);
+      await client.query(FULL_SCHEMA_SQL);
     });
   } catch (err) {
     throw new Error(`before: 执行 schema.sql 失败（已回滚）—— ${err.message}`);

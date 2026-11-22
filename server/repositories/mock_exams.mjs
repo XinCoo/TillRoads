@@ -123,11 +123,22 @@ export async function create(client, input = {}) {
     scopeParams = [input.knowledge_node_id];
   }
 
+  // ★ m17431：抽题只在「公共题 + 该用户自己的题」范围内。
+  //   以前所有题都是公共的（questions 表没有 owner 列），现在用户导入的题是
+  //   私有题，别人的私有题绝不能被抽进自己的模考（否则会出现「我考到了别人的题」）。
+  //   ownerUserId 为空（未鉴权的内部调用 / seed 数据）时不过滤，保持旧行为。
+  const ownerUserId = input.owner_user_id ?? null;
+  let ownerSql = '';
+  if (ownerUserId) {
+    scopeParams.push(ownerUserId);
+    ownerSql = ' AND (owner_user_id IS NULL OR owner_user_id = $' + scopeParams.length + ')';
+  }
+  const whereSql = 'deleted_at IS NULL AND ' + scopeSql + ownerSql;
+
   // 可用题量（先查，给出准确的 available 数字）
   const countRow = await queryOne(
     client,
-    `SELECT count(*)::int AS available FROM questions
-      WHERE deleted_at IS NULL AND ${scopeSql}`,
+    'SELECT count(*)::int AS available FROM questions WHERE ' + whereSql,
     scopeParams,
   );
   const available = countRow?.available ?? 0;
@@ -136,9 +147,8 @@ export async function create(client, input = {}) {
   // 随机抽题（ORDER BY random() 是 PG 原生随机，MVP 不引入抽样算法）
   const picked = await queryMany(
     client,
-    `SELECT ${PUBLIC_QUESTION_COLUMNS} FROM questions
-      WHERE deleted_at IS NULL AND ${scopeSql}
-      ORDER BY random() LIMIT $${scopeParams.length + 1}`,
+    'SELECT ' + PUBLIC_QUESTION_COLUMNS + ' FROM questions WHERE ' + whereSql +
+      ' ORDER BY random() LIMIT $' + (scopeParams.length + 1),
     [...scopeParams, count],
   );
 

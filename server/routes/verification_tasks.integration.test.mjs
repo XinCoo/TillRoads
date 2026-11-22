@@ -29,7 +29,9 @@ const RUN = process.env.RUN_PG_INTEGRATION === '1';
 const skipOpt = RUN ? {} : { skip: '本机无 PG；设 RUN_PG_INTEGRATION=1 才运行（CI 会设）' };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SCHEMA_SQL = readFileSync(join(HERE, '..', '..', 'schema.sql'), 'utf8');
+// ★ m17431：schema 解冻后要连「基线 schema + 增量迁移」一起跑
+//   （owner_user_id 列在 migrations/0002_questions_owner.sql 里，不在 schema.sql 里）。
+import { FULL_SCHEMA_SQL } from './../db/test_schema.mjs';
 
 let pool;
 let app;
@@ -165,7 +167,7 @@ before(async () => {
   pool = createPool();
   try {
     await withTransaction(pool, async (client) => {
-      await client.query(SCHEMA_SQL);
+      await client.query(FULL_SCHEMA_SQL);
     });
   } catch (err) {
     throw new Error(`before: 执行 schema.sql 失败（已回滚）—— ${err.message}`);

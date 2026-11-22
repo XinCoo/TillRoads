@@ -498,6 +498,18 @@ export function createFakeRepos() {
     rows() {
       return questionPool.map((r) => ({ ...r }));
     },
+    // ★ m17431：与真实仓储 listVisible 同口径（公共题 + 自己的题）。
+    async listVisible(_client, { limit = 50, offset = 0, ownerUserId = null, subjectId = null } = {}) {
+      const rows = questionPool.filter((q) => {
+        if (q.deleted_at) return false;
+        if (subjectId && q.subject_id !== subjectId) return false;
+        if (ownerUserId && q.owner_user_id != null && q.owner_user_id !== ownerUserId) {
+          return false;
+        }
+        return true;
+      });
+      return rows.slice(offset, offset + limit).map((r) => ({ ...r }));
+    },
   };
 
   const attempts = {
@@ -562,7 +574,16 @@ export function createFakeRepos() {
       }
       const scope = input.mode === 'full' ? input.subject_id : input.knowledge_node_id;
       const field = input.mode === 'full' ? 'subject_id' : 'knowledge_node_id';
-      const available = questionPool.filter((q) => !q.deleted_at && q[field] === scope);
+      // ★ m17431：只抽「公共题 + 该用户自己的题」，别人的私有题不可见。
+      //   owner_user_id 为空（未鉴权调用 / seed）时不过滤，保持旧行为。
+      const ownerUserId = input.owner_user_id ?? null;
+      const visible = questionPool.filter(
+        (q) =>
+          !q.deleted_at &&
+          q[field] === scope &&
+          (ownerUserId ? q.owner_user_id == null || q.owner_user_id === ownerUserId : true),
+      );
+      const available = visible;
       if (available.length < count) {
         const e = new Error('INSUFFICIENT_QUESTIONS');
         e.code = 'INSUFFICIENT_QUESTIONS';

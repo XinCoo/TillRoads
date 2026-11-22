@@ -44,7 +44,20 @@ export const WRITABLE_COLUMNS = Object.freeze([
   'content_hash',
   'asset_refs',
   'is_subjective',
+  // 归属用户（m17431）：NULL = 公共题（seed / 系统题），非 NULL = 用户私有题。
+  // 查重与组卷抽题都按这一列分域，见 findHashConflict 的注释。
+  'owner_user_id',
 ]);
+
+/**
+ * UPDATE 允许列（乐观锁）。
+ *
+ * 刻意**不含** owner_user_id：归属是「谁导进来的」，只能由服务端按 token 决定，
+ * 不允许客户端 PATCH 把它改成别人的 id（否则就能「认领」别人的题）。
+ */
+const UPDATE_COLUMNS = Object.freeze(
+  WRITABLE_COLUMNS.filter((c) => c !== 'owner_user_id'),
+);
 
 const INSERT_COLUMNS = Object.freeze([...WRITABLE_COLUMNS]);
 
@@ -81,15 +94,27 @@ function duplicateQuestionError(current, incoming) {
   return err;
 }
 
-/** 查同 hash 的未软删行（返回整行，便于 409 body 里带上已有题让客户端展示）。 */
-async function findHashConflict(client, contentHash) {
-  return findDuplicate(
-    client,
-    `SELECT * FROM ${TABLE} WHERE content_hash = $1 AND deleted_at IS NULL`,
-    [contentHash],
-  );
+/**
+ * 查同 hash 的未软删行（返回整行，便于 409 body 里带上已有题让客户端展示）。
+ *
+ * ★ m17431：查重**按 owner 分域**。
+ *   - ownerUserId 非空（用户导入的题）：只在**该用户自己**的题里查重
+ *     `owner_user_id = $2`。这样用户 A 导入过的题，用户 B 导入同一份文件不会
+ *     被判重 —— 否则题库就变成「第一个人的题库」。
+ *   - ownerUserId 为空（公共题 / seed 数据）：只在公共题里查重
+ *     `owner_user_id IS NULL`；公共题不参与用户去重。
+ *   - 公共题对所有用户可见，所以用户导入的题与公共题同 hash 也不算重复
+ *     （用户可以有自己的副本，组卷时抽到哪份都不影响正确性）。
+ */
+async function findHashConflict(client, contentHash, ownerUserId = null) {
+  const sql = ownerUserId
+    ? `SELECT * FROM ${TABLE}
+        WHERE content_hash = $1 AND deleted_at IS NULL AND owner_user_id = $2`
+    : `SELECT * FROM ${TABLE}
+        WHERE content_hash = $1 AND deleted_at IS NULL AND owner_user_id IS NULL`;
+  const params = ownerUserId ? [contentHash, ownerUserId] : [contentHash];
+  return findDuplicate(client, sql, params);
 }
-
 /**
  * 建题。
  *
@@ -108,11 +133,13 @@ export async function create(client, input = {}) {
 
   const contentHash = contentHashOf(input);
 
-  const dup = await findHashConflict(client, contentHash);
+  // owner_user_id 由调用方（导入路由）传入，且只认 token 映射出来的 userId，
+  // 不信任请求体里的 user_id（m17431 A4）。
+  const ownerUserId = input.owner_user_id ?? null;
+  const dup = await findHashConflict(client, contentHash, ownerUserId);
   if (dup) {
     throw duplicateQuestionError(dup, { content_hash: contentHash, stem: input.stem });
   }
-
   const values = [
     input.source,
     input.subject_id ?? null,
@@ -130,6 +157,8 @@ export async function create(client, input = {}) {
     input.asset_refs ?? null,
     // 列 NOT NULL DEFAULT false：显式给值，不依赖 DEFAULT（与四表仓储的 status 同处理）
     input.is_subjective ?? false,
+    // 归属：NULL = 公共题。列可空（不设 NOT NULL），公共题必须是 NULL。
+    ownerUserId,
   ];
 
   return insertRow(client, TABLE, INSERT_COLUMNS, values);
@@ -141,21 +170,65 @@ export async function getById(client, id) {
 }
 
 /** 列某科目的题（分页，稳定排序）。 */
-export async function listBySubject(client, subjectId, { limit, offset } = {}) {
+/**
+ * 列某科目的题（分页，稳定排序）。
+ *
+ * ★ m17431：加 ownerUserId 后按域过滤 ——
+ *   - ownerUserId 非空：只看「公共题 + 该用户自己的题」，别人的私有题不可见；
+ *   - ownerUserId 为空（未鉴权的内部调用）：不加 owner 过滤（保持旧行为）。
+ */
+export async function listBySubject(client, subjectId, { limit, offset, ownerUserId } = {}) {
   const p = pageParams({ limit, offset });
-  return listRows(client, TABLE, ['subject_id = $1', 'deleted_at IS NULL'], [subjectId], p);
+  const where = ['subject_id = $1', 'deleted_at IS NULL'];
+  const params = [subjectId];
+  if (ownerUserId) {
+    params.push(ownerUserId);
+    where.push(`(owner_user_id IS NULL OR owner_user_id = $${params.length})`);
+  }
+  return listRows(client, TABLE, where, params, p);
 }
 
 /** 列某知识点下的题（分页）。知识点为空时前端多半会退回到按科目列。 */
-export async function listByKnowledgeNode(client, knowledgeNodeId, { limit, offset } = {}) {
+/**
+ * 列某知识点下的题（分页）。知识点为空时前端多半会退回到按科目列。
+ * owner 过滤口径同 listBySubject。
+ */
+export async function listByKnowledgeNode(
+  client,
+  knowledgeNodeId,
+  { limit, offset, ownerUserId } = {},
+) {
   const p = pageParams({ limit, offset });
-  return listRows(
-    client,
-    TABLE,
-    ['knowledge_node_id = $1', 'deleted_at IS NULL'],
-    [knowledgeNodeId],
-    p,
-  );
+  const where = ['knowledge_node_id = $1', 'deleted_at IS NULL'];
+  const params = [knowledgeNodeId];
+  if (ownerUserId) {
+    params.push(ownerUserId);
+    where.push(`(owner_user_id IS NULL OR owner_user_id = $${params.length})`);
+  }
+  return listRows(client, TABLE, where, params, p);
+}
+
+/**
+ * 列某个用户可见的全部题（题库列表页用）。
+ *
+ * 可见集合 = 公共题（owner_user_id IS NULL）+ 该用户自己的题。
+ * 只读端点，不含 answer / analysis 的剔除 —— 那由路由层做。
+ */
+export async function listVisible(client, { limit, offset, ownerUserId, subjectId, orderBy } = {}) {
+  const p = pageParams({ limit, offset });
+  const where = ['deleted_at IS NULL'];
+  const params = [];
+  if (subjectId) {
+    params.push(subjectId);
+    where.push(`subject_id = $${params.length}`);
+  }
+  if (ownerUserId) {
+    params.push(ownerUserId);
+    where.push(`(owner_user_id IS NULL OR owner_user_id = $${params.length})`);
+  }
+  // 题库列表默认「最新导入的排最前」—— 用户刚导入完要能立刻在第一屏看到自己导入的题。
+  // 其余调用方（目前只有题库端点）可传 orderBy 覆盖。
+  return listRows(client, TABLE, where, params, { ...p, orderBy: orderBy || 'created_at DESC, id DESC' });
 }
 
 /**
@@ -189,11 +262,18 @@ export async function update(client, id, patch = {}, baseVersion) {
     const contentHash = contentHashOf(merged);
 
     // 排除自己：只改标点导致 hash 变化时不该撞自己；hash 反而变回原值时也不该 409。
+    // ★ m17431：查重按**这一行自己的归属**分域（公共题在公共题域里查，
+    //   用户私有题在该用户域里查），避免改公共题时撞上别人的同名私有题。
+    const ownerSql = current.owner_user_id
+      ? 'AND owner_user_id = $3'
+      : 'AND owner_user_id IS NULL';
     const dup = await findDuplicate(
       client,
       `SELECT * FROM ${TABLE}
-        WHERE content_hash = $1 AND deleted_at IS NULL AND id <> $2`,
-      [contentHash, id],
+        WHERE content_hash = $1 AND deleted_at IS NULL AND id <> $2 ${ownerSql}`,
+      current.owner_user_id
+        ? [contentHash, id, current.owner_user_id]
+        : [contentHash, id],
     );
     if (dup) {
       throw duplicateQuestionError(dup, { content_hash: contentHash, stem: merged.stem });
@@ -206,7 +286,7 @@ export async function update(client, id, patch = {}, baseVersion) {
     id,
     baseVersion,
     patch: next,
-    allowedColumns: WRITABLE_COLUMNS,
+    allowedColumns: UPDATE_COLUMNS,
   });
 }
 

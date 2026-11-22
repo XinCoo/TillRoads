@@ -30,24 +30,30 @@ try {
 const { createPool } = await import('../server/db/pool.mjs');
 
 const down = process.argv.includes('--down');
-const file = down ? 'migrations/0001_init_down.sql' : 'schema.sql';
+
+// ★ m17431：schema 解冻后，schema.sql 不再是唯一事实来源。
+//   这里按顺序执行「增量迁移文件」——它们都是纯 SQL 且幂等（IF NOT EXISTS / IF EXISTS），
+//   可以重复执行。新增迁移时把文件加进对应数组即可，不要改 0001。
+const UP_MIGRATIONS = ['migrations/0002_questions_owner.sql'];
+const DOWN_MIGRATIONS = ['migrations/0002_questions_owner_down.sql'];
+
+const files = down
+  ? [...DOWN_MIGRATIONS, 'migrations/0001_init_down.sql']
+  : ['schema.sql', ...UP_MIGRATIONS];
 const label = down ? 'DROP（清理）' : 'CREATE（建表）';
 
-console.log(`[migrate] ${label} ← ${file}`);
-
-let sql;
-if (down) {
-  // down 脚本是普通 SQL（DROP TABLE/FUNCTION/TYPE），可直接执行
-  sql = await readFile(join(ROOT, file), 'utf8');
-} else {
-  // up 走 schema.sql 单一事实来源（0001_init_up.sql 只是 \ir 包装）
-  sql = await readFile(join(ROOT, 'schema.sql'), 'utf8');
+console.log(`[migrate] ${label} ← ${files.join(' , ')}`);
+const statements = [];
+for (const f of files) {
+  const text = await readFile(join(ROOT, f), 'utf8');
+  if (/^\s*\\/m.test(text)) {
+    console.error(`[migrate] ${f} 含 psql 元命令（行首 \\）——本脚本只能执行纯 SQL 文件`);
+    process.exit(1);
+  }
+  statements.push(text);
 }
+const sql = statements.join('\n');
 
-if (/^\s*\\/m.test(sql)) {
-  console.error('[migrate] 检测到 psql 元命令（行首 \\）——本脚本只能执行纯 SQL 文件');
-  process.exit(1);
-}
 
 const pool = createPool();
 const started = Date.now();

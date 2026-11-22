@@ -37,6 +37,16 @@ dependencies:
   # 它本来是 flutter_test 的传递依赖，显式声明是因为 lib/ 里直接 import 它。
   path: ^1.9.0
 
+  # m17431（题库导入入口）：唯一新增依赖。
+  # file_picker —— 用户从手机「文件」里选 .md/.txt/.csv/.pdf/.xlsx 交给导入管线。
+  # 不用 image_picker 的理由：题目文件是文档不是图片；
+  # 不用 desktop_drop 的理由：那只管桌面拖放，移动端分发要的是系统文件选择器。
+  # 注意版本：任务书建议 ^8.0.0，但 file_picker 8.x 依赖 win32 ^5，
+  # 与 share_plus 13.x（win32 ^6）冲突，pub 解析不出来。
+  # 这里升到 file_picker 13.x（与 share_plus 13.x 同代 win32），
+  # API 形状不变（FilePicker.platform.pickFiles / FilePickerResult.files.first.bytes）。
+  file_picker: ^13.4.1
+
 dev_dependencies:
   flutter_test:
     sdk: flutter

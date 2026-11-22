@@ -25,6 +25,7 @@ import * as capabilityLayers from './capability_layers.mjs';
 import * as mockExams from './mock_exams.mjs';
 import * as defectTickets from './defect_tickets.mjs';
 import * as questionsImport from './questions_import.mjs';
+import * as questions from './questions.mjs';
 import * as verificationTasks from './verification_tasks.mjs';
 import * as reviewCycles from './review_cycles.mjs';
 
@@ -47,6 +48,10 @@ export const ROUTE_MODULES = Object.freeze([
   { name: 'review_cycles', match: reviewCycles.match },
   { name: 'defect_tickets', match: defectTickets.match },
   { name: 'questions_import', match: questionsImport.match },
+  // m17431：题库列表读取端点（GET /questions）。
+  // 必须排在 questions_import 之后 —— 前者只认 POST /questions/import，
+  // 但保持「长/具体在前」的顺序习惯，将来加 POST /questions 时不会被截胡。
+  { name: 'questions', match: questions.match },
   // BE-04：纯查询端点（GET /users/:id/verification-tasks|verification-summary）。
   // 放最后是因为它只认 seg.length===3 且 seg[2] 是固定字面量，不会遮蔽任何已有路径。
   { name: 'verification_tasks', match: verificationTasks.match },

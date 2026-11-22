@@ -106,6 +106,9 @@ function toCreateInput(question, ctx) {
     options: question.options,
     answer: question.answer,
     analysis: question.analysis,
+    // ★ m17431：归属由服务端按 token 决定（ctx.owner_user_id），
+    //   不信任请求体里的 user_id。缺省 null = 公共题。
+    owner_user_id: ctx.owner_user_id ?? null,
     // V1 接入对象存储后这里会是真 asset 引用；MVP 恒为 null（见 server/import/separate.mjs）
     asset_refs: assets.asset_refs.length > 0 ? assets.asset_refs : null,
     is_subjective: ctx.default_type === 'short_answer' || ctx.default_type === 'essay',
@@ -116,7 +119,7 @@ function toCreateInput(question, ctx) {
  * 执行导入（四阶段）。
  * 单独导出，便于集成测试直接调用而不必起 HTTP。
  */
-export async function runImport(pool, body = {}) {
+export async function runImport(pool, body = {}, ownerUserId = null) {
   if (!body.filename || String(body.filename).trim() === '') {
     throw Object.assign(new Error('filename 必填'), { code: 'MISSING_FILENAME' });
   }
@@ -148,6 +151,10 @@ export async function runImport(pool, body = {}) {
     subject_id: body.subject_id || null,
     knowledge_node_id: body.knowledge_node_id || null,
     default_type: body.default_type || DEFAULT_TYPE,
+    // ★ m17431：归属只认 token 映射出来的 userId，不信任请求体里的 user_id。
+    //   请求体里的 user_id 会被 server/index.mjs 改写成 authUserId，
+    //   但这里仍显式用 ownerUserId 参数，避免任何调用方绕过鉴权。
+    owner_user_id: ownerUserId ?? null,
   };
 
   const candidates = split.questions.map((q) => toCreateInput(q, createCtx));
@@ -162,7 +169,11 @@ export async function runImport(pool, body = {}) {
   // 阶段 3 + 4：去重与入库必须在同一事务内 —— 否则两个并发导入同一份文件时，
   // 双方都能通过 dedupe（此时还都没写），然后双双插入同 hash 的两行。
   return withTransaction(pool, async (client) => {
-    const { newQuestions, duplicates } = await dedupe(candidates, client);
+    const { newQuestions, duplicates } = await dedupe(
+      candidates,
+      client,
+      ownerUserId ?? null,
+    );
 
     const imported = [];
     for (const item of newQuestions) {
@@ -203,12 +214,12 @@ export async function runImport(pool, body = {}) {
 }
 
 export function match(method, seg, ctx) {
-  const { pool, body } = ctx;
+  const { pool, body, authUserId } = ctx;
 
   if (method === 'POST' && seg.length === 2 && seg[0] === 'questions' && seg[1] === 'import') {
     return (async () => {
       try {
-        const result = await runImport(pool, body);
+        const result = await runImport(pool, body, authUserId ?? null);
         return ok(result, 200);
       } catch (err) {
         // 请求体形状问题（缺 filename / base64 非法）在本层翻译成 400，
@@ -228,7 +239,7 @@ export function match(method, seg, ctx) {
     // 兼容别名：早期文档里写成 /questions-import，保留以免调用方改两次。
     return (async () => {
       try {
-        const result = await runImport(pool, body);
+        const result = await runImport(pool, body, authUserId ?? null);
         return ok(result, 200);
       } catch (err) {
         if (err && !err.statusCode && typeof err.code === 'string' && err.code.startsWith('MISSING')) {

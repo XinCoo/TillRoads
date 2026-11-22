@@ -33,7 +33,9 @@ const skipOpt = RUN
   : { skip: '本机无 PG；设 RUN_PG_INTEGRATION=1 才运行（CI 会设）' };
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const SCHEMA_SQL = readFileSync(join(HERE, '..', '..', 'schema.sql'), 'utf8');
+// ★ m17431：schema 解冻后要连「基线 schema + 增量迁移」一起跑
+//   （owner_user_id 列在 migrations/0002_questions_owner.sql 里，不在 schema.sql 里）。
+import { FULL_SCHEMA_SQL } from './../db/test_schema.mjs';
 
 let pool;
 let seed; // { userId, profileId, subjectId }
@@ -73,7 +75,7 @@ before(async () => {
   //   注意：PG 的 DDL 是事务性 的（CREATE TABLE/TYPE/INDEX/FUNCTION 均可回滚）。
   try {
     await withTransaction(pool, async (client) => {
-      await client.query(SCHEMA_SQL);
+      await client.query(FULL_SCHEMA_SQL);
     });
   } catch (err) {
     // 明确报错终止，绝不让后续 test 在半个 schema 上跑出误导性结果
