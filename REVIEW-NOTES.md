@@ -1483,3 +1483,83 @@ UUID 只保留前 4 位而不是全删：同一个用户的日志要能看出「
 任务书第 7 条要求「导出运行日志」**直接调用 `showLogActionsSheet(context)` 复用现有逻辑**。实际实现是 `settings_page.dart` 自己写了一份 `_exportLogs()`（确认弹窗文案 + `exportLogs()` + `SharePlus.instance.share`）。原因：`showLogActionsSheet` 是一个**三选一的 ActionSheet**（导出 / 清空 / 取消），而设置页已经是「一行一功能」的列表——点「导出运行日志」却弹出包含「清空日志」的二级选单，与页面信息架构重复。代码注释里已明写「两边若改动需同步」。
 
 副产物：`lib/widgets/log_export_sheet.dart` 里的 `showLogActionsSheet()` 与 `LogExportButton` 现已**无任何调用方**（只用到它的两个常量 `kLogExportIcon` / `kLogExportLabel`）——属死代码，但本轮不删文件（与「不删三页」同理保守处理），建议下轮清理。
+
+## 35. R4a 归档（本地状态机 + 写队列 + 推送引擎 + 简单冲突处理）
+
+### 范围与硬约束
+
+- 本轮把**写路径**也本地化：断网时乐观更新 + 入队，联网后由推送引擎补推。R2 已经把「读」搬到了本地。
+- **跳过 R3**（增量对账）：后端没有 `updated_since`，B/C 两档都要改后端；R2 的页面刷新已覆盖读同步的核心需求，断网可写更紧迫。
+- 硬约束遵守情况：后端与 `schema.sql` **零改动**；读路径（`local_queries.dart` / `local_refresh.dart` / `first_fill.dart`）只做「把详情回写本地」的增量，**不改读语义**；模考提交与复盘生成仍必须在线；**未引入任何新依赖**；`core/index.mjs` **未改**（只在 Dart 侧移植）；未建 `questions_cache`；`flutter analyze` 0 error；未执行任何 git 命令。
+
+### 三个新文件
+
+| 文件 | 行数 | 职责 |
+| --- | --- | --- |
+| `lib/local/local_state_machine.dart` | 386 | `core/index.mjs` 纯函数的 Dart 移植；非法抛 `LocalValidationException` |
+| `lib/local/write_queue.dart` | 604 | 五类写操作「本地校验 → 乐观写库 → 入队」 |
+| `lib/local/push_engine.dart` | 652 | 队列补推 + 错误分级 + 重试退避 |
+
+配套测试：`test/local_state_machine_test.dart`（24 用例，与 `core/index.test.mjs` 逐条对齐）、`test/write_queue_test.dart`（11 用例）。
+
+### 本地状态机与 core 的两处刻意不同
+
+1. **`assertBeginVerification` 只接受 `ANALYZED`**，而 core 的 `beginVerification(ticket)` 校验的是第二跳 `ACTION_DONE → V1`。云端端点 `PATCH /defect-tickets/:id/begin-verification` 的入参状态就是 `ANALYZED`（仓储内部自己走 ANALYZED→ACTION_DONE→V1 两跳），core 纯函数只是第二跳的校验，不能当端点契约用。
+2. **V3 的验证方式白名单**比 core 宽：V3 = `timed_mock` / `teach_back`，因为云端 V3 允许限时模考。
+
+### 推送引擎的错误分级
+
+| 服务端响应 | 队列行去向 | 理由 |
+| --- | --- | --- |
+| 2xx | 物理删除 + 回填 `server_id`/`version`/`status` | 成功 |
+| 409 | `status = 3 conflict`，`last_error` 存服务端 `current` | 乐观锁冲突，需人工介入 |
+| 400 | `status = 4 dead` | 本地规则与云端漂了，重试无意义 |
+| 404 | `status = 4 dead` | 目标实体在云端没了 |
+| 401 | 停止整轮 | token 失效 |
+| 网络 / 超时 / 5xx | `status = 2 failed_retryable`，退避 `2^retry × 2s`（上限 5 分钟），超 5 次转 dead | 可恢复 |
+
+`pushPending()` 全局串行（共享 `_inFlight`），避免「写操作后 + 下拉刷新 + 回前台」三处同时触发把同一条 `POST` 发两遍造重复单。触发时机四处：启动、写后、下拉、回前台。
+
+### 真机抓到的 5 个真实缺陷
+
+这一轮 5 个缺陷都不是读代码读出来的，全是真机跑出来的：
+
+1. **离线建单被前置网络请求挡住**——`_openCreate()` 只从云端拿 examProfileId/subjectId，断网点「新建」直接报「无法连接后端」。改为本地优先（`loadActiveExamProfile` + `loadFirstSubject`），云端只兜底。
+2. **启动时不补推，队列永远推不出去**——只有五个页面的写操作后调 `PushScheduler.schedule()`，`main.dart` 里没有启动触发。修法：新增 `pushOnStartup()`，且 `main.dart` 必须**先填充、再补推**（顺序反了的话推送刚回填的 `server_id` 会被随后的全量覆写用 `deleteSynced` 抹掉）。
+3. **`begin-verification` 的入参状态与 core 不同**——照抄 core 写成「只允许 ACTION_DONE→V1」，联网推送被云端 400 `ILLEGAL_DEFECT_TRANSITION` 判死。
+4. **标记动作的 base_version 用错了对象**——`PATCH /:id/actions/:actionId` 的乐观锁作用在 **actions 表自己的 version** 上。探针实证：用 ticket version → 500；用 `action.version = undefined` → 400 `INVALID_BASE_VERSION`；用 `action.version = 1` → 200。之前没炸是因为一张单只标一个动作时两边 version 恰好同步递增。修法：`DefectAction` 加 `version` 字段，API 解析 / 本地落库 / 入队 / 推送五处统一改用动作行的 version，推送时跳过缺陷单的 version 级联。
+5. **Dart 字符串插值漏花括号**——`where: '$Col.localId = ? OR $Col.serverId = ?'` 把 `$Col.localId` 当成字面量列名，点「刷新」时抛 `DatabaseException(no such column: Col.localId)`，冲突行静默没被删（但 UI 弹了成功提示）。全库 grep `'\$Col\.` 命中 3 处（都在 `write_queue.dart`），修完又 grep 全库 125 处 `Col.` 用法复查。
+
+第 5 条的教训值得单列：**乐观路径上的异常被 catch 掉后，UI 仍可能提示成功**。修法是在 `_resolveConflict()` 里把清除失败单独打日志（「`[detail] 清除冲突失败：…`」），真机复验时正是靠这行 logcat 定位到根因的。
+
+### 验收证据（Android 17 模拟器 + Railway/Neon）
+
+| 项 | 结果 |
+| --- | --- |
+| E1 离线建单 | 断网建单 → 入队 → 联网自动推送 → 回填 `server_id` → 云端出现同一单，**无重复建单** |
+| E2 断网链 | 断网标记两个动作 + 进入验证 → 3 条队列行 → 联网推送 → 云端 `status = V1`、`version = 3`、两条动作 `done = true` |
+| E4 冲突 | 云端先改同一动作 → 推送撞 409 → 列表角标「待同步 · 有冲突」、详情页橙色横幅 → 点刷新 → **冲突行真被清掉**（`pending_operations` 空、`sync_state = 0`） |
+| E5 门禁 | 无动作时点「进入验证」被本地状态机拦下，提示「先添加至少一条处理动作，再进入验证。」 |
+| E7 死信 | 注入两条队列行分别撞 400 与 404 → 两条都转 `status = 4 dead`（`last_error` 分别为「后端返回 400（INVALID_BASE_VERSION）｜…」与「服务端找不到该资源（404）」） |
+
+截图：`tillroad_app/screenshots/r4-offline-created.png` / `r4-synced.png` / `r4-validate-blocked.png` / `r4-offline-begin.png` / `r4-conflict.png`。
+
+### 数字
+
+- `flutter analyze --no-fatal-infos`：**51 issues，0 error / 0 warning**（全部既有 Cupertino deprecation info，比 R2 的 37 条多 14 条）。
+- `flutter test`：**106/106 通过**（R2 的 71 + 本地状态机 24 + 写队列 11）。
+- 后端与 schema 零改动，`npm test` 未重跑。
+
+### 遗留
+
+- **R3 增量对账未做**：只有全量分页对账，云端数据多时每次刷新都拉全量；要真正增量需要后端加 `updated_since` 或变更日志。
+- **冲突只做「丢弃本地 + 以云端为准」**：字段级自动仲裁未做，用户要手工重做冲突的那次修改。
+- **本地乐观推进的 status 若被云端 400 拒绝**，该行会停在 `dirty` 等用户处理，没有自动收敛回云端状态。
+- **写队列不支持删除操作**：后端没有删除动作/缺陷单的端点。
+- 模考提交、复盘生成仍**必须在线**。
+
+### 排查环境备忘（本轮反复用到）
+
+- **模拟器 DNS 偶尔全挂**（`ping: unknown host`，但 `ping 8.8.8.8` 通），设备内改 DNS 全无效；唯一有效的是 `adb emu kill` 后带 `-dns-server 8.8.8.8,1.1.1.1` 重启模拟器。
+- **查设备上的 SQLite 库**只能用 `adb push x.sql /data/local/tmp/` + `adb shell "su 0 sqlite3 /data/data/com.tillroad.tillroad_app/databases/tillroad_local.db < /data/local/tmp/x.sql"`。不要 pull 库文件（SQLite 未 checkpoint + journal 未拷，拿到的是坏文件）；`run-as` 对 release 包报 `package not debuggable`。
+- **`uiautomator dump` 在 Flutter release 包里 `text` 为空**，只能读 `content-desc`；而且同一解析脚本在多次 dump 之间可能返回旧内容，**判断界面状态一律以 `adb screencap` + 读图为准**，dump 只用来粗定位坐标。

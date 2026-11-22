@@ -174,6 +174,8 @@ class DefectApi {
         id: _str(map['id']),
         content: _str(map['content']),
         done: map['done'] == true,
+        // R4a：actions 行的乐观锁版本号，和缺陷单的 version 是两套。
+        version: _int(map['version'], 1),
       );
     }).toList(growable: false);
   }

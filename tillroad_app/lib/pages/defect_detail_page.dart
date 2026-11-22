@@ -1,8 +1,21 @@
+import 'dart:async' show unawaited;
+
 import 'package:flutter/cupertino.dart';
 
 import '../api/api_client.dart';
 import '../api/defect_api.dart';
 import '../config/api_config.dart';
+// 只取写队列相关符号：`local.dart` 与 defect_api 都有 forbidden 相关同名函数。
+import '../local/local.dart'
+    show
+        LocalCache,
+        LocalValidationException,
+        PushScheduler,
+        WriteQueue,
+        WriteQueueStatus,
+        kLocalDataRevision,
+        kLocalFirstEnabled,
+        loadDefectTickets;
 import '../mock/defects_mock.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart';
@@ -40,6 +53,8 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
   final DefectApi _api = DefectApi();
   ApiException? _refreshError;
 
+  /// R4a：这张单的写队列里有 409 冲突（推送被服务端版本号挡下）。
+  bool _hasConflict = false;
   @override
   void initState() {
     super.initState();
@@ -53,10 +68,82 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
   }
 
   /// 拉详情（含 verifications / actions）。失败只记提示，不回退整页错误态。
+  ///
+  /// R4a：本地优先时先读本地库（写操作后能立刻看到乐观结果），再在后台拉云端。
   Future<void> _refreshDetail() async {
+    if (kUseMock) return;
+    if (kLocalFirstEnabled) {
+      await _readLocalDetail();
+      unawaited(_refreshConflictFlag());
+      unawaited(_refreshFromCloud());
+      return;
+    }
+    await _refreshFromCloud();
+  }
+
+  /// R4a：冲突标记不在单行上（它属于队列），要单独查一次。
+  Future<void> _refreshConflictFlag() async {
+    if (!kLocalFirstEnabled) return;
+    try {
+      final Set<String> conflicts = await WriteQueueStatus.ticketIdsInConflict();
+      if (!mounted) return;
+      setState(() => _hasConflict = conflicts.contains(ticket.id));
+    } catch (e) {
+      debugPrint('[detail] 冲突状态读取失败：$e');
+    }
+  }
+
+  /// R4a：冲突后用户点「刷新」——先清掉本地冲突操作，再以云端为准重拉。
+  Future<void> _resolveConflict() async {
+    try {
+      await WriteQueueStatus.clearConflicts(ticket.id);
+    } catch (e) {
+      debugPrint('[detail] 清除冲突失败：$e');
+    }
+    if (!mounted) return;
+    setState(() => _hasConflict = false);
+    await _refreshDetail();
+    if (!mounted) return;
+    _toast(context, '已丢弃本地冲突的修改，并以云端数据为准。');
+  }
+
+  Future<void> _readLocalDetail() async {
+    try {
+      final List<DefectTicket> all = await loadDefectTickets(kDemoUserId);
+      final Object? id = ticket.id;
+      DefectTicket? found;
+      for (final DefectTicket t in all) {
+        if (t.id == id) {
+          found = t;
+          break;
+        }
+      }
+      if (!mounted || found == null) return;
+      setState(() {
+        ticket = found!;
+        _refreshError = null;
+      });
+    } catch (e) {
+      debugPrint('[detail] 本地读取失败：$e');
+    }
+  }
+
+  Future<void> _refreshFromCloud() async {
     if (kUseMock) return;
     try {
       final detail = await _api.fetchDefectDetail(widget.ticket.id);
+      // R4a：把详情（含 actions / verifications）落到本地。
+      //
+      // 没有这一步，ANALYZED / ACTION_DONE 的单在离线时就找不到处理动作：
+      // 后台刷新只补 kChildRefreshStatuses（V2/V3）的子行，其余状态永远没缓存。
+      // 写入失败不影响 UI（页面已经从云端拿到数据了）。
+      if (kLocalFirstEnabled) {
+        try {
+          await LocalCache.cacheTicketDetail(detail);
+        } catch (e) {
+          debugPrint('[detail] 详情缓存写入失败：$e');
+        }
+      }
       if (!mounted) return;
       setState(() {
         ticket = detail;
@@ -73,6 +160,25 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
 
   /// 统一报错：后端的业务错误用 ApiException.body['error'] 判别。
   void _handleWriteError(Object e) {
+    if (e is LocalValidationException) {
+      // 本地状态机拦截（R4a）：没落库，也没发网络。把业务码翻成用户能懂的一句话。
+      setState(() => _busy = false);
+      switch (e.code) {
+        case 'NO_ACTIONS':
+          _toast(context, '先添加至少一条处理动作，再进入验证。');
+        case 'ACTIONS_NOT_DONE':
+          _toast(context, '还有处理动作未完成，全部勾选后才能进入验证。');
+        case 'ILLEGAL_DEFECT_TRANSITION':
+          _toast(context, '当前状态不支持这个操作，请返回列表刷新后重试。');
+        case 'DUPLICATE_VERIFICATION':
+          _toast(context, '本轮验证已提交过，不能重复提交。');
+        case 'TICKET_NOT_FOUND':
+          _toast(context, '本地找不到这张单，请下拉刷新后重试。');
+        default:
+          _toast(context, e.message);
+      }
+      return;
+    }
     if (e is! ApiException) {
       setState(() => _busy = false);
       _toast(context, '操作失败：$e');
@@ -130,11 +236,26 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
     }
     setState(() => _busy = true);
     try {
+      if (kLocalFirstEnabled) {
+        await WriteQueue.enqueueMarkAction(
+          ticketId: ticket.id,
+          actionId: action.id,
+          done: true,
+        );
+        if (!mounted) return;
+        setState(() => _busy = false);
+        kLocalDataRevision.value++;
+        PushScheduler.schedule();
+        await _refreshDetail();
+        return;
+      }
       await _api.markActionDone(
         ticket.id,
         action.id,
         done: true,
-        version: ticket.version,
+        // R4a：后端这条端点的乐观锁作用在 **action 行自己** 的 version 上，
+        // 不是缺陷单的 version。用 action.version。
+        version: action.version,
       );
       if (!mounted) return;
       setState(() => _busy = false);
@@ -153,6 +274,21 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
     }
     setState(() => _busy = true);
     try {
+      if (kLocalFirstEnabled) {
+        // 本地只乐观前进到 V1；云端那一步是两跳（version +2），推送前会先拉最新版本。
+        await WriteQueue.enqueueBeginVerification(
+          ticketId: ticket.id,
+          baseVersion: ticket.version,
+        );
+        if (!mounted) return;
+        setState(() => _busy = false);
+        kLocalDataRevision.value++;
+        PushScheduler.schedule();
+        await _refreshDetail();
+        if (!mounted) return;
+        _toast(context, '已进入第 1 次验证（V1），联网后会自动同步。');
+        return;
+      }
       await _api.beginVerification(ticket.id, version: ticket.version);
       if (!mounted) return;
       setState(() => _busy = false);
@@ -360,6 +496,13 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
                                 _refreshDetail();
                               },
                             ),
+                          ),
+                        // R4a：这张单的离线修改被服务端版本号挡下了。
+                        // 只给一条橙色提示 + 「刷新」，字段级仲裁留给 R4b。
+                        if (_hasConflict)
+                          Padding(
+                            padding: const EdgeInsets.only(bottom: 12),
+                            child: _ConflictBanner(onRefresh: _resolveConflict),
                           ),
                         // ─────────── 六栏基本信息 ───────────
                         const SectionHeader(text: '基本信息'),
@@ -764,6 +907,63 @@ class _RefreshFailedBanner extends StatelessWidget {
                 fontSize: 13,
                 fontWeight: FontWeight.w600,
                 color: AppColors.accent,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// R4a：离线修改撞上服务端版本号时的橙色提示条。
+///
+/// 这一轮只做「提示 + 以云端为准重新拉取」，不做字段级仲裁（R4b）。
+class _ConflictBanner extends StatelessWidget {
+  const _ConflictBanner({required this.onRefresh});
+
+  final Future<void> Function() onRefresh;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(12, 10, 8, 10),
+      decoration: BoxDecoration(
+        color: AppColors.dueSoon.withValues(alpha: 0.14),
+        borderRadius: BorderRadius.circular(AppRadii.chip),
+      ),
+      child: Row(
+        children: <Widget>[
+          const Icon(
+            CupertinoIcons.exclamationmark_triangle,
+            size: 18,
+            color: AppColors.dueSoon,
+          ),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              '该单已被修改，请刷新后重试',
+              style: const TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 12,
+                height: 1.35,
+                color: AppColors.label,
+              ),
+            ),
+          ),
+          CupertinoButton(
+            padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+            minimumSize: Size.zero,
+            onPressed: () {
+              unawaited(onRefresh());
+            },
+            child: const Text(
+              '刷新',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: AppColors.dueSoon,
               ),
             ),
           ),

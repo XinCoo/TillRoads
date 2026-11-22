@@ -61,7 +61,49 @@ export 'local_queries.dart'
         loadActiveExamProfile,
         loadDefectStats,
         loadDefectTickets,
+        loadFirstSubject,
+        loadKnowledgeNodes,
         loadVerificationSummary,
         loadVerificationTasks,
         localHasAnyData;
 export 'sha256.dart' show Sha256;
+
+export 'local_state_machine.dart'
+    show
+        LocalActionState,
+        LocalTicketState,
+        LocalValidationException,
+        ReanalyzeDecision,
+        VerificationDecision,
+        assertAnalyzable,
+        assertBeginVerification,
+        assertCanBeginVerification,
+        assertNoForbiddenPhrase,
+        assertTransition,
+        applyVerification,
+        canTransition,
+        containsForbiddenPhrase,
+        describeLocalStateMachine,
+        findForbiddenPhrases,
+        kDefectStatuses,
+        kDefectTransitions,
+        kForbiddenPhrases,
+        kStageVerifyTypes,
+        kVerifyResults,
+        kVerifyTypes,
+        reanalyze,
+        validateVerifyType;
+
+export 'write_queue.dart'
+    show WriteQueue, WriteQueueResult, WriteQueueStatus, newLocalId;
+
+export 'push_engine.dart'
+    show
+        PushEngine,
+        PushOutcome,
+        PushReport,
+        PushScheduler,
+        kPushBackoffCapSeconds,
+        kPushBackoffBaseSeconds,
+        kPushMaxRetry,
+        stripInternalKeys;

@@ -18,6 +18,14 @@ import 'package:flutter/cupertino.dart';
 
 import '../../api/api_client.dart';
 import '../../api/defect_api.dart';
+import '../../config/api_config.dart';
+import '../../local/local.dart'
+    show
+        LocalValidationException,
+        PushScheduler,
+        WriteQueue,
+        kLocalDataRevision,
+        kLocalFirstEnabled;
 import '../../theme/app_theme.dart';
 import '../../widgets/defect_badges.dart';
 import '../../widgets/form_field.dart';
@@ -157,6 +165,25 @@ class _DefectVerifyPageState extends State<DefectVerifyPage> {
 
     setState(() => _busy = true);
     try {
+      if (kLocalFirstEnabled) {
+        // 本地优先（R4a）：本地立即推进状态（pass→下一阶段 / V3 pass→CLOSED），
+        // 联网后由推送引擎发给云端。
+        await WriteQueue.enqueueSubmitVerification(
+          ticketId: widget.ticket.id,
+          stage: _stage,
+          verifyType: _verifyType!,
+          result: _result,
+          baseVersion: _version,
+          questionId: _questionId.text,
+          evidence: _evidence.text,
+        );
+        if (!mounted) return;
+        kLocalDataRevision.value++;
+        PushScheduler.schedule();
+        Navigator.of(context).pop(true);
+        return;
+      }
+
       await _api.submitVerification(
         widget.ticket.id,
         stage: _stage,
@@ -168,6 +195,23 @@ class _DefectVerifyPageState extends State<DefectVerifyPage> {
       );
       if (!mounted) return;
       Navigator.of(context).pop(true);
+    } on LocalValidationException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        switch (e.code) {
+          case 'INVALID_VERIFICATION_STAGE':
+            _bannerError = '当前阶段不支持这次提交，请返回详情刷新后重试';
+          case 'INVALID_VERIFY_TYPE':
+            _errors['verifyType'] = '这个验证方式不适用于 ${e.details['stage'] ?? _stage}';
+          case 'INVALID_VERIFICATION_RESULT':
+            _bannerError = '验证结果只能是「通过」或「未通过」';
+          case 'DUPLICATE_VERIFICATION':
+            _bannerError = '本轮此阶段已提交过，不能重复提交';
+          default:
+            _bannerError = e.message;
+        }
+      });
     } on ApiException catch (e) {
       if (!mounted) return;
       setState(() => _busy = false);

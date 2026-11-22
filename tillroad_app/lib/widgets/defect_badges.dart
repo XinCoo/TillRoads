@@ -150,6 +150,43 @@ class ReopenChip extends StatelessWidget {
   }
 }
 
+/// 同步状态小角标（R4a）：本地已改、还没推到云端，或推送撞上了 409。
+///
+/// 刻意做得轻：灰字 + 小圆点，不抢状态的视觉优先级 —— 用户关心的是这张单
+/// 「验证到第几次了」，而不是「有没有同步」。冲突用橙色，因为那时需要他动手。
+class SyncBadge extends StatelessWidget {
+  const SyncBadge({super.key, this.hasConflict = false});
+
+  final bool hasConflict;
+
+  @override
+  Widget build(BuildContext context) {
+    final Color color =
+        hasConflict ? AppColors.dueSoon : AppColors.secondaryLabel;
+    return Row(
+      mainAxisSize: MainAxisSize.min,
+      children: <Widget>[
+        Container(
+          width: 6,
+          height: 6,
+          decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+        ),
+        const SizedBox(width: 4),
+        Text(
+          hasConflict ? '待同步 · 有冲突' : '待同步',
+          style: TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 11,
+            fontWeight: FontWeight.w500,
+            color: color,
+            height: 1.3,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
 /// 白色圆角卡片外壳（与 FE-01 首页 `_CardShell` 同一视觉规格）
 class CardShell extends StatelessWidget {
   const CardShell({super.key, required this.child, this.padding});

@@ -11,6 +11,7 @@ import 'config/app_info.dart';
 import 'config/local_config.dart';
 import 'local/first_fill.dart' show ensureInitialData;
 import 'local/local_db.dart' show LocalDb;
+import 'local/local.dart' show kLocalDataRevision, PushScheduler;
 import 'logging/app_logger.dart';
 import 'logging/nav_observer.dart';
 import 'pages/defects_page.dart';
@@ -29,7 +30,16 @@ Future<void> main() async {
   // 最小首次填充（R2）：后台跑，不阻塞 runApp（拍板第 3 条）。
   // 本地空时页面显示骨架，填充完成后 `kLocalDataRevision` 通知重读。
   if (kLocalFirstEnabled && !kUseMock) {
-    unawaited(ensureInitialData());
+    // R4a：启动时补推上次没推完的写操作（网络断过、进程被杀都可能留下队列）。
+    // 顺序要紧：先等首次填充跑完，再补推——推送成功后回写的 server_id 不能被
+    // 随后全量覆写的父表 deleteSynced 抹掉。两者都不 await，不阻塞首屏。
+    unawaited(
+      ensureInitialData()
+          .then((_) => PushScheduler.pushOnStartup())
+          .catchError((Object e) {
+        AppLogger.instance.warn('SYNC', '首次填充失败，跳过启动补推：$e');
+      }),
+    );
   }
   if (!kUseMock) {
     unawaited(_prewarm());
@@ -175,11 +185,28 @@ class RootTabs extends StatefulWidget {
   State<RootTabs> createState() => _RootTabsState();
 }
 
-class _RootTabsState extends State<RootTabs> {
+class _RootTabsState extends State<RootTabs> with WidgetsBindingObserver {
   final CupertinoTabController _controller = CupertinoTabController();
 
   @override
+  void initState() {
+    super.initState();
+    // R4a：回前台时补推（任务 C2）。用生命周期观察者而不是 connectivity_plus，
+    // 因为硬约束禁止新依赖，而「从后台切回来」正是用户联网后最常见的时刻。
+    WidgetsBinding.instance.addObserver(this);
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed) {
+      PushScheduler.schedule();
+      kLocalDataRevision.value++;
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _controller.dispose();
     super.dispose();
   }

@@ -62,6 +62,49 @@ Map<String, Object?> _profileToWire(Map<String, Object?> row) => <String, Object
       'status': row['status'],
     };
 
+/// T2：取某个考试目标下的第一个科目（建单页需要）。
+///
+/// 建单只需要「哪个科目」，列表页目前也只支持选第一个科目，所以不再提供
+/// `loadSubjects` 全量接口 —— 等真的要做科目选择器时再加。
+Future<Map<String, Object?>?> loadFirstSubject(String examProfileId) async {
+  final Database db = await LocalDb.instance.database;
+  final List<Map<String, Object?>> rows = await db.query(
+    'subjects',
+    where: 'exam_profile_id = ?',
+    whereArgs: <Object?>[examProfileId],
+    orderBy: 'created_at ASC, local_id ASC',
+    limit: 1,
+  );
+  if (rows.isEmpty) return null;
+  final Map<String, Object?> row = rows.first;
+  return <String, Object?>{
+    'id': row['server_id'] ?? row['local_id'],
+    'name': row['name'],
+    'kind': row['kind'],
+  };
+}
+/// T3：某科目下的考点（建单页的下拉选项）。
+///
+/// 返回形状对齐云端 `GET /subjects/:id/knowledge-nodes` 的 items：
+/// `{id, title, freq_tag, parent_id}`，这样页面不必区分来源。
+Future<List<Map<String, Object?>>> loadKnowledgeNodes(String subjectId) async {
+  final Database db = await LocalDb.instance.database;
+  final List<Map<String, Object?>> rows = await db.query(
+    'knowledge_nodes',
+    where: 'subject_id = ?',
+    whereArgs: <Object?>[subjectId],
+    orderBy: 'created_at ASC, local_id ASC',
+  );
+  return rows
+      .map((Map<String, Object?> row) => <String, Object?>{
+            'id': row['server_id'] ?? row['local_id'],
+            'title': row['title'],
+            'freq_tag': row['freq_tag'],
+            'parent_id': row['parent_id'],
+          })
+      .toList();
+}
+
 /// T4：缺陷单列表（带考点/科目名、动作、当前 round 的验证结果）。
 ///
 /// [statuses] 为空表示全部；排序与云端一致（`created_at ASC, local_id ASC`）。
@@ -169,6 +212,8 @@ DefectTicket _ticketFromRow(
               id: (a['server_id'] ?? a['local_id'])! as String,
               content: text(a['content']) ?? '',
               done: (asInt(a['done'], 0) ?? 0) != 0,
+              // R4a：动作行的乐观锁版本号是独立的一套，不能用缺陷单的 version。
+              version: asInt(a['version'], 1) ?? 1,
             ))
         .toList(growable: false),
     v1: results['V1'] ?? VerifyResult.pending,

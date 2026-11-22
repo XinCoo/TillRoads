@@ -970,3 +970,148 @@ if (!fillDone) { /* 保持加载态/骨架，return */ }
 - 没有移植状态机 / 禁用语校验（R-9 仍在，但因写操作直连云端，本轮不受影响）。
 - 模考提交、复盘生成仍**必须在线**（设计 §4 已定）。
 - 后端、`schema.sql`、`api_client.dart` 零改动。
+
+## 10. R4a 实现记录（本地状态机 + 写队列 + 推送引擎 + 简单冲突处理）
+
+R2 把「读」搬到了本地，R4a 把「写」也搬到了本地：断网时乐观更新 + 入队，联网后由推送引擎把队列补推上云。本轮跳过 R3（增量对账），理由见 10.8。
+
+### 10.1 落地文件表
+
+| 文件 | 行数 | 职责 |
+| --- | --- | --- |
+| `lib/local/local_state_machine.dart` | 386 | 移植 `core/index.mjs` 的纯函数规则；非法操作抛 `LocalValidationException` |
+| `lib/local/write_queue.dart` | 604 | 五类写操作的「本地校验 → 乐观写库 → 入队」 |
+| `lib/local/push_engine.dart` | 652 | 队列补推、错误分级（conflict / dead / retryable / unauthorized）、重试退避 |
+| `test/local_state_machine_test.dart` | 251 | 24 条用例，与 `core/index.test.mjs` 的 14 条规则逐条对齐 |
+| `test/write_queue_test.dart` | 335 | 11 条用例：base_version 来源、门禁、冲突消解、SQL 插值回归 |
+
+改动文件：`lib/main.dart`(275) / `lib/pages/defects_page.dart`(478) / `lib/pages/defect_detail_page.dart`(975) / `lib/pages/defect_create_page.dart`(512) / `lib/pages/defect_analyze_page.dart`(356) / `lib/pages/defect_verify_page.dart`(363) / `lib/widgets/defect_badges.dart`(284) / `lib/widgets/defect_card.dart`(205) / `lib/mock/defects_mock.dart`(524) / `lib/api/defect_api.dart`(452) / `lib/local/local_queries.dart`(375) / `lib/local/local_refresh.dart`(270) / `lib/local/first_fill.dart`(686) / `lib/local/local.dart`(110)。
+
+`lib/` 下的 dart 文件从 R2 的 56 个增加到 **59 个**。
+
+### 10.2 本地状态机：移植了什么，改了什么
+
+`core/index.mjs` 的纯函数在 `lib/local/local_state_machine.dart` 里逐条重写，保证「离线时拦下的错误」和「联网后云端会拒绝的错误」是同一套规则：
+
+- `kDefectTransitions` 与 core 的 `TRANSITIONS` 逐条一致（DRAFT→ANALYZED→ACTION_DONE→V1→V2→V3→CLOSED，重开回 ANALYZED 并 `verification_round + 1`）。
+- `kForbiddenPhrases` 7 条禁用语、`kVerifyTypes` 6 条、`kVerifyResults` 3 条。
+- `kStageVerifyTypes` 按阶段给出可选验证方式：V1 = `redo_hidden` / `similar_variant` / `teach_back`，V2 = `new_question`，**V3 = `timed_mock` / `teach_back`**——V3 比 core 宽松，因为云端 V3 允许限时模考。
+
+一处**刻意与 core 不同口径**：`assertBeginVerification` 只接受 `ANALYZED`，而 core 的 `beginVerification(ticket)` 校验的是第二跳的 `ACTION_DONE → V1`。原因是云端端点 `PATCH /defect-tickets/:id/begin-verification` 的入参状态是 `ANALYZED`（仓储内部自己走 ANALYZED→ACTION_DONE→V1 两跳），core 纯函数只是第二跳的校验，不能当端点契约用。详见 10.7 缺陷 3。
+
+### 10.3 写队列
+
+`WriteQueue` 提供五个入队方法，每个都遵循同一条流水线：
+
+1. 读本地最新行（带 `version` / `status` / `done`）；
+2. 调本地状态机校验，非法就直接抛 `LocalValidationException`，**不入队、不落库**；
+3. 乐观更新本地行（`sync_state = 2 dirty`），让 UI 立刻反映结果；
+4. 写一条 `pending_operations` 行（`operation` + `path_template` + `payload` + `base_version`）。
+
+| 方法 | 端点 | 本地前置校验 |
+| --- | --- | --- |
+| `enqueueCreateDefect` | `POST /defect-tickets` | 归因层/归因说明非空、禁用语 |
+| `enqueueAnalyze` | `POST /defect-tickets/{id}/analyze` | 状态必须是 DRAFT |
+| `enqueueMarkAction` | `PATCH /defect-tickets/{id}/actions/{actionId}` | 动作存在；**base_version 取动作行自己的 version** |
+| `enqueueBeginVerification` | `PATCH /defect-tickets/{id}/begin-verification` | 至少一条动作且全部完成；payload 带 `__requires_online_refresh` |
+| `enqueueSubmitVerification` | `POST /defect-tickets/{id}/verifications` | 阶段匹配、验证方式在阶段白名单内 |
+
+队列表沿用 R1 的 `pending_operations`（`op_id` 自增主键 + `status` 0 pending / 1 inflight / 2 failed_retryable / 3 conflict / 4 dead）。`__` 前缀的键是内部用的（如 `__action_local_id`、`__requires_online_refresh`），推送前由 `stripInternalKeys` 剥掉。
+
+### 10.4 推送引擎
+
+`PushEngine.pushPending()` 是**全局串行**的：所有页面共享同一个 `_inFlight` Future，避免「写操作后 + 下拉刷新 + 回前台」三处同时触发把同一条 `POST` 发两遍造出重复单。
+
+单条推送的处理顺序：
+
+1. 定位云端 id（`POST /defect-tickets` 本身不需要，其余操作缺 `server_id` 时按可重试处理，等前置建单成功）；
+2. 解析路径占位符 `{server_id}` / `{action_server_id}`；动作占位符会顺带把 `payload['version']` 覆盖成**本地动作行当前的 version**；
+3. base_version 级联：同一实体的上一条操作成功后，用云端返回的新 version 覆盖后续操作的 base_version。**标记动作例外**——动作走 `actions` 表自己的乐观锁，不能用缺陷单的 version 级联（见 10.7 缺陷 4）；
+4. `__requires_online_refresh` 的操作（进入验证）推送前先 `GET /defect-tickets/{id}` 取最新 version。
+
+错误分级（决定这条队列行的去向）：
+
+| 服务端响应 | 处理 | 队列行结果 |
+| --- | --- | --- |
+| 2xx | 成功 | 物理删除；回填 `server_id` / `version` / `status`；`sync_state = 0` |
+| 409 | 乐观锁冲突 | `status = 3 conflict`，把服务端 `current` 写进 `last_error`，该实体的后续操作本轮暂停 |
+| 400 | 业务校验失败 | `status = 4 dead`（本地规则与云端漂了，重试无意义） |
+| 404 | 目标实体在云端没了 | `status = 4 dead` |
+| 401 | token 失效 | 停止整轮推送，不改队列行 |
+| 网络 / 超时 / 5xx | 可重试 | `status = 2 failed_retryable`，`retry_count + 1`，退避 `2^retry × 2s`（上限 5 分钟）；`retry_count > 5` 转 `dead` |
+
+触发时机四个：App 启动、写操作后、下拉刷新、回前台（`WidgetsBindingObserver` 的 `resumed`）。不引入 connectivity_plus，靠失败重试 + 回前台兜底。
+
+### 10.5 五页接入
+
+`kLocalFirstEnabled` 为 false 时逻辑与 R2 完全不变（每个写页面都是 `if (kLocalFirstEnabled) { 本地路径 } else { 原云端路径 }`）。
+
+- `defect_create_page.dart` / `defect_analyze_page.dart` / `defect_detail_page.dart` / `defect_verify_page.dart`：本地路径先校验再入队，成功后弹「联网后会自动同步。」；`LocalValidationException` 按错误码映射到对应输入框（禁用语→归因说明、缺归因层→归因层、缺归因说明→归因说明、状态非法→顶部横幅）。
+- `defects_page.dart`：列表读本地同步状态，卡片右上角挂 `SyncBadge`——灰色「待同步」，冲突时橙色「待同步 · 有冲突」。
+
+### 10.6 409 简单冲突处理
+
+冲突不做字段级仲裁（设计文档 §3.4 的自动 merge 明确不在本轮范围），只做三件事：
+
+1. 队列行标 `conflict`，`last_error` 里存服务端 `current` 快照；
+2. 缺陷单行 `sync_state = 4 conflict`，列表卡片显示橙色角标；
+3. 详情页顶部出现橙色横幅「该单已被修改，请刷新后重试」+「刷新」按钮。点刷新 → 丢弃本地冲突操作 → 重拉云端 → 横幅与角标消失。
+
+### 10.7 真机抓到的 5 个真实缺陷
+
+这一轮的 5 个缺陷都不是靠读代码发现的，全部是真机跑出来的。
+
+**缺陷 1：离线建单被前置网络请求挡住。**
+断网点「新建」直接弹「无法连接后端（…exam-profiles）」。根因是 `_openCreate()` 必须先拿 examProfileId + subjectId，而原实现只从云端拉。修法：`_openCreate()` 本地优先读 `loadActiveExamProfile` + `loadFirstSubject`，云端只作兜底；`defect_create_page._loadNodes()` 同样本地优先，且本地优先模式下考点拉取失败不报错（考点是可选项）。
+
+**缺陷 2：启动时不补推，队列永远推不出去。**
+离线建单后联网重启 App，`pending_operations` 一直是 1 条 `status = 2`。根因是「App 启动时调 pushPending」这条要求没有落进 `main.dart`——只有五个页面的写操作后调 `PushScheduler.schedule()`。修法：新增 `PushScheduler.pushOnStartup()`，且 `main.dart` 里必须**先填充、再补推**（`ensureInitialData().then((_) => PushScheduler.pushOnStartup())`），顺序反了的话推送刚回填的 `server_id` 会被随后的全量覆写用 `deleteSynced` 抹掉。同时 `_RootTabsState` 改 `WidgetsBindingObserver`，回前台时也触发一次。
+
+**缺陷 3：`begin-verification` 的入参状态和 core 不一样。**
+本地 `assertBeginVerification` 照抄 core 写成「只允许 ACTION_DONE→V1」，离线推进到 V1 后，联网推送被云端 400 `ILLEGAL_DEFECT_TRANSITION` 判死。实测云端端点 `PATCH /defect-tickets/:id/begin-verification` 要求当前是 **ANALYZED**（仓储内部走 ANALYZED→ACTION_DONE→V1 两跳），core 纯函数只管第二跳。修法：本地改为只认 `ANALYZED`，并写注释说明这是刻意与 core 不同的口径。
+
+**缺陷 4：标记动作的 base_version 用错了对象。**
+`PATCH /defect-tickets/:id/actions/:actionId` 的乐观锁作用在 **actions 表自己的 version** 上（后端 `actions.markDone` 走 `updateWithVersion({table:'actions', ...})`），而客户端一直传缺陷单的 version。探针实证：用 ticket version → 500；用 `action.version = undefined` → 400 `INVALID_BASE_VERSION`；用 `action.version = 1` → 200。之所以一直没炸，是因为一张单只标一个动作时两边 version 恰好同步递增；一张单两个动作只标一个就会错位。修法：`DefectAction` 模型加 `version` 字段、API 解析、本地落库、入队、推送五处统一改用动作行的 version，并在推送时跳过缺陷单的 version 级联。
+
+**缺陷 5：Dart 字符串插值漏花括号导致冲突消解失败。**
+点橙色横幅的「刷新」后弹了成功提示，但数据库里的 conflict 行没被删。设备 logcat 原文：
+
+```
+DatabaseException(no such column: Col.localId (code 1 SQLITE_ERROR):
+  while compiling: SELECT local_id FROM defect_tickets WHERE Col.localId = ? OR Col.serverId = ? LIMIT 1)
+```
+
+根因是 `where: '$Col.localId = ? OR $Col.serverId = ?'`——少了花括号，`$Col.localId` 被当成字面量列名。全库 grep `'\$Col\.` 命中 3 处（都在 `write_queue.dart`），修完后又 grep 全库 125 处 `Col.` 用法复查。
+
+### 10.8 与设计文档的偏差
+
+| 项 | 设计 | 实现 | 理由 |
+| --- | --- | --- | --- |
+| 增量对账 | §3.3 给 A/B/C 三方档 | **本轮跳过 R3**，只做 A（全量分页对账） | 后端没有 `updated_since`，B/C 都要改后端；R2 的页面刷新已覆盖读同步的核心需求，断网可写更紧迫 |
+| 冲突仲裁 | §3.4 含自动 merge | **只做「丢弃本地 + 以云端为准」** | 任务书明确不做字段级仲裁 UI；自动 merge 的前提是 R3 的增量同步 |
+| 写队列时机 | §3.2 写队列 | 落地，但**不入队删除动作** | 后端没有删除动作的端点 |
+| V3 验证方式 | 白名单随 core | V3 = `timed_mock` / `teach_back` | 云端 V3 允许限时模考，core 的纯函数白名单更严 |
+
+### 10.9 测试与验证
+
+- `flutter test` → **106 tests / All passed**（R2 的 71 + 本地状态机 24 + 写队列 11）。
+- `flutter test test/local_state_machine_test.dart` → **24/24**；`flutter test test/write_queue_test.dart` → **11/11**。
+- `flutter analyze --no-fatal-infos` → **51 issues / 0 error / 0 warning**（全部是既有的 `deprecated_member_use: package:flutter/cupertino.dart`）。
+- Android 17 模拟器 + Railway/Neon 真机：
+  - **E1 离线建单**：断网建单 → 本地入队 → 联网自动推送 → 回填 `server_id` → 云端出现同一单，**无重复建单**。
+  - **E2 断网链**：断网标记两个动作 + 进入验证 → 3 条队列行 → 联网推送 → 云端 `status = V1`、`version = 3`、两条动作 `done = true`。
+  - **E4 冲突**：云端先改同一动作 → App 推送撞 409 → 列表角标「待同步 · 有冲突」、详情页橙色横幅 → 点刷新 → 冲突行真被清掉（`pending_operations` 空、`sync_state = 0`）。
+  - **E5 门禁**：无动作时点「进入验证」被本地状态机拦下，提示「先添加至少一条处理动作，再进入验证。」。
+  - **E7 死信**：注入两条队列行分别撞 400 与 404 → 两条都转 `status = 4 dead`，`last_error` 分别是「后端返回 400（INVALID_BASE_VERSION）｜…」与「服务端找不到该资源（404）」。
+  - 本地与云端行数核对：首次填充后 `defect_tickets 9 / actions 6 / verifications 11`，与云端逐项一致。
+
+截图：`screenshots/r4-offline-created.png` / `r4-synced.png` / `r4-validate-blocked.png` / `r4-offline-begin.png` / `r4-conflict.png`。
+
+### 10.10 R4a 明确没做的事
+
+- **没做增量同步（R3）**：只有全量分页对账，云端数据多时每次刷新都拉全量。
+- **没做字段级冲突仲裁**：冲突一律丢弃本地修改、以云端为准，用户要手工重做。
+- **没做本地状态机与云端状态机的自动收敛**：本地乐观推进的 `status` 若被云端拒绝（400），该行会停在 `dirty` 状态等用户处理。
+- **没做写队列的删除操作**：不支持离线删除动作或缺陷单。
+- **没有断点续传的历史分页游标**：刷新一律从 offset 0 重新拉。
+- 模考提交、复盘生成仍**必须在线**（设计文档 §4 已定）。

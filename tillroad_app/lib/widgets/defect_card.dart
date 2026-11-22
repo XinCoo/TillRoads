@@ -12,10 +12,22 @@ import 'defect_badges.dart';
 /// 2. `error_cause` 单行截断
 /// 3. status 徽标 + 第 N 轮 + 重开 N 次 + 相对时间
 class DefectCard extends StatelessWidget {
-  const DefectCard({super.key, required this.ticket, this.onTap});
+  const DefectCard({
+    super.key,
+    required this.ticket,
+    this.onTap,
+    this.pendingSync = false,
+    this.hasConflict = false,
+  });
 
   final DefectTicket ticket;
   final VoidCallback? onTap;
+
+  /// R4a：本地已改但还没推到云端（`sync_state != 0`）。
+  final bool pendingSync;
+
+  /// R4a：推送撞上 409，需要用户手动刷新（详情页只做提示，R4b 才做仲裁）。
+  final bool hasConflict;
 
   @override
   Widget build(BuildContext context) {
@@ -48,6 +60,10 @@ class DefectCard extends StatelessWidget {
                 PriorityBadge(priority: ticket.priority),
               ],
             ),
+            if (pendingSync || hasConflict) ...<Widget>[
+              const SizedBox(height: 6),
+              SyncBadge(hasConflict: hasConflict),
+            ],
             const SizedBox(height: 6),
 
             // ── 第二行：归因说明，单行截断 ──

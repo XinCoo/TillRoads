@@ -73,11 +73,20 @@ class DefectAction {
     required this.id,
     required this.content,
     required this.done,
+    this.version = 1,
   });
 
   final String id;
   final String content;
   final bool done;
+
+  /// 乐观锁版本号（后端每写一次 +1）。
+  ///
+  /// R4a 重要修正：后端 `PATCH /defect-tickets/:id/actions/:actionId` 的乐观锁
+  /// 作用在 **actions 表自己** 的 version 上，不是缺陷单的 version。
+  /// （见 `server/repositories/actions.mjs` 的 `markDone` → `updateWithVersion`。）
+  /// 两者平时恰好相等，但一张单有两条动作、只标记其中一条时就会错位。
+  final int version;
 }
 
 /// 单个阶段的验证结果

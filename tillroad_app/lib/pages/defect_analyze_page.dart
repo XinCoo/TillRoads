@@ -15,6 +15,15 @@ import 'package:flutter/cupertino.dart';
 
 import '../../api/api_client.dart';
 import '../../api/defect_api.dart';
+import '../../config/api_config.dart';
+// 只取写队列相关符号：`local.dart` 也导出 `findForbiddenPhrases`，与 defect_api 冲突。
+import '../../local/local.dart'
+    show
+        LocalValidationException,
+        PushScheduler,
+        WriteQueue,
+        kLocalDataRevision,
+        kLocalFirstEnabled;
 import '../../theme/app_theme.dart';
 // CardShell / InfoRow 等卡片壳复用 FE-03 列表页的组件，保证圆角/阴影一致
 import '../../widgets/defect_badges.dart';
@@ -181,6 +190,22 @@ class _DefectAnalyzePageState extends State<DefectAnalyzePage> {
 
     setState(() => _busy = true);
     try {
+      if (kLocalFirstEnabled) {
+        // 本地优先（R4a）：写本地库 + 入队。REOPENED 时会自动 round+1。
+        await WriteQueue.enqueueAnalyze(
+          ticketId: widget.ticket.id,
+          errorLayer: _errorLayer!,
+          errorCause: _errorCause.text.trim(),
+          baseVersion: _version,
+        );
+        if (!mounted) return;
+        kLocalDataRevision.value++;
+        PushScheduler.schedule();
+        // true 让详情页知道「归因成功，需要重新读取」。
+        Navigator.of(context).pop(true);
+        return;
+      }
+
       await _api.analyzeDefectTicket(
         widget.ticket.id,
         errorLayer: _errorLayer!,
@@ -191,6 +216,23 @@ class _DefectAnalyzePageState extends State<DefectAnalyzePage> {
       if (!mounted) return;
       // true 让详情页知道「归因成功，需要重新拉详情」。
       Navigator.of(context).pop(true);
+    } on LocalValidationException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        switch (e.code) {
+          case 'FORBIDDEN_PHRASE_IN_ERROR_CAUSE':
+            _errors['errorCause'] = '不能写「${e.details['phrases'] ?? '这些词'}」，要写具体错因';
+          case 'MISSING_ERROR_LAYER':
+            _errors['errorLayer'] = '请选择错因层级';
+          case 'MISSING_ERROR_CAUSE':
+            _errors['errorCause'] = '请填写具体错因';
+          case 'ILLEGAL_DEFECT_TRANSITION':
+            _bannerError = '当前状态不允许归因，请返回列表刷新后重试';
+          default:
+            _bannerError = e.message;
+        }
+      });
     } on ApiException catch (e) {
       if (!mounted) return;
       setState(() => _busy = false);

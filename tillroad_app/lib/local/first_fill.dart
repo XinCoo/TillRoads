@@ -25,7 +25,7 @@
 import 'dart:convert';
 
 import 'package:flutter/foundation.dart' show ValueNotifier;
-import 'package:sqflite/sqflite.dart' show DatabaseExecutor;
+import 'package:sqflite/sqflite.dart' show DatabaseExecutor, Database, Transaction;
 
 import '../api/api_client.dart';
 import '../config/api_config.dart';
@@ -37,6 +37,7 @@ import 'dao/table_daos.dart';
 import 'local_db.dart';
 import 'local_schema.dart';
 import 'sha256.dart';
+import '../mock/defects_mock.dart' show DefectTicket, DefectAction, VerifyResult;
 
 /// 单页条数。**必须**与服务端 `pageParams` 的上限 200 一致，
 /// 否则服务端会把 limit 夹回 50，而客户端用 200 判断「还有下一页」→ 死循环。
@@ -113,16 +114,102 @@ abstract final class LocalCache {
     List<Map<String, Object?>> rows,
   ) async {
     final db = await LocalDb.instance.database;
-    return db.transaction<int>((txn) async {
-      await dao.deleteSyncedWhere(
+    return db.transaction<int>(
+      (Transaction txn) => _rewriteChildrenIn(txn, dao, ticketLocalId, rows),
+    );
+  }
+
+  /// [_rewriteChildren] 的事务内版本，供已经开了事务的调用方（详情缓存）复用。
+  static Future<int> _rewriteChildrenIn(
+    Transaction txn,
+    SyncTableDao dao,
+    String ticketLocalId,
+    List<Map<String, Object?>> rows,
+  ) async {
+    await dao.deleteSyncedWhere(
+      txn,
+      '${Col.defectTicketLocalId} = ?',
+      <Object?>[ticketLocalId],
+    );
+    if (rows.isNotEmpty) {
+      await dao.insertAll(txn, rows);
+    }
+    return rows.length;
+  }
+  /// 缓存**单张**缺陷单的详情（含 actions / verifications）。
+  ///
+  /// 由详情页在云端刷新成功后调用。为什么需要它：子表刷新只覆盖
+  /// `kChildRefreshStatuses` 那几种状态，而 ANALYZED / ACTION_DONE 的单在离线时
+  /// 同样要能勾选动作、进入验证——用户刚看过详情页就是最好的缓存时机，
+  /// 过期数据由后续刷新覆盖。
+  ///
+  /// 与 [writeDefectTickets] 的区别：那是整表重写（列表页/首次填充用），
+  /// 这里只 upsert 一行，不会把列表刚拉回来的其它单删掉。
+  static Future<void> cacheTicketDetail(DefectTicket detail) async {
+    final Map<String, Object?> row = <String, Object?>{
+      'local_id': detail.id,
+      'server_id': detail.id,
+      'sync_state': SyncState.synced,
+      'user_id': kDemoUserId,
+      'q_type': detail.qType,
+      'error_layer': detail.errorLayer,
+      'error_cause': detail.errorCause,
+      'priority': detail.priority.wire,
+      'status': detail.status.wire,
+      'verification_round': detail.verificationRound,
+      'reopen_count': detail.reopenCount,
+      'created_at': detail.createdAt.toUtc().toIso8601String(),
+      'updated_at': nowIso(),
+      'version': detail.version,
+    };
+    final Database db = await LocalDb.instance.database;
+    await db.transaction<void>((Transaction txn) async {
+      await LocalDaos.defectTickets.insert(txn, row);
+      await _rewriteChildrenIn(
         txn,
-        '${Col.defectTicketLocalId} = ?',
-        <Object?>[ticketLocalId],
+        LocalDaos.actions,
+        detail.id,
+        detail.actions
+            .map((DefectAction a) => <String, Object?>{
+                  'local_id': a.id,
+                  'server_id': a.id,
+                  'sync_state': SyncState.synced,
+                  'defect_ticket_local_id': detail.id,
+                  'content': a.content,
+                  'done': a.done ? 1 : 0,
+                  'created_at': detail.createdAt.toUtc().toIso8601String(),
+                  'updated_at': nowIso(),
+                  // R4a：动作行的乐观锁版本号独立于缺陷单，必须原样落库。
+                  'version': a.version,
+                })
+            .toList(),
       );
-      if (rows.isNotEmpty) {
-        await dao.insertAll(txn, rows);
+      final List<Map<String, Object?>> verifications = <Map<String, Object?>>[];
+      for (final String stage in const <String>['V1', 'V2', 'V3']) {
+        final VerifyResult r = stage == 'V1'
+            ? detail.v1
+            : stage == 'V2'
+                ? detail.v2
+                : detail.v3;
+        if (r == VerifyResult.pending) continue;
+        verifications.add(<String, Object?>{
+          'local_id': '${detail.id}:$stage:${detail.verificationRound}',
+          'server_id': null,
+          'sync_state': SyncState.synced,
+          'defect_ticket_local_id': detail.id,
+          'stage': stage,
+          'round': detail.verificationRound,
+          'result': r.wire,
+          'created_at': detail.createdAt.toUtc().toIso8601String(),
+          'version': 1,
+        });
       }
-      return rows.length;
+      await _rewriteChildrenIn(
+        txn,
+        LocalDaos.verifications,
+        detail.id,
+        verifications,
+      );
     });
   }
 

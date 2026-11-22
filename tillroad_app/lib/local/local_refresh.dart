@@ -33,10 +33,24 @@ const int kRefreshPageSize = 200;
 /// 单资源最多翻多少页（200×20 = 4000 行，防服务端异常时死循环）。
 const int kRefreshMaxPages = 20;
 
-/// 只为这些状态补拉子行：V2/V3 的 urgency 依赖「上一阶段 pass 的 created_at」，
+/// 只为这些状态补拉子行（`verifications`）：V2/V3 的 urgency 依赖「上一阶段 pass 的 created_at」，
 /// 没有 verifications 就复算不出正确的进入时间。V1 用 updated_at，不需要。
 const List<String> kChildRefreshStatuses = <String>['V2', 'V3'];
 
+/// 这些状态的缺陷单**也需要**子行里的 `actions`：用户要离线勾选处理动作、
+/// 离线进入验证，前提是本地能拿到动作清单（否则本地状态机的「至少一条动作且全部
+/// 完成」门禁永远过不去）。
+///
+/// 之前只补 V2/V3，导致 ANALYZED / ACTION_DONE 的单在离线时找不到动作——R4a 真机
+/// 复现：本地 actions=0 而云端有 2 条。
+const List<String> kChildActionStatuses = <String>['DRAFT', 'ANALYZED', 'ACTION_DONE'];
+
+/// 一次最多补拉多少张「缺动作」的单（每个 = 1 次请求）。
+///
+/// 只补**本地还没有动作行**的单：云端本来就 0 条动作的单会每次被重拉一次，
+/// 但数量极少（一个用户的 DRAFT/ANALYZED 单通常个位数），换取「任何被打开过的
+/// 单都能离线写」的确定性。
+const int kMaxActionRefresh = 20;
 /// 一次刷新最多补拉多少张单的详情（每个 = 1 次请求）。
 const int kMaxChildRefresh = 40;
 
@@ -145,6 +159,13 @@ Future<int> _refresh() async {
 /// 为什么不顺带补 V1：V1 的进入时间用 `updated_at`（主表已有），不依赖子表；
 /// 每多补一张就是一次往返，冷启动时这 40 次请求代价太高。
 Future<int> _refreshChildren(ApiClient client) async {
+  int written = await _refreshVerifications(client);
+  written += await _refreshActions(client);
+  return written;
+}
+
+/// 补 V2/V3 的 `verifications`（urgency 复算要用上一阶段 pass 的 created_at）。
+Future<int> _refreshVerifications(ApiClient client) async {
   final Database db = await LocalDb.instance.database;
   final String placeholders = List<String>.filled(kChildRefreshStatuses.length, '?').join(', ');
   final List<Map<String, Object?>> rows = await db.rawQuery(
@@ -169,6 +190,40 @@ Future<int> _refreshChildren(ApiClient client) async {
     } catch (e) {
       // 单张失败不影响其它单：下次刷新会再试。
       AppLogger.instance.warn('SYNC', '补拉缺陷单 $serverId 详情失败：$e');
+    }
+  }
+  return written;
+}
+
+/// 补「本地缺动作行」的缺陷单的 `actions`。
+///
+/// 判据是 `NOT EXISTS (SELECT 1 FROM actions WHERE ...)`：本地已有动作行的单不需要
+/// 再拉（说明上次已经同步过），只有缺动作的单才补一次。
+Future<int> _refreshActions(ApiClient client) async {
+  final Database db = await LocalDb.instance.database;
+  final String placeholders = List<String>.filled(kChildActionStatuses.length, '?').join(', ');
+  final List<Map<String, Object?>> rows = await db.rawQuery(
+    'SELECT dt.${Col.localId} AS local_id, dt.${Col.serverId} AS server_id '
+    'FROM defect_tickets dt '
+    'WHERE dt.${Col.status} IN ($placeholders) '
+    'AND dt.${Col.serverId} IS NOT NULL '
+    'AND NOT EXISTS (SELECT 1 FROM actions a WHERE a.${Col.defectTicketLocalId} = dt.${Col.localId}) '
+    'ORDER BY dt.${Col.updatedAt} DESC LIMIT $kMaxActionRefresh',
+    kChildActionStatuses,
+  );
+
+  int written = 0;
+  for (final Map<String, Object?> row in rows) {
+    final String? serverId = text(row['server_id']);
+    final String? localId = text(row['local_id']);
+    if (serverId == null || localId == null) continue;
+    try {
+      final Object? raw = await client.get('/defect-tickets/$serverId');
+      if (raw is! Map) continue;
+      final Object? actions = raw['actions'];
+      if (actions is List) written += await LocalCache.writeActions(localId, actions);
+    } catch (e) {
+      AppLogger.instance.warn('SYNC', '补拉缺陷单 $serverId 的动作失败：$e');
     }
   }
   return written;

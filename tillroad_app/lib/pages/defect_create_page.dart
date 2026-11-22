@@ -15,6 +15,16 @@ import 'package:flutter/cupertino.dart';
 import '../../api/api_client.dart';
 import '../../api/defect_api.dart';
 import '../../config/api_config.dart';
+// 只取写队列相关符号：`local.dart` 也导出 `findForbiddenPhrases`，
+// 与 `defect_api.dart` 的同名函数冲突，故用 show 收窄。
+import '../../local/local.dart'
+    show
+        kLocalDataRevision,
+        kLocalFirstEnabled,
+        loadKnowledgeNodes,
+        LocalValidationException,
+        PushScheduler,
+        WriteQueue;
 import '../../theme/app_theme.dart';
 import '../../widgets/form_field.dart';
 
@@ -81,18 +91,41 @@ class _DefectCreatePageState extends State<DefectCreatePage> {
       setState(() => _loadingNodes = false);
       return;
     }
+    // R4a：本地优先时先读本地目录，离线也能建单（考点列表不是写操作的前置
+    // 校验，选不到考点时后端 `knowledge_node_id` 本来就是可空的）。
+    if (kLocalFirstEnabled) {
+      try {
+        final List<Map<String, Object?>> local =
+            await loadKnowledgeNodes(widget.subjectId);
+        if (local.isNotEmpty) {
+          if (!mounted) return;
+          setState(() {
+            _nodes = local;
+            _loadingNodes = false;
+          });
+          return;
+        }
+      } catch (e) {
+        debugPrint('[create] 本地考点读取失败：$e');
+      }
+    }
     try {
       final nodes = await _api.fetchKnowledgeNodes(widget.subjectId);
       if (!mounted) return;
+      final bool offline = !kLocalFirstEnabled;
       setState(() {
         _nodes = nodes;
         _loadingNodes = false;
+        // 本地优先时拉不到考点不算致命错误：考点是可选项，允许不选直接提交。
+        if (offline) _bannerError = null;
       });
     } on ApiException catch (e) {
       if (!mounted) return;
       setState(() {
         _loadingNodes = false;
-        _bannerError = '考点列表加载失败：${e.message}';
+        if (!kLocalFirstEnabled) {
+          _bannerError = '考点列表加载失败：${e.message}';
+        }
       });
     }
   }
@@ -180,6 +213,27 @@ class _DefectCreatePageState extends State<DefectCreatePage> {
         .toList(growable: false);
 
     try {
+      if (kLocalFirstEnabled) {
+        // 本地优先（R4a）：写本地库 + 入队，用户立刻看到新单；推送由后台完成。
+        // 校验已在 WriteQueue 内部跑过一遍状态机，非法操作在这里抛出，不会落库。
+        await WriteQueue.enqueueCreateDefect(
+          userId: kDemoUserId,
+          examProfileId: widget.examProfileId,
+          qType: _qType.text.trim(),
+          errorCause: _errorCause.text.trim(),
+          errorLayer: _errorLayer,
+          knowledgeNodeId: _knowledgeNodeId,
+          priority: _priority,
+          actions: actions,
+        );
+        if (!mounted) return;
+        kLocalDataRevision.value++;
+        // 尽力而为地推一次；离线时会静默留在队列里，联网后自动补发。
+        PushScheduler.schedule();
+        Navigator.of(context).pop(true);
+        return;
+      }
+
       await _api.createDefectTicket(
         userId: kDemoUserId,
         examProfileId: widget.examProfileId,
@@ -194,6 +248,22 @@ class _DefectCreatePageState extends State<DefectCreatePage> {
       // 成功：把 true 传回列表页，由它决定刷新时机（避免 create 页自己
       // 再发一次列表请求，两处刷新容易产生闪烁）。
       Navigator.of(context).pop(true);
+    } on LocalValidationException catch (e) {
+      // 本地校验拦截（如归因写了禁用语）：留在本页，把错误映射到对应字段。
+      if (!mounted) return;
+      setState(() {
+        _busy = false;
+        switch (e.code) {
+          case 'FORBIDDEN_PHRASE_IN_ERROR_CAUSE':
+            _errors['errorCause'] = '不能写「${e.details['phrases'] ?? '这些词'}」，要写具体错因';
+          case 'MISSING_ERROR_LAYER':
+            _errors['errorLayer'] = '请选择错因层级';
+          case 'MISSING_ERROR_CAUSE':
+            _errors['errorCause'] = '请填写具体错因';
+          default:
+            _bannerError = e.message;
+        }
+      });
     } on ApiException catch (e) {
       if (!mounted) return;
       setState(() => _busy = false);
