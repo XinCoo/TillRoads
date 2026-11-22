@@ -1563,3 +1563,142 @@ UUID 只保留前 4 位而不是全删：同一个用户的日志要能看出「
 - **模拟器 DNS 偶尔全挂**（`ping: unknown host`，但 `ping 8.8.8.8` 通），设备内改 DNS 全无效；唯一有效的是 `adb emu kill` 后带 `-dns-server 8.8.8.8,1.1.1.1` 重启模拟器。
 - **查设备上的 SQLite 库**只能用 `adb push x.sql /data/local/tmp/` + `adb shell "su 0 sqlite3 /data/data/com.tillroad.tillroad_app/databases/tillroad_local.db < /data/local/tmp/x.sql"`。不要 pull 库文件（SQLite 未 checkpoint + journal 未拷，拿到的是坏文件）；`run-as` 对 release 包报 `package not debuggable`。
 - **`uiautomator dump` 在 Flutter release 包里 `text` 为空**，只能读 `content-desc`；而且同一解析脚本在多次 dump 之间可能返回旧内容，**判断界面状态一律以 `adb screencap` + 读图为准**，dump 只用来粗定位坐标。
+
+## 36. R4b 归档（修 R4a 的三个集成缺口）
+
+R4a 交付后，用户在真机断网测试里发现三个症状：
+
+1. 断网后主页打不开卡片；
+2. 断网提交验证显示「提交成功」，但状态没变；
+3. 联网后列表状态与详情状态不一致。
+
+用户提供的日志里有一行关键证据：
+
+```
+[API] POST /defect-tickets/3932****/verifications 网络失败 28ms：ClientException with SocketException
+```
+
+——提交验证时请求**直接打到了云端**，根本没有进写队列。
+
+### 36.1 根因：不是「写队列没接」，而是「一个开关把写路径也关掉了」
+
+前置确认逐个读过五页后，发现写队列其实**早就接好了**：
+
+| 页面 | 位置 | 已有分支 |
+| --- | --- | --- |
+| `defect_create_page.dart` | `_submit()` | `WriteQueue.enqueueCreateDefect` |
+| `defect_analyze_page.dart` | `_submit()` | `WriteQueue.enqueueAnalyze` |
+| `defect_detail_page.dart` | `_toggleAction()` | `WriteQueue.enqueueMarkAction` |
+| `defect_detail_page.dart` | `_enterVerification()` | `WriteQueue.enqueueBeginVerification` |
+| `defect_verify_page.dart` | `_submit()` | `WriteQueue.enqueueSubmitVerification` |
+
+但五个分支的判据都是 `if (kLocalFirstEnabled)`，而 `kLocalFirstEnabled` 在 `lib/main.dart` 的 `_initLocalDb()` 里是一个**一票否决**的开关：
+
+```dart
+// R4a 的写法（问题所在）
+catch (e, stack) {
+  kLocalFirstEnabled = false;   // 一次失败 → 整个 App（含写操作）静默直连云端
+}
+```
+
+于是：本地库初始化只要失败过一次，**整个 App（包括写操作）静默退回直连云端**，用户看到的是「提交成功」，其实请求打到了云端，断网时直接失败，而且**没有任何提示**。这就是症状 2 的根因；症状 1、3 是它的下游（写操作没进队列 → 推送从未发生 → 本地与云端状态分叉）。
+
+### 36.2 修法一：拆开关（`kLocalDbReady` vs `kLocalFirstEnabled`）
+
+`lib/config/local_config.dart` 新增两个全局量：
+
+```dart
+bool kLocalDbReady = false;          // 本地库能不能用（只由 _initLocalDb 设置）
+String? kLocalDbUnavailableReason;   // 不可用时的原因，给设置页展示
+bool kLocalFirstEnabled = true;      // 要不要走「本地优先」读路径
+```
+
+分工：**写操作只看 `kLocalDbReady`**（本地库能用就走写队列），**读路径仍看 `kLocalFirstEnabled`**（便于一行回退）。`main.dart` 的 `_initLocalDb()` 现在这样设置：
+
+```dart
+// 成功
+kLocalDbReady = true;
+kLocalDbUnavailableReason = null;
+// 失败
+kLocalDbReady = false;
+kLocalFirstEnabled = false;
+kLocalDbUnavailableReason = e.toString();
+```
+
+`push_engine.dart` 的 `_push()` / `PushScheduler.schedule()` / `pushOnStartup()` 判据也一并从 `kLocalFirstEnabled` 改成 `kLocalDbReady`——本地库不可用时队列永远不会被推送，离线写的东西会静默卡在本地。
+
+### 36.3 修法二：详情页按 id 查（`loadDefectTicketById`）
+
+原 `_readLocalDetail()` 用 `loadDefectTickets(kDemoUserId)` 把全量拉回来，再在内存里按 `t.id == id` 匹配。而 `_ticketFromRow` 生成的 id 是 `server_id ?? local_id`：
+
+- 离线新建的单 `server_id` 为 null → id 是 `local_id`（本地 UUID）；
+- 推送成功后 id 变成 `server_id`（云端 UUID）；
+- 页面持有的 `widget.ticket` 可能是**旧快照**。
+
+三种情况互相都对不上，于是详情页在本地读不到 → 列表与详情不一致（症状 3）。
+
+新增 `local_queries.dart` 的 `loadDefectTicketById(String userId, String id)`，直接按 `local_id` **或** `server_id` 命中：
+
+```sql
+SELECT dt.*, ... FROM defect_tickets dt
+WHERE dt.user_id = ? AND (dt.local_id = ? OR dt.server_id = ?)
+LIMIT 1
+```
+
+命中后再用 `_groupBy` 一次取回该单的 `verifications` / `actions` 子表，`_ticketFromRow` 组装。
+
+### 36.4 修法三：首页「今日待验证」改读本地真实任务
+
+原来首页的今日待验证**始终渲染 mock 常量** `kHomeSnapshot.tasks`（`_summaryTrailing()` 显示真实三色计数，但列表内容是假数据）。R4b 改为：
+
+- `_loadFromLocal()` 调 `loadVerificationTasks(kDemoUserId)`，映射成首页任务模型存进 `_tasks`；
+- `TaskListCard(tasks: _tasks.isEmpty ? _snapshot.tasks : _tasks)`（本地有数据就用本地，全空才回落 mock）；
+- `_onTapTask` 改为 `_openTaskDetail(task.id)`：先 `loadDefectTicketById`，失败再回落 `_defectApi.fetchDefectDetail`，然后 push 详情页。
+
+### 36.5 修法四：写操作的反馈措辞
+
+本地写入 ≠ 云端已收到，措辞必须区分，否则又是一轮「显示成功其实没成功」：
+
+| 操作 | 本地优先 | 直连云端 |
+| --- | --- | --- |
+| 归因 | 归因已保存，联网后会自动同步。 | 归因已提交，状态推进到「已归因」。 |
+| 验证（未关闭） | 已提交，联网后自动同步。 | 验证已提交，状态已推进。 |
+| 验证（V3 通过将关闭） | 验证已保存，联网后会自动同步（通过后缺陷单将关闭）。 | 三次验证全部通过，缺陷单已关闭。 |
+
+### 36.6 埋点：本地与队列要能自证
+
+- `[QUEUE] 入队 submitVerification op_id=7（stage=V3 result=pass 本地 status=CLOSED）`——五个写操作各一条；
+- `[PUSH] 提交验证成功，本地 status=CLOSED version=2`——推送引擎 `_applySuccess` 各分支各一条；
+- `[LOCAL] 读取缺陷单 1 条（status=V3）` / `[LOCAL] 读取验证任务 4 条`——四页的本地读取各一条。
+
+### 36.7 启动一致性校验（任务 D3）
+
+新增 `local_refresh.dart` 的 `checkLocalStatusConsistency()`：对比本地 `defect_tickets` 的 status 分布与云端拉回来的分布，一致记 info，不一致记 warn 并触发一次全量对账：
+
+```
+[WARN] [SYNC] 本地与云端状态分布不一致（本地={...}，云端={...}），触发一次全量对账
+```
+
+`main.dart` 的启动链变成：`ensureInitialData()` → `PushScheduler.pushOnStartup()` → `await checkLocalStatusConsistency()`。
+
+### 36.8 真机验证（Android 17，Railway 公网 + Neon）
+
+| 编号 | 场景 | 结果 |
+| --- | --- | --- |
+| E1 | 断网启动 → 首页今日待验证显示本地数据 | ✅ `[LOCAL] 读取验证任务 4 条`，首页三张卡来自本地 |
+| E2 | 断网点卡片 → 详情页 | ✅ `[LOCAL] 读取缺陷单 1 条（status=V3）`，详情六栏/动作/验证进度齐全 |
+| E3 | 断网提交 V3 pass | ✅ `[QUEUE] 入队 submitVerification op_id=7（stage=V3 result=pass 本地 status=CLOSED）`；本地 `status=CLOSED sync_state=2`，队列新增 1 条 `status=2 retry_count=1` |
+| E4 | 联网重启 → 推送 | ✅ `[PUSH] 提交验证成功，本地 status=CLOSED version=2`；队列行清空，`sync_state=0`，云端该单 CLOSED |
+| E5 | 断网时详情页不白屏 | ✅ 截图 `screenshots/r4b-offline-detail.png` |
+| E6 | 截图 | ✅ 7 张（见下） |
+| E7 | adb 核对队列 | ✅ 断网提交后 1 条 pending；联网后该条消失，只剩两条历史 dead 行 |
+
+截图：`screenshots/r4b-offline-home.png` / `r4b-offline-detail.png` / `r4b-offline-verify-form.png` / `r4b-offline-submitted.png` / `r4b-offline-list.png` / `r4b-synced-list.png` / `r4b-synced-home.png`。
+
+### 36.9 R4b 明确没做的事
+
+- **没做字段级冲突仲裁**：仍然只有「丢弃本地、以云端为准」。
+- **没做增量同步（R3）**：仍然全量对账。
+- **没做 dead 队列的 UI 管理入口**：dead 行只能在数据库里看。
+- **没改写操作的云端契约**：五页在 `kLocalDbReady == false` 时行为与 R2 之前完全一致。
+- 模考提交、复盘生成仍**必须在线**。

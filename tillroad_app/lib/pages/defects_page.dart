@@ -7,6 +7,7 @@ import '../api/defect_api.dart';
 import '../config/api_config.dart';
 import '../config/local_config.dart';
 import '../local/local.dart';
+import '../logging/app_logger.dart';
 import '../mock/defects_mock.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart';
@@ -133,6 +134,7 @@ class _DefectsPageState extends State<DefectsPage> {
     }
     try {
       final List<DefectTicket> list = await loadDefectTickets(kDemoUserId);
+      AppLogger.instance.info('LOCAL', '读取缺陷单 ${list.length} 条');
       // 本地为空且首次填充还没跑完 → 继续保持加载态（_all 仍为 null）。
       // 直接给空列表会把「还没同步下来」误报成「你确实没有缺陷单」（C5）。
       if (list.isEmpty && !await isFirstFillComplete()) return;
@@ -256,7 +258,7 @@ class _DefectsPageState extends State<DefectsPage> {
       if (created == true) {
         await _load();
         if (!mounted) return;
-        _toast(kLocalFirstEnabled ? '缺陷单已保存，联网后会自动同步。' : '缺陷单已创建。');
+        _toast(kLocalDbReady ? '缺陷单已保存，联网后会自动同步。' : '缺陷单已创建。');
       }
     } finally {
       if (mounted && _creating) setState(() => _creating = false);

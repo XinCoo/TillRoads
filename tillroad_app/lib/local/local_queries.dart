@@ -151,6 +151,48 @@ Future<List<DefectTicket>> loadDefectTickets(
       .toList(growable: false);
 }
 
+/// T4-b：**按 id 取单张**（详情页用）。
+///
+/// R4b 修缺口 3（列表与详情状态不一致）：
+/// 详情页原来调 `loadDefectTickets(userId)` 拿全量再按 `t.id == id` 在内存里找，
+/// 而 `t.id` 是 `server_id ?? local_id`。三处会因此对不上：
+///   1. 离线新建的单 `server_id` 还是 null，`t.id` 是 `local_id`；
+///   2. 云端详情回填后 `widget.ticket.id` 变成了 `server_id`，本地行的 `server_id`
+///      还没回填（等推送成功），于是 `t.id` 是 `local_id`；
+///   3. 推送成功后本地行的 `server_id` 有了值，`t.id` 变成 `server_id`，而页面
+///      还拿着旧的 `local_id`。
+/// 所以这里**两个列都当 id 匹配**。
+Future<DefectTicket?> loadDefectTicketById(String userId, String id) async {
+  final Database db = await LocalDb.instance.database;
+  final List<Map<String, Object?>> rows = await db.rawQuery(
+    '''SELECT dt.*,
+              kn.title   AS knowledge_node_title,
+              kn.freq_tag AS knowledge_node_freq_tag,
+              sub.name   AS subject_name
+         FROM defect_tickets dt
+         LEFT JOIN knowledge_nodes kn ON kn.local_id = dt.knowledge_node_id
+         LEFT JOIN subjects sub       ON sub.local_id = kn.subject_id
+        WHERE dt.${Col.userId} = ?
+          AND (dt.${Col.localId} = ? OR dt.${Col.serverId} = ?)
+        ORDER BY dt.created_at ASC, dt.local_id ASC
+        LIMIT 1''',
+    <Object?>[userId, id, id],
+  );
+  if (rows.isEmpty) return null;
+
+  final String localId = rows.first['local_id']! as String;
+  final Map<String, List<Map<String, Object?>>> verifications =
+      await _groupBy(db, 'verifications', <String>[localId]);
+  final Map<String, List<Map<String, Object?>>> actions =
+      await _groupBy(db, 'actions', <String>[localId]);
+
+  return _ticketFromRow(
+    rows.first,
+    verifications[localId] ?? const <Map<String, Object?>>[],
+    actions[localId] ?? const <Map<String, Object?>>[],
+  );
+}
+
 Future<Map<String, List<Map<String, Object?>>>> _groupBy(
   Database db,
   String table,

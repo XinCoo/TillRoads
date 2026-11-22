@@ -255,6 +255,70 @@ Future<List<Map<String, Object?>>> _pullAll(
   return out;
 }
 
+/// 启动时的一致性校验（R4b 任务 D3）。
+///
+/// 对比本地 `defect_tickets` 的 status 分布与云端返回的分布；不一致时记 warn
+/// 并触发一次后台刷新（不阻塞启动）。
+///
+/// 为什么需要：R4b 的症状「联网后列表与详情状态不一致」有两种来源——
+/// 本地行被推送引擎改了一半、或某次刷新中途断网留下半新半旧的数据。
+/// 这个校验能在启动时把差异说出来，并顺手拉一次全量对账。
+Future<void> checkLocalStatusConsistency() async {
+  if (!kLocalDbReady || kUseMock) return;
+  if ((kApiToken ?? '').trim().isEmpty) return;
+  try {
+    final Database db = await LocalDb.instance.database;
+    final List<Map<String, Object?>> localRows = await db.rawQuery(
+      'SELECT ${Col.status} AS status, COUNT(*) AS n FROM defect_tickets '
+      'WHERE ${Col.userId} = ? GROUP BY ${Col.status}',
+      <Object?>[kDemoUserId],
+    );
+    final Map<String, int> local = <String, int>{};
+    for (final Map<String, Object?> row in localRows) {
+      final String? status = text(row['status']);
+      final int n = asInt(row['n'], 0) ?? 0;
+      if (status != null) local[status] = n;
+    }
+    if (local.isEmpty) return;
+
+    final ApiClient client = ApiClient();
+    try {
+      final List<Map<String, Object?>> remoteRows = await _pullAll(
+        client,
+        '/users/$kDemoUserId/defect-tickets',
+      );
+      final Map<String, int> remote = <String, int>{};
+      for (final Map<String, Object?> row in remoteRows) {
+        final String? status = text(row['status']);
+        if (status == null) continue;
+        remote[status] = (remote[status] ?? 0) + 1;
+      }
+      bool same = remote.length == local.length;
+      if (same) {
+        for (final String status in remote.keys) {
+          if (local[status] != remote[status]) {
+            same = false;
+            break;
+          }
+        }
+      }
+      if (!same) {
+        AppLogger.instance.warn(
+          'SYNC',
+          '本地与云端状态分布不一致（本地=$local，云端=$remote），触发一次全量对账',
+        );
+        await refreshLocalFromCloud();
+      } else {
+        AppLogger.instance.info('SYNC', '本地与云端状态分布一致（$local）');
+      }
+    } finally {
+      client.close();
+    }
+  } catch (e) {
+    AppLogger.instance.warn('SYNC', '状态一致性校验失败：$e');
+  }
+}
+
 /// 清空所有「与云端一致」的行（换 token / 退出登录时用）。
 ///
 /// 与 `first_fill._wipeAllSynced` 同语义，但放在这里是给设置页调的公开入口

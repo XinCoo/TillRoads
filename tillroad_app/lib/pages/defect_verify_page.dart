@@ -19,12 +19,15 @@ import 'package:flutter/cupertino.dart';
 import '../../api/api_client.dart';
 import '../../api/defect_api.dart';
 import '../../config/api_config.dart';
+import '../../logging/app_logger.dart';
 import '../../local/local.dart'
     show
         LocalValidationException,
         PushScheduler,
         WriteQueue,
+        WriteQueueResult,
         kLocalDataRevision,
+        kLocalDbReady,
         kLocalFirstEnabled;
 import '../../theme/app_theme.dart';
 import '../../widgets/defect_badges.dart';
@@ -165,10 +168,16 @@ class _DefectVerifyPageState extends State<DefectVerifyPage> {
 
     setState(() => _busy = true);
     try {
-      if (kLocalFirstEnabled) {
+      // R4b：写路径的判据从 `kLocalFirstEnabled` 改成 `kLocalDbReady`。
+      //
+      // 原来用 `kLocalFirstEnabled`，而它在本地库初始化失败时会被置成 false，
+      // 于是**整个 App（含写操作）静默退回直连云端**——用户看到「提交成功」，
+      // 其实请求打到了云端，断网时直接失败且没有任何提示。
+      // 现在写操作只看「本地库能不能用」；读路径仍由 `kLocalFirstEnabled` 控制。
+      if (kLocalDbReady) {
         // 本地优先（R4a）：本地立即推进状态（pass→下一阶段 / V3 pass→CLOSED），
         // 联网后由推送引擎发给云端。
-        await WriteQueue.enqueueSubmitVerification(
+        final WriteQueueResult queued = await WriteQueue.enqueueSubmitVerification(
           ticketId: widget.ticket.id,
           stage: _stage,
           verifyType: _verifyType!,
@@ -177,7 +186,11 @@ class _DefectVerifyPageState extends State<DefectVerifyPage> {
           questionId: _questionId.text,
           evidence: _evidence.text,
         );
-        if (!mounted) return;
+        AppLogger.instance.info(
+          'QUEUE',
+          '入队 submitVerification op_id=${queued.opId}'
+          '（stage=$_stage result=$_result 本地 status=${queued.status}）',
+        );
         kLocalDataRevision.value++;
         PushScheduler.schedule();
         Navigator.of(context).pop(true);

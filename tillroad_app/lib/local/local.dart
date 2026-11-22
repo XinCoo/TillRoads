@@ -21,7 +21,11 @@ export 'dao/table_daos.dart'
         VerificationsDao;
 export 'local_db.dart' show LocalDb, LocalDbInventory;
 export 'package:tillroad_app/config/local_config.dart'
-    show kLocalDbFileName, kLocalFirstEnabled;
+    show
+        kLocalDbFileName,
+        kLocalDbReady,
+        kLocalDbUnavailableReason,
+        kLocalFirstEnabled;
 export 'local_schema.dart'
     show kLocalIndexNames, kLocalSchemaStatements, kLocalSchemaVersion, kLocalTableNames;
 export 'verify_window.dart'
@@ -49,6 +53,7 @@ export 'first_fill.dart'
         localDefectCount;
 export 'local_refresh.dart'
     show
+        checkLocalStatusConsistency,
         clearLocalCache,
         isRefreshingFromCloud,
         kChildRefreshStatuses,
@@ -60,6 +65,7 @@ export 'local_queries.dart'
     show
         loadActiveExamProfile,
         loadDefectStats,
+        loadDefectTicketById,
         loadDefectTickets,
         loadFirstSubject,
         loadKnowledgeNodes,

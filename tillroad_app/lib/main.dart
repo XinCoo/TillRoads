@@ -11,7 +11,7 @@ import 'config/app_info.dart';
 import 'config/local_config.dart';
 import 'local/first_fill.dart' show ensureInitialData;
 import 'local/local_db.dart' show LocalDb;
-import 'local/local.dart' show kLocalDataRevision, PushScheduler;
+import 'local/local.dart' show checkLocalStatusConsistency, kLocalDataRevision, PushScheduler;
 import 'logging/app_logger.dart';
 import 'logging/nav_observer.dart';
 import 'pages/defects_page.dart';
@@ -33,9 +33,14 @@ Future<void> main() async {
     // R4a：启动时补推上次没推完的写操作（网络断过、进程被杀都可能留下队列）。
     // 顺序要紧：先等首次填充跑完，再补推——推送成功后回写的 server_id 不能被
     // 随后全量覆写的父表 deleteSynced 抹掉。两者都不 await，不阻塞首屏。
+    // R4b：填充 + 补推完成后再跑一次「本地 vs 云端状态分布」一致性校验，
+    // 不一致就自动拉一次全量对账（任务 D3）。
     unawaited(
       ensureInitialData()
-          .then((_) => PushScheduler.pushOnStartup())
+          .then((_) async {
+        PushScheduler.pushOnStartup();
+        await checkLocalStatusConsistency();
+      })
           .catchError((Object e) {
         AppLogger.instance.warn('SYNC', '首次填充失败，跳过启动补推：$e');
       }),
@@ -57,18 +62,31 @@ Future<void> main() async {
 /// 并把 `kLocalFirstEnabled` 强制置 false（桌面平台没有 sqflite 实现，
 /// 这里就是它的降级点）。
 ///
+/// R4b 修正：失败时**不再**把 `kLocalFirstEnabled` 当成「写操作也禁用」的开关。
+/// 原来这里一次置 false，会让整个 App（包括写操作）静默退回直连云端——
+/// 用户看到「提交成功」，其实请求打到了云端，断网时直接失败且无任何提示。
+/// 现在分成两件事：
+///   · `kLocalDbReady` —— 本地库能不能用（写操作的判据）；
+///   · `kLocalFirstEnabled` —— 要不要走「本地优先」读路径（读路径的判据）。
+/// 本地库确实不可用时两个都置 false，并在 [kLocalDbUnavailableReason] 记原因，
+/// 供设置页展示，而不是让用户一头雾水。
+///
 /// 为什么要在这里等一次 `database`：只有真的 open 过，建表脚本才会跑。
 /// 若拖到页面里首次使用时才打开，R1 的「启动即建库」验收就没法验证。
 Future<void> _initLocalDb() async {
   try {
     await LocalDb.instance.database;
+    kLocalDbReady = true;
+    kLocalDbUnavailableReason = null;
     AppLogger.instance.info(
       'DB',
       '本地库就绪（$kLocalDbFileName，本地优先=$kLocalFirstEnabled）',
     );
   } catch (e, stack) {
     LocalDb.instance.lastError = e.toString();
+    kLocalDbReady = false;
     kLocalFirstEnabled = false;
+    kLocalDbUnavailableReason = e.toString();
     AppLogger.instance.error(
       'DB',
       '本地库初始化失败，已降级为直连云端：$e',

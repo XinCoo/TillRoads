@@ -122,7 +122,10 @@ abstract final class PushEngine {
 
   static Future<PushReport> _push() async {
     final PushReport report = PushReport();
-    if (!kLocalFirstEnabled) return report;
+    // R4b：推送引擎的判据也改成「本地库能不能用」。
+    // 原来用 `kLocalFirstEnabled`，一旦本地库初始化失败（被置 false），
+    // 队列就永远不会被推送——离线写的东西会静默卡在本地。
+    if (!kLocalDbReady) return report;
     if ((kApiToken ?? '').trim().isEmpty) return report;
 
     final Database db = await LocalDb.instance.database;
@@ -333,6 +336,10 @@ abstract final class PushEngine {
         });
         latestVersion[localId] = version;
         await _backfillActions(db, localId, row['actions'], version);
+        AppLogger.instance.info(
+          'PUSH',
+          '建单成功，本地 server_id=$serverId status=${status ?? '-'} version=$version',
+        );
       }
       return;
     }
@@ -352,6 +359,14 @@ abstract final class PushEngine {
           : null;
       if (verificationRow != null) {
         await _applyVerificationRow(db, localId, verificationRow);
+        // R4b：把「推送后本地状态是什么」明确记下来，方便核对列表与详情是否一致。
+        final Map<String, Object?>? appliedTicket =
+            await LocalDaos.defectTickets.getByLocalId(db, localId);
+        AppLogger.instance.info(
+          'PUSH',
+          '提交验证成功，本地 status=${appliedTicket?['status']}'
+          ' version=${appliedTicket?[Col.version]}',
+        );
       }
       return;
     }
@@ -369,12 +384,22 @@ abstract final class PushEngine {
           Col.version: actionVersion,
           if (row['done'] is bool) 'done': (row['done']! as bool) ? 1 : 0,
         });
+        AppLogger.instance.info(
+          'PUSH',
+          '标记动作成功，本地 action=$actionLocalId done=${row['done']}'
+          ' version=$actionVersion',
+        );
       }
       return;
     }
 
     // 归因 / 进入验证：响应都是缺陷单裸行。
     await _applyTicketRow(db, localId, row, latestVersion);
+    AppLogger.instance.info(
+      'PUSH',
+      '${op.operation} ${op.pathTemplate} 成功，'
+      '本地 status=${row['status']} version=${_intOf(row['version']) ?? 1}',
+    );
   }
 
   static Future<void> _applyTicketRow(
@@ -617,7 +642,8 @@ abstract final class PushScheduler {
   /// 尽力而为地触发一次推送：失败只记日志，绝不影响调用方（页面写操作后的调用处
   /// 不该因为推送失败而回滚 UI）。
   static void schedule({bool force = false}) {
-    if (!kLocalFirstEnabled) return;
+    // R4b：改用 `kLocalDbReady`（本地库能不能用）。
+    if (!kLocalDbReady) return;
     final DateTime now = DateTime.now();
     final DateTime? last = _lastPushAt;
     if (!force && last != null && now.difference(last) < minInterval) return;
@@ -636,7 +662,8 @@ abstract final class PushScheduler {
   /// **调用方要保证已在首次填充之后**（见 `main()`）：否则 `POST /defect-tickets`
   /// 成功回写的 `server_id` 可能被随后全量覆写的父表 deleteSynced 抹掉。
   static void pushOnStartup() {
-    if (!kLocalFirstEnabled) return;
+    // R4b：同上。
+    if (!kLocalDbReady) return;
     _lastPushAt = DateTime.now();
     unawaited(
       PushEngine.pushPending().catchError((Object e) {

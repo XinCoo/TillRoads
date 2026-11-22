@@ -11,6 +11,8 @@ import '../local/local.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart';
 import '../widgets/defect_badges.dart';
+import '../logging/app_logger.dart';
+import '../mock/defects_mock.dart' show DefectTicket;
 import 'defect_detail_page.dart';
 
 /// 验证任务页（FE-04）。
@@ -167,6 +169,7 @@ class _VerifyPageState extends State<VerifyPage> {
         stage: _stage.wire,
         urgency: _urgency.wire,
       );
+      AppLogger.instance.info('LOCAL', '读取验证任务 ${items.length} 条');
       final VerificationSummary summary = await loadVerificationSummary(kDemoUserId);
       // 本地空且首次填充没跑完 → 保持加载态，不报「暂无待验证任务」（C5）。
       if (items.isEmpty && !await isFirstFillComplete()) return;
@@ -212,7 +215,13 @@ class _VerifyPageState extends State<VerifyPage> {
     }
     setState(() => _openingId = task.id);
     try {
-      final ticket = await _defectApi.fetchDefectDetail(task.id);
+      // R4b：本地优先——先从本地表取完整缺陷单（断网也能进详情），
+      // 取不到再回落云端。否则断网点卡片会直接报错。
+      DefectTicket? ticket;
+      if (kLocalFirstEnabled) {
+        ticket = await loadDefectTicketById(kDemoUserId, task.id);
+      }
+      ticket ??= await _defectApi.fetchDefectDetail(task.id);
       if (!mounted) return;
       setState(() => _openingId = null);
       final changed = await Navigator.of(context).push<bool>(

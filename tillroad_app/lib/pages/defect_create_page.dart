@@ -15,16 +15,19 @@ import 'package:flutter/cupertino.dart';
 import '../../api/api_client.dart';
 import '../../api/defect_api.dart';
 import '../../config/api_config.dart';
+import '../../logging/app_logger.dart';
 // 只取写队列相关符号：`local.dart` 也导出 `findForbiddenPhrases`，
 // 与 `defect_api.dart` 的同名函数冲突，故用 show 收窄。
 import '../../local/local.dart'
     show
         kLocalDataRevision,
+        kLocalDbReady,
         kLocalFirstEnabled,
         loadKnowledgeNodes,
         LocalValidationException,
         PushScheduler,
-        WriteQueue;
+        WriteQueue,
+        WriteQueueResult;
 import '../../theme/app_theme.dart';
 import '../../widgets/form_field.dart';
 
@@ -213,10 +216,13 @@ class _DefectCreatePageState extends State<DefectCreatePage> {
         .toList(growable: false);
 
     try {
-      if (kLocalFirstEnabled) {
+      // R4b：写路径判据改为 `kLocalDbReady`（本地库能不能用）。
+      // 原来用 `kLocalFirstEnabled`，本地库初始化失败时会连写操作一起关掉，
+      // 静默退回直连云端——用户看到「提交成功」但请求其实打到了云端。
+      if (kLocalDbReady) {
         // 本地优先（R4a）：写本地库 + 入队，用户立刻看到新单；推送由后台完成。
         // 校验已在 WriteQueue 内部跑过一遍状态机，非法操作在这里抛出，不会落库。
-        await WriteQueue.enqueueCreateDefect(
+        final WriteQueueResult queued = await WriteQueue.enqueueCreateDefect(
           userId: kDemoUserId,
           examProfileId: widget.examProfileId,
           qType: _qType.text.trim(),
@@ -225,6 +231,11 @@ class _DefectCreatePageState extends State<DefectCreatePage> {
           knowledgeNodeId: _knowledgeNodeId,
           priority: _priority,
           actions: actions,
+        );
+        AppLogger.instance.info(
+          'QUEUE',
+          '入队 createDefect op_id=${queued.opId}'
+          '（本地 status=${queued.status}）',
         );
         if (!mounted) return;
         kLocalDataRevision.value++;

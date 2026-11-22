@@ -6,13 +6,18 @@ import '../api/api_client.dart' show ApiException;
 import '../api/defect_api.dart';
 // 只拿 summary 相关的两个类型：`VerificationTask` 在 home_mock.dart 里已有一个
 // 首页专用版本（展示字段不同），两个都导入会 ambiguous_import。
-import '../api/verification_api.dart'
-    show VerificationApi, VerificationSummary;
+// 用前缀别名导入：`VerificationTask` 在 home_mock.dart 里已有一个首页专用版本
+// （展示字段不同），两个都直接导入会 ambiguous_import；而 `show` 后面不能带
+// 逐项 `as` 前缀，所以这里整个模块用别名。
+import '../api/verification_api.dart' as vapi;
 import '../config/api_config.dart';
 import '../config/local_config.dart';
 import '../local/local.dart';
+import '../logging/app_logger.dart';
 import '../mock/home_mock.dart';
+import '../mock/defects_mock.dart' show DefectTicket;
 import '../pages/defect_create_page.dart';
+import '../pages/defect_detail_page.dart';
 import '../pages/mock_create_page.dart';
 import '../pages/review_page.dart';
 import '../pages/settings_page.dart';
@@ -64,7 +69,7 @@ class _HomePageState extends State<HomePage> {
   /// 首页这块是「今日待验证」的摘要位，样式沿用 FE-01。
   final HomeSnapshot _snapshot = kHomeSnapshot;
 
-  final VerificationApi _verifyApi = VerificationApi();
+  final vapi.VerificationApi _verifyApi = vapi.VerificationApi();
   final DefectApi _defectApi = DefectApi();
 
   /// —— 倒计时 ——
@@ -72,8 +77,15 @@ class _HomePageState extends State<HomePage> {
   ApiException? _profileError;
   bool _profileLoaded = false;
   /// —— 今日待验证 ——
-  VerificationSummary? _summary;
+  vapi.VerificationSummary? _summary;
   ApiException? _summaryError;
+
+  /// 「今日待验证」的真实任务列表（R4b）。
+  ///
+  /// R4a 之前这里渲染的是 mock 常量 `_snapshot.tasks`——断网时点开卡片拿不到
+  /// 任何真实数据，而且摘要数字是真实的、列表是假的，两者对不上。
+  /// 现在本地优先模式下从本地表算出来；空列表时才回落到 mock（离线演示）。
+  List<VerificationTask> _tasks = const <VerificationTask>[];
 
   // ── 缺陷分布 ──
   Map<String, Object?>? _stats;
@@ -155,13 +167,18 @@ class _HomePageState extends State<HomePage> {
         return;
       }
       final Map<String, Object?>? profile = await loadActiveExamProfile(kDemoUserId);
-      final VerificationSummary summary = await loadVerificationSummary(kDemoUserId);
+      final vapi.VerificationSummary summary = await loadVerificationSummary(kDemoUserId);
       final Map<String, Object?> stats = await loadDefectStats(kDemoUserId);
+      // R4b：今日待验证也从本地算，不再渲染 mock。
+      final List<vapi.VerificationTask> rawTasks = await loadVerificationTasks(kDemoUserId);
+      AppLogger.instance.info('LOCAL', '读取验证任务 ${rawTasks.length} 条');
+      final List<VerificationTask> tasks = rawTasks.map(_toHomeTask).toList();
       if (!mounted) return;
       setState(() {
         // 三块已是「本地真实值」，不再标降级：离线也能读到的数据不该带「离线数据」标记。
         _profile = profile;
         _summary = summary;
+        _tasks = tasks;
         _stats = stats;
         _profileError = null;
         _summaryError = null;
@@ -337,7 +354,51 @@ class _HomePageState extends State<HomePage> {
   }
 
   void _onTapTask(VerificationTask task) {
+    // R4b：本地优先时直接进缺陷单详情（详情页自己会从本地表读完整数据），
+    // 断网也能看到归因、动作与验证进度；读不到才回落到验证任务页。
+    if (kLocalFirstEnabled && !kUseMock) {
+      unawaited(_openTaskDetail(task.id));
+      return;
+    }
     _openVerify();
+  }
+
+  /// 打开某张缺陷单的详情页：先从本地表取完整单（离线可用），
+  /// 取不到再回落云端。
+  Future<void> _openTaskDetail(String ticketId) async {
+    try {
+      DefectTicket? ticket = await loadDefectTicketById(kDemoUserId, ticketId);
+      if (ticket == null) {
+        ticket = await _defectApi.fetchDefectDetail(ticketId);
+      }
+      if (!mounted) return;
+      await Navigator.of(context).push<void>(
+        appRoute<void>(context, DefectDetailPage(ticket: ticket)),
+      );
+      if (mounted) await _loadFromLocal();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      _toast(
+        '打开详情',
+        e.isNetworkError
+            ? '无法连接后端，且本地没有这条缺陷单。'
+            : '打开详情失败（HTTP ${e.statusCode}）',
+      );
+    }
+  }
+
+  /// 把 API 层的验证任务转成首页卡片用的模型（字段名不同，见 home_mock）。
+  VerificationTask _toHomeTask(vapi.VerificationTask t) {
+    return VerificationTask(
+      id: t.id,
+      knowledgeNodeTitle: (t.knowledgeNodeTitle ?? '').trim().isEmpty
+          ? '未关联考点'
+          : t.knowledgeNodeTitle!,
+      subjectName: (t.subjectName ?? '').trim().isEmpty ? '未分类科目' : t.subjectName!,
+      stage: t.stage,
+      daysLeft: t.daysLeft,
+      urgency: TaskUrgency.fromWire(t.urgency),
+    );
   }
 
   // ─────────────────────────── 倒计时 ───────────────────────────
@@ -400,7 +461,7 @@ class _HomePageState extends State<HomePage> {
   /// 骨架阶段（真实模式、数据未到、也没失败）返回 `null`：不显示计数。
   /// 否则会先看到 mock 的「3 项」再突变成真实的「1 2」，违反 FE-07「首屏不显示 mock 数字」的要求。
   Widget? _summaryTrailing() {
-    final VerificationSummary? summary = _summary;
+    final vapi.VerificationSummary? summary = _summary;
     if (summary == null && _summaryError == null && !kUseMock) {
       return null;
     }
@@ -722,7 +783,7 @@ class _HomePageState extends State<HomePage> {
                   ),
                   _CardShell(
                     child: TaskListCard(
-                      tasks: _snapshot.tasks,
+                      tasks: _tasks.isEmpty ? _snapshot.tasks : _tasks,
                       onTapTask: _onTapTask,
                     ),
                   ),

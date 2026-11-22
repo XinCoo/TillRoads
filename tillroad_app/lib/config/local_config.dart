@@ -20,5 +20,20 @@
 ///   平台收窄放到 R2 的同步引擎入口处，此处只保留一个纯开关。
 bool kLocalFirstEnabled = true;
 
-/// 本地 SQLite 数据库文件名（sqflite 会放在平台标准目录下）。
+/// 本地库是否**真的能用**（与 [kLocalFirstEnabled] 分开）。
+///
+/// R4b 修缺口时发现的问题：`kLocalFirstEnabled` 是个「一票否决」的全局开关——
+/// 只要 `_initLocalDb()` 抛过一次异常，它就被置成 false，**整个 App（含写操作）
+/// 静默退回直连云端**，用户看到的是「提交成功」但其实请求打到了云端、
+/// 断网时直接失败，而且没有任何提示。
+///
+/// 现在拆成两个开关：
+///   · [kLocalDbReady] —— 本地库能不能用（只由 `_initLocalDb()` 设置）；
+///   · [kLocalFirstEnabled] —— 要不要走「本地优先」这条读路径。
+/// 写操作只要 [kLocalDbReady] 为 true 就走写队列；读路径仍受 [kLocalFirstEnabled]
+/// 控制，方便一行回退。
+bool kLocalDbReady = false;
+
+/// 本地库不可用时的降级原因（给设置页与启动横幅展示）。
+String? kLocalDbUnavailableReason;
 const String kLocalDbFileName = 'tillroad_local.db';

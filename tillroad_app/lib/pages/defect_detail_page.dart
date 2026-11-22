@@ -5,6 +5,7 @@ import 'package:flutter/cupertino.dart';
 import '../api/api_client.dart';
 import '../api/defect_api.dart';
 import '../config/api_config.dart';
+import '../logging/app_logger.dart';
 // 只取写队列相关符号：`local.dart` 与 defect_api 都有 forbidden 相关同名函数。
 import '../local/local.dart'
     show
@@ -12,10 +13,12 @@ import '../local/local.dart'
         LocalValidationException,
         PushScheduler,
         WriteQueue,
+        WriteQueueResult,
         WriteQueueStatus,
         kLocalDataRevision,
+        kLocalDbReady,
         kLocalFirstEnabled,
-        loadDefectTickets;
+        loadDefectTicketById;
 import '../mock/defects_mock.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart';
@@ -109,24 +112,33 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
 
   Future<void> _readLocalDetail() async {
     try {
-      final List<DefectTicket> all = await loadDefectTickets(kDemoUserId);
-      final Object? id = ticket.id;
-      DefectTicket? found;
-      for (final DefectTicket t in all) {
-        if (t.id == id) {
-          found = t;
-          break;
-        }
+      // R4b：改成按 id 直接查单张（`local_id` 或 `server_id` 都认）。
+      // 原来拿全量再按 `t.id == id` 在内存里找，而 `t.id` 是 `server_id ?? local_id`，
+      // 离线新建 / 推送成功回填 / 页面拿着旧快照这三种情况下都对不上，
+      // 表现就是「列表显示 V2、详情还是 V1」。
+      final DefectTicket? found =
+          await loadDefectTicketById(kDemoUserId, ticket.id);
+      if (!mounted || found == null) {
+        AppLogger.instance.warn(
+          'LOCAL',
+          '本地读取缺陷单失败：未找到 id=${ticket.id}',
+        );
+        return;
       }
-      if (!mounted || found == null) return;
+      AppLogger.instance.info(
+        'LOCAL',
+        '读取缺陷单 1 条（status=${found.status.wire}）',
+      );
       setState(() {
-        ticket = found!;
+        ticket = found;
         _refreshError = null;
       });
     } catch (e) {
+      AppLogger.instance.warn('LOCAL', '本地读取缺陷单失败：$e');
       debugPrint('[detail] 本地读取失败：$e');
     }
   }
+
 
   Future<void> _refreshFromCloud() async {
     if (kUseMock) return;
@@ -236,11 +248,18 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
     }
     setState(() => _busy = true);
     try {
-      if (kLocalFirstEnabled) {
-        await WriteQueue.enqueueMarkAction(
+      // R4b：写路径判据改为 `kLocalDbReady`（本地库能不能用），
+      // 不再用 `kLocalFirstEnabled`——后者失败时会连写操作一起关掉。
+      if (kLocalDbReady) {
+        final WriteQueueResult queued = await WriteQueue.enqueueMarkAction(
           ticketId: ticket.id,
           actionId: action.id,
           done: true,
+        );
+        AppLogger.instance.info(
+          'QUEUE',
+          '入队 markAction op_id=${queued.opId}'
+          '（action=${action.id} done=true）',
         );
         if (!mounted) return;
         setState(() => _busy = false);
@@ -274,11 +293,17 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
     }
     setState(() => _busy = true);
     try {
-      if (kLocalFirstEnabled) {
+      // R4b：同上，写路径只看本地库是否可用。
+      if (kLocalDbReady) {
         // 本地只乐观前进到 V1；云端那一步是两跳（version +2），推送前会先拉最新版本。
-        await WriteQueue.enqueueBeginVerification(
+        final WriteQueueResult queued = await WriteQueue.enqueueBeginVerification(
           ticketId: ticket.id,
           baseVersion: ticket.version,
+        );
+        AppLogger.instance.info(
+          'QUEUE',
+          '入队 beginVerification op_id=${queued.opId}'
+          '（本地 status=${queued.status}）',
         );
         if (!mounted) return;
         setState(() => _busy = false);
@@ -314,7 +339,14 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
     if (changed == true) {
       await _refreshDetail();
       if (!mounted) return;
-      _toast(context, '归因已提交，状态推进到「已归因」。');
+      // R4b：本地优先时不能说「已提交」——那会让人以为云端已经收到。
+      // 实际是「已保存到本地，联网后自动同步」。
+      _toast(
+        context,
+        kLocalDbReady
+            ? '归因已保存，联网后会自动同步。'
+            : '归因已提交，状态推进到「已归因」。',
+      );
     }
   }
 
@@ -332,7 +364,13 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
       await _refreshDetail();
       if (!mounted) return;
       final bool closed = ticket.status == DefectStatus.closed;
-      _toast(context, closed ? '三次验证全部通过，缺陷单已关闭。' : '验证已提交，状态已推进。');
+      // R4b：同上，写入本地 ≠ 云端已收到。措辞要区分「已保存」与「已提交」。
+      final String message = kLocalDbReady
+          ? (closed
+              ? '验证已保存，联网后会自动同步（通过后缺陷单将关闭）。'
+              : '已提交，联网后自动同步。')
+          : (closed ? '三次验证全部通过，缺陷单已关闭。' : '验证已提交，状态已推进。');
+      _toast(context, message);
     }
   }
 

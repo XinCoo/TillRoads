@@ -16,13 +16,16 @@ import 'package:flutter/cupertino.dart';
 import '../../api/api_client.dart';
 import '../../api/defect_api.dart';
 import '../../config/api_config.dart';
+import '../../logging/app_logger.dart';
 // 只取写队列相关符号：`local.dart` 也导出 `findForbiddenPhrases`，与 defect_api 冲突。
 import '../../local/local.dart'
     show
         LocalValidationException,
         PushScheduler,
         WriteQueue,
+        WriteQueueResult,
         kLocalDataRevision,
+        kLocalDbReady,
         kLocalFirstEnabled;
 import '../../theme/app_theme.dart';
 // CardShell / InfoRow 等卡片壳复用 FE-03 列表页的组件，保证圆角/阴影一致
@@ -190,13 +193,20 @@ class _DefectAnalyzePageState extends State<DefectAnalyzePage> {
 
     setState(() => _busy = true);
     try {
-      if (kLocalFirstEnabled) {
+      // R4b：写路径判据改为 `kLocalDbReady`（本地库能不能用），
+      // 不再用 `kLocalFirstEnabled`——后者失败时会连写操作一起关掉。
+      if (kLocalDbReady) {
         // 本地优先（R4a）：写本地库 + 入队。REOPENED 时会自动 round+1。
-        await WriteQueue.enqueueAnalyze(
+        final WriteQueueResult queued = await WriteQueue.enqueueAnalyze(
           ticketId: widget.ticket.id,
           errorLayer: _errorLayer!,
           errorCause: _errorCause.text.trim(),
           baseVersion: _version,
+        );
+        AppLogger.instance.info(
+          'QUEUE',
+          '入队 analyze op_id=${queued.opId}'
+          '（本地 status=${queued.status}）',
         );
         if (!mounted) return;
         kLocalDataRevision.value++;
