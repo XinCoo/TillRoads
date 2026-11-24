@@ -96,7 +96,7 @@ TillRoads/
 ├── tests/fixtures/questions/  # 切题样本（3 份文本 + 2 个 PDF + 生成脚本）
 ├── migrations/                # PG 迁移入口（psql 的 \ir ../schema.sql）
 ├── schema.sql                 # 数据库单一事实来源
-├── .github/workflows/schema-ci.yml  # schema 幂等/可逆 + Node 单测 + PG 集成
+├── .github/workflows/schema-ci.yml  # schema 幂等/可逆 + Node 单测 + PG 集成 + Flutter analyze/test
 ├── *.md                       # 设计 / 决策 / 评审文档
 ├── package.json               # scripts: test / test:core / test:server / test:integration / start / dev / db:*
 ├── scripts/                   # 本地运维脚本（联调新增，均 process.loadEnvFile()）
@@ -144,7 +144,7 @@ npm start
 
 数据库（PG15+）：
 
-- **CI**：由 GitHub Actions 的 PG15 service 容器真跑（`psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql`）。
+- **CI**：由 GitHub Actions 的 PG15 service 容器真跑（`psql -v ON_ERROR_STOP=1 -f migrations/0001_init_up.sql`）。workflow 现有三个 job：`schema`（幂等/可逆）、`node-tests`（`npm ci && npm test`，用 `grep -q 'skipped 0'` 防「全 skip 也算绿」）、`flutter-tests`（`flutter analyze --no-fatal-infos` + `flutter test`，**钉住 Flutter 3.50.0**）；触发路径含 `tillroad_app/**`。
 - **本地**：本机未安装 PostgreSQL，联调时改用 Neon 云库（连接参数放 `.env`，已被 `.gitignore` 忽略），并用 `scripts/migrate.mjs` 代替 `psql`（因为 `migrations/0001_init_up.sql` 只有 `\ir ../schema.sql` 这条 psql 元命令，`pg` 驱动执行不了；脚本改为直接跑纯 SQL 的 `schema.sql`）。
 
 ```bash
@@ -645,6 +645,17 @@ CREATE INDEX IF NOT EXISTS idx_q_owner
 
 **前端入口**（「我的 → 题库管理」）：`lib/pages/question_bank_page.dart`（列表，按科目分组）与 `lib/pages/question_import_page.dart`（选文件 → 选科目 → 选考点（可选）→ 上传 → 结果），新增依赖 `file_picker ^13.4.1`。
 
+### 分发前四个阻塞项修复与考试配置（m18680）
+
+| 问题 | 真因（实测） | 修法 |
+|---|---|---|
+| 「判重 50 但云端一条没有」 | **不是 dedupe bug**：50 题首次导入在 Neon 上耗时 **20.3s**，超过前端全局 15s 超时 → 客户端报失败、用户重试 → 第二次因已入库而判重 50；且用户当时用 A 的 token 看 B 导入的题，本来就看不到 | ①`questions_import` 加 4 处 `[IMPORT]` 日志（切题数 / 查重命中 / 每 10 题进度 / 完成汇总，不改事务语义）②导入页单独用 `ApiClient(timeout: 60s)`，全局 `kApiTimeout` 仍 15s③`GET /questions` 默认 `created_at DESC`，刚导入的排最前 |
+| 「清除所有数据」只清本地 | 名字与行为不符：云端一行未动，重装/换设备后数据全回来 | 后端新增 `DELETE /users/:userId/data`（九类按子→父软删，**公共题 `owner_user_id IS NULL` 保留**）；前端拆成「清除本地缓存」与「删除我的所有数据」两个入口，后者要手打「确认删除」四字，云端失败时**不清本地**并如实报告 |
+| 首页「今日待验证」残留 mock 卡 | `TaskListCard(tasks: _tasks.isEmpty ? _snapshot.tasks : _tasks)` 在本地为空时回落 3 条 mock（`dt-v1-001` 等非法 id），点击请求 500 | 三态分离：mock 模式 / 真实列表 / 同步中转圈 / 真空态；列表不再回落 mock；`_onTapTask` 先校验 UUID，非法 id 不请求 |
+| 文件选择器选不到 `.md` | `kSupportedExtensions` 缺 `markdown`，且 `FileType.custom` 在部分系统上过滤过严 | 扩展名补 `markdown`（与后端 `extract.mjs` 的 `EXT_KINDS` 一致）+ 「选不到文件？用「所有文件」打开」兜底（`FileType.any` 后自校验扩展名） |
+
+**考试配置四页面**（「我的 → 考试配置」）：`exam_config_page.dart`（目标列表）→ `exam_profile_create_page.dart`（新建目标，**`civil_service` 自动预置 6 个科目**）→ `subject_config_page.dart`（科目增删）→ `knowledge_node_page.dart`（考点树，支持父子与频率/权重）。写操作裸用 `ApiClient().post/patch/delete`，`DELETE` 的 `version` 走 **body**（`readBaseVersion(body)` 不读 query）；首页「还没有设置考试目标」的「去设置」按钮与导入页空档案文案均指向该页。
+
 ---
 
 ## 5.5 应用界面与字体（`tillroad_app/`）
@@ -672,11 +683,11 @@ CREATE INDEX IF NOT EXISTS idx_q_owner
 
 ### 目录与依赖
 
-- `tillroad_app/lib/` 62 个 dart 文件：`main.dart` / `theme/` 1 / `config/` 3（`api_config`、`app_info`、`local_config`）/ `mock/` 2（`home_mock`、`defects_mock`）/ `api/` 6 / `logging/` 4 / `local/` 16（其中 `local/dao/` 5）/ `pages/` 18 / `widgets/` 11。
+- `tillroad_app/lib/` 66 个 dart 文件：`main.dart` / `theme/` 1 / `config/` 3（`api_config`、`app_info`、`local_config`）/ `mock/` 2（`home_mock`、`defects_mock`）/ `api/` 6 / `logging/` 4 / `local/` 16（其中 `local/dao/` 5）/ `pages/` 22 / `widgets/` 11。
 - 运行时依赖 `cupertino_icons` + `http` + `shared_preferences` + `share_plus` + `sqflite` + `path` + `file_picker`（后两个是本地优先 R1 引入、`file_picker` 是题库导入入口引入，见下节）；dev 依赖 `flutter_lints` + `flutter_launcher_icons` + `sqflite_common_ffi`（**仅测试用**，不进产物）。**无状态管理库、无路由库、无图表库、无 ORM、无 build_runner**。
 - ⚠️ `file_picker` 版本必须是 **^13.4.1**（不是 8.x）：8.x 依赖 `win32 ^5`，与 `share_plus 13.x`（`win32 ^6`）冲突，pub 解析不出来。13.x 的 API 也变了——`FilePicker.pickFiles(...)` 是**静态方法**直接返回 `List<PlatformFile>`（没有 `.platform`、没有 `FilePickerResult`），文件大小用 `await file.length()` 取、内容用 `await file.readAsBytes()` 取（没有 `size`/`bytes` 字段）。
 - 兼容平台：`android` / `ios` / `windows`（Windows 仅为本机开发期验证用，交付目标是移动端；**Windows 上不启用本地库**，见下节）。
-- 已知 `flutter analyze` 输出：**0 error / 0 warning / 57 info**（R1 前是 30 info，R1 新增 2 条、R2 新增 5 条、R4a 新增 14 条、R4b 新增 3 条、题库导入新增 3 条，均为同一 `deprecated_member_use`）。全部 info 都是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「纯 Cupertino」的约束冲突。
+- 已知 `flutter analyze` 输出：**0 error / 0 warning / 68 info**（R1 前是 30 info，R1 新增 2 条、R2 新增 5 条、R4a 新增 14 条、R4b 新增 3 条、题库导入新增 3 条、m18680 新增 11 条，均为同一 `deprecated_member_use`）。全部 info 都是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「纯 Cupertino」的约束冲突。
 
 ### 缺陷单界面（FE-03）
 
@@ -978,6 +989,39 @@ flutter build apk --release --dart-define=API_BASE_URL=https://tillroads-product
 ```
 
 不提供 `API_TOKEN` 时，App 首次启动会显示 Token 输入页，并使用 `shared_preferences` 保存在本机；编译期 Token 优先于本地保存值。APK 输出路径为 `tillroad_app/build/app/outputs/flutter-apk/app-release.apk`。部署完成后应确认 `/health` 返回 200、无 Token 返回 401、正确 Token 返回自己的数据，另一个 Token 可以返回其用户的空列表。
+### 打包分发（release 签名）
+
+`android/app/build.gradle.kts` 的 release 签名是**条件式**的：
+
+- 存在 `tillroad_app/android/key.properties` → 用其中指定的 keystore 签名；
+- 不存在 → 回落到 debug 密钥（只够本机 `flutter run --release` 自测，**不可对外分发**）。
+
+两个文件 `key.properties` 与 keystore（`**/*.jks`）都已在 `android/.gitignore` 排除，不会入库。生成正式 keystore：
+
+```powershell
+# 在仓库根执行；口令自己记住，别写进任何提交物
+pwsh -File tillroad_app/scripts/make-keystore.ps1 -StorePassword "你的口令" -KeyPassword "你的口令"
+```
+
+脚本会在 `tillroad_app/android/` 下生成 `tillroad-release.jks` 与 `key.properties`（PKCS12 格式、RSA 2048、有效期 10000 天）。等价的裸 keytool 命令：
+
+```powershell
+keytool -genkeypair -keystore tillroad_app/android/tillroad-release.jks -storetype PKCS12 `
+  -keyalg RSA -keysize 2048 -validity 10000 -alias tillroad `
+  -storepass "你的口令" -keypass "你的口令" -dname "CN=TillRoad, OU=Mobile, O=TillRoad, L=Shanghai, S=Shanghai, C=CN"
+```
+
+然后构建并校验签名：
+
+```powershell
+flutter build apk --release --dart-define=API_BASE_URL=https://tillroads-production.up.railway.app --dart-define=API_TOKEN=tk_test_001
+apksigner verify --print-certs tillroad_app/build/app/outputs/flutter-apk/app-release.apk
+# 应看到 certificate DN: CN=TillRoad, ...
+```
+
+**务必离线备份 keystore 与 key.properties**：Android 的覆盖升级要求签名一致，丢了就再也无法给已装用户发升级包，只能换 `applicationId` 重新上架。
+
+签名是自签名证书，足够侧载 / 内测分发；若要上架 Google Play，需要用同一套 keystore 或改走 Play App Signing。
 
 ### ⚠️ Release APK 的联网权限与连接诊断
 
@@ -1038,8 +1082,9 @@ Select-String -Path tillroad_app\build\app\intermediates\merged_manifest\release
 - ✅ **本地优先 R4a**：写操作也本地化——新增 `local_state_machine.dart`（`core/index.mjs` 纯函数 Dart 移植，24 条用例逐条对齐）+ `write_queue.dart`（五类写操作「本地校验 → 乐观写库 → 入队」）+ `push_engine.dart`（队列补推、409 → conflict / 400·404 → dead / 网络 → 退避重试、四处触发：启动·写后·下拉·回前台）；五个写页面改为本地优先（`kLocalFirstEnabled=false` 时逻辑完全不变），列表卡片挂「待同步」角标，详情页冲突时出橙色横幅「该单已被修改，请刷新后重试」；本轮**跳过 R3**（后端无 `updated_since`）；真机抓到并修掉 **5 个**只有真机才能暴露的缺陷：①离线建单被前置网络请求挡住 ②启动时不补推导致队列永远推不出去 ③`begin-verification` 入参状态与 core 不同（云端要 `ANALYZED`）④标记动作的 base_version 该用**动作行自己的 version** 而非缺陷单的 ⑤Dart 字符串插值漏花括号致冲突消解静默失败；`flutter test` **106/106**、`flutter analyze` 0 error / 51 info；Android 真机 E1 离线建单→自动推送（无重复单）/ E2 断网链（标记两动作 + 进入验证 → 云端 `V1 version=3`）/ E4 冲突横幅与消解 / E5 门禁拦截 / E7 死信（400 与 404 均转 `status=4`），5 张截图留证
 - ✅ **本地优先 R4b**：修掉 R4a 的三个集成缺口。①**根因不是「写队列没接」**（五页早就有分支），而是 `kLocalFirstEnabled` 是个一票否决开关——本地库初始化失败一次就置 false，**整个 App（含写操作）静默退回直连云端**，用户看到「提交成功」其实请求打到了云端；R4b 拆出 **`kLocalDbReady`**（写路径判据）与 `kLocalFirstEnabled`（读路径判据）②详情页改用 `loadDefectTicketById`（`local_id = ? OR server_id = ?`）取代「拉全量再内存匹配」，修掉离线新建/推送回填/旧快照三种 id 对不上导致的「列表与详情不一致」③首页「今日待验证」改读本地真实任务（此前只渲染 mock）④写操作反馈措辞区分「已保存（联网后自动同步）」与「已提交」⑤新增启动一致性校验（本地 vs 云端 status 分布不一致 → warn + 全量对账）与三类埋点（`[QUEUE]` / `[PUSH]` / `[LOCAL]`）；`flutter test` **106/106**、`flutter analyze` 0 error / 54 info；Android 真机 E1 断网首页读本地 4 条 / E2 断网详情页本地命中 / E3 断网提交 V3 pass 入队（本地 CLOSED，队列 +1）/ E4 联网推送成功（`[PUSH] 提交验证成功，本地 status=CLOSED version=2`，队列清空）/ E7 adb 核对队列，7 张截图留证
 - ✅ **题库导入入口 + owner_user_id 多用户隔离（m17431）**：后端新增 `questions.owner_user_id`（独立幂等迁移 `migrations/0002_questions_owner.sql` + down 脚本，不改 `schema.sql`/0001）+ 查重按 owner 分域（单题/批量/更新三处）+ 组卷抽题限「公共题 + 自己的题」+ 新增只读端点 `GET /questions`（原先后端**没有**题库列表端点，items 不含 answer/analysis）+ 导入路由只认 token 映射的 userId（不信任请求体）；前端新增「我的 → 题库管理」入口 + `question_bank_page.dart`（按科目分组、默认最新在前）+ `question_import_page.dart`（file_picker 选文件 md/txt/csv/pdf/xlsx → 选科目 → 选考点可选 → base64 上传 → 结果页 imported/duplicates/errors + 413/422/415/400 分档人话提示）+ `question_api.dart`；唯一新依赖 `file_picker`（必须 ^13.4.1，8.x 与 `share_plus 13.x` 的 `win32` 版本冲突）；Neon 真库验证：A 导入 12 → B 导入同文件 12（**不判重**）→ A 再导入 0 新增/12 判重 → B 组卷抽题 **A 私有题 0 命中** → `GET /questions` A 私有题**泄漏给 B = 0**；Android 17 真机走通「我的 → 题库管理 → 导入 → 选文件 → 选科目 → 上传 → 新增 12 → 列表显示「我导入的」→ 再导入同文件判重 12」，7 张截图留证
-- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两个节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）；⑥本地优先 R3 的增量对账尚未实现（后端需加 `updated_since` 或变更日志）；⑦R4a 的冲突只做「丢弃本地 + 以云端为准」，字段级自动仲裁与写队列的删除操作未做；⑧R4b 未做 dead 队列的 UI 管理入口（死信行只能在数据库里看），也未做删除操作的入队；⑨题库只有「导入 + 查看」，编辑/删除/按考点筛选与 AI 生成题入口都没做（题库本地缓存待 R5 拍板）
-详细顺序见 [REVIEW-NOTES.md §7](<REVIEW-NOTES.md>) 与 [mvp-tasks.md](<mvp-tasks.md>)。
+（`fe-import-50.png` / `fe-import-dupes.png` / `fe-exam-config.png` / `fe-exam-create.png` / `fe-subject-config.png` / `fe-knowledge-tree.png` / `fe-settings-danger.png` / `fe-delete-confirm.png`）
+- ✅ **四项阻塞项复核 + CI 接入 Flutter（m21159）**：先读源码盘点，四项（判重 / 重置语义与待验证残留 / 文件选择器 / 考试配置）**均已修**，本轮未再改业务代码。真正补的两件：①**真后端判重双向验证**（`imported 3 → 0`、`duplicates 0 → 3`，后端 `[IMPORT]` 四段日志同步印证，验完软删 3 道测试题不留垃圾）；②**CI 新增 `flutter-tests` job**（`subosito/flutter-action@v2` 钉 `3.50.0` → `pub get` → `analyze --no-fatal-infos` 并用 `grep -Eq '^\s+(error|warning)\s+-'` 硬拦 → `flutter test`），两个 `paths` 补 `tillroad_app/**`；YAML 用 `yaml` 包解析断言结构（3 job / steps 9·4·6）而非肉眼。新增截图 `fe-reset-home-empty.png`（全新空用户的首页三空态：无考试目标、待验证 0、缺陷 0）；`flutter analyze` 68 issues / **0 error / 0 warning**、`flutter test` **106/106**
+- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两个节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）；⑥本地优先 R3 的增量对账尚未实现（后端需加 `updated_since` 或变更日志）；⑦R4a 的冲突只做「丢弃本地 + 以云端为准」，字段级自动仲裁与写队列的删除操作未做；⑧R4b 未做 dead 队列的 UI 管理入口（死信行只能在数据库里看），也未做删除操作的入队；⑨题库只有「导入 + 查看」，编辑/删除/按考点筛选与 AI 生成题入口都没做（题库本地缓存待 R5 拍板）；⑩「删除我的所有数据」只软删不物理删（数据仍在库里可恢复，合规的「彻底抹除」需物理删除与保留期策略）
 
 ---
 

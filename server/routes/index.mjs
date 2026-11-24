@@ -28,6 +28,8 @@ import * as questionsImport from './questions_import.mjs';
 import * as questions from './questions.mjs';
 import * as verificationTasks from './verification_tasks.mjs';
 import * as reviewCycles from './review_cycles.mjs';
+// m18680 B1：删除「我的所有数据」（DELETE /users/:userId/data）。
+import * as userData from './user_data.mjs';
 
 /**
  * 挂载顺序即匹配优先级。长路径模块在前，短路径在后。
@@ -55,6 +57,11 @@ export const ROUTE_MODULES = Object.freeze([
   // BE-04：纯查询端点（GET /users/:id/verification-tasks|verification-summary）。
   // 放最后是因为它只认 seg.length===3 且 seg[2] 是固定字面量，不会遮蔽任何已有路径。
   { name: 'verification_tasks', match: verificationTasks.match },
+  // m18680 B1：DELETE /users/:id/data。
+  // 放在最后：只认 DELETE + seg.length===3 + seg[2]==='data'，
+  // 与 GET /users/:id/verification-tasks|verification-summary 的方法不同、
+  // 字面量不同，不会互相遮蔽。
+  { name: 'user_data', match: userData.match },
 ]);
 
 /**

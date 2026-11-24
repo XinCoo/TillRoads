@@ -18,6 +18,7 @@ import '../mock/home_mock.dart';
 import '../mock/defects_mock.dart' show DefectTicket;
 import '../pages/defect_create_page.dart';
 import '../pages/defect_detail_page.dart';
+import '../pages/exam_config_page.dart';
 import '../pages/mock_create_page.dart';
 import '../pages/review_page.dart';
 import '../pages/settings_page.dart';
@@ -353,7 +354,32 @@ class _HomePageState extends State<HomePage> {
     Navigator.of(context).push<void>(appRoute<void>(context, const VerifyPage()));
   }
 
+  /// 考试配置（m18680 D1）：从「我的」也可以进，但首页空目标卡片直接跳更顺手。
+  void _openExamConfig() {
+    Navigator.of(context)
+        .push<void>(appRoute<void>(context, const ExamConfigPage()));
+  }
+
+  /// 缺陷单 id 必须是 UUID（v4 或服务端 `gen_random_uuid()`）。
+  ///
+  /// m18680 B2：历史上「今日待验证」在本地为空时会回落 mock 三张卡，
+  /// 那些卡的 id 是 `dt-v1-001` 这类硬编码串。点开就会把非 UUID 发给后端，
+  /// PG 报 22P02，被 `httpError` 吞成 500 —— 用户看到「服务器错误」。
+  /// 现在列表不再回落 mock，但旧本地缓存 / 旧深链里仍可能有脏 id，
+  /// 所以在发请求前统一拦一道。
+  static final RegExp _uuidPattern = RegExp(
+    r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-'
+    r'[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$',
+  );
+
+  bool _isUuid(String value) => _uuidPattern.hasMatch(value.trim());
+
   void _onTapTask(VerificationTask task) {
+    // 非法 id：不发请求，直接提示刷新（硬约束「非法 id 防御必须做」）。
+    if (!_isUuid(task.id)) {
+      _toast('数据异常', '这条待验证记录缺少有效的缺陷单编号，请下拉刷新后重试。');
+      return;
+    }
     // R4b：本地优先时直接进缺陷单详情（详情页自己会从本地表读完整数据），
     // 断网也能看到归因、动作与验证进度；读不到才回落到验证任务页。
     if (kLocalFirstEnabled && !kUseMock) {
@@ -440,7 +466,7 @@ class _HomePageState extends State<HomePage> {
       return _GoalEmptyCard(
         offline: _profileError != null,
         onRetry: _profileError != null ? _refreshAll : null,
-        onSetup: () => _toast('设置考试目标', '目标配置页将在后续里程碑实现。'),
+        onSetup: _openExamConfig,
       );
     }
 
@@ -490,6 +516,77 @@ class _HomePageState extends State<HomePage> {
         ],
         _CountDot(color: AppColors.normal, count: summary.normal),
       ],
+    );
+  }
+
+  /// 今日待验证的列表体。
+  ///
+  /// m18680 B2：以前 `_tasks.isEmpty ? _snapshot.tasks : _tasks` —— 本地为空时
+  /// 回落到 mock 三张卡，而摘要数字是真实值，两者对不上；点卡片还会把
+  /// `dt-v1-001` 这类非 UUID 发给后端（500）。现在三种状态分开：
+  ///   · 首次同步中（`_syncPending`）→ 轻量占位，不冒充真实任务；
+  ///   · 已同步完、确实没有待验证 → 空状态文案；
+  ///   · 有数据 → 真实列表。
+  /// `kUseMock`（离线演示 / widget test）仍直接用 mock，保持旧行为。
+  Widget _buildTaskList() {
+    if (kUseMock) {
+      return TaskListCard(tasks: _snapshot.tasks, onTapTask: _onTapTask);
+    }
+    if (_tasks.isNotEmpty) {
+      return TaskListCard(tasks: _tasks, onTapTask: _onTapTask);
+    }
+    if (_syncPending) {
+      return Padding(
+        padding: const EdgeInsets.symmetric(
+          horizontal: AppSpacing.cardPadding,
+          vertical: 20,
+        ),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.center,
+          children: const <Widget>[
+            CupertinoActivityIndicator(radius: 6),
+            SizedBox(width: 8),
+            Text(
+              '正在同步验证任务…',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 13,
+                color: AppColors.secondaryLabel,
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+    return const Padding(
+      padding: EdgeInsets.symmetric(vertical: 20),
+      child: Column(
+        children: <Widget>[
+          Icon(
+            CupertinoIcons.check_mark_circled,
+            size: 28,
+            color: AppColors.normal,
+          ),
+          SizedBox(height: 8),
+          Text(
+            '今天没有待验证的题',
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 15,
+              color: AppColors.label,
+            ),
+          ),
+          SizedBox(height: 4),
+          Text(
+            '进入验证阶段后会出现在这里。',
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 13,
+              color: AppColors.secondaryLabel,
+            ),
+          ),
+        ],
+      ),
     );
   }
 
@@ -782,10 +879,7 @@ class _HomePageState extends State<HomePage> {
                     trailing: _summaryTrailing(),
                   ),
                   _CardShell(
-                    child: TaskListCard(
-                      tasks: _tasks.isEmpty ? _snapshot.tasks : _tasks,
-                      onTapTask: _onTapTask,
-                    ),
+                    child: _buildTaskList(),
                   ),
                   const SizedBox(height: 20),
 

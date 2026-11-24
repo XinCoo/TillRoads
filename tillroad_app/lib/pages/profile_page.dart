@@ -42,6 +42,7 @@ import '../local/local.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart';
 import 'api_token_page.dart';
+import 'exam_config_page.dart';
 import 'mock_page.dart';
 import 'question_bank_page.dart';
 import 'review_page.dart';
@@ -436,6 +437,14 @@ class _ProfilePageState extends State<ProfilePage> {
     ).push<void>(appRoute<void>(context, const QuestionBankPage()));
   }
 
+  /// 考试配置：目标 → 科目 → 考点树。
+  /// 这条链路是「建题 / 导入 / 组卷」的前置 —— 没有科目就选不了归属。
+  void _openExamConfig() {
+    Navigator.of(
+      context,
+    ).push<void>(appRoute<void>(context, const ExamConfigPage()));
+  }
+
   void _openSettings() {
     Navigator.of(
       context,
@@ -729,6 +738,11 @@ class _ProfilePageState extends State<ProfilePage> {
         icon: CupertinoIcons.doc_text,
         title: '题库管理',
         onTap: _openQuestionBank,
+      ),
+      _EntryRow(
+        icon: CupertinoIcons.square_stack_3d_up,
+        title: '考试配置',
+        onTap: _openExamConfig,
       ),
       _EntryRow(
         icon: CupertinoIcons.gear,

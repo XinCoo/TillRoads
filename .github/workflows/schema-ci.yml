@@ -4,7 +4,6 @@ name: Schema CI
 # 用途: 在 GitHub Actions 的临时 PostgreSQL 15 服务容器里「真跑」schema。
 #   验证范围 = 建表 + 二次执行幂等 + down/up 可逆 + 末尾自检 DO 块通过。
 #   **不是**业务语义验证: 状态机 / 禁用语 / 三次验证 / 去重哈希等业务规则
-#   **不是**业务语义验证: 状态机 / 禁用语 / 三次验证 / 去重哈希等业务规则
 #   由下方 node-tests job 的 Node 单测(core/ + server/)覆盖, 本 schema job 不重复。
 # ---------------------------------------------------------------------------
 on:
@@ -17,6 +16,8 @@ on:
       - 'package-lock.json'
       - 'core/**'
       - 'server/**'
+      # m21159 E1：前端改动也要跑 CI（此前只覆盖后端，Flutter 侧无人守）。
+      - 'tillroad_app/**'
   pull_request:
     paths:
       - 'schema.sql'
@@ -26,6 +27,7 @@ on:
       - 'package-lock.json'
       - 'core/**'
       - 'server/**'
+      - 'tillroad_app/**'
 
 jobs:
   schema:
@@ -113,7 +115,7 @@ jobs:
       - name: Up #5 — re-apply incremental migration 0002 (可上)
         run: psql -v ON_ERROR_STOP=1 -f migrations/0002_questions_owner.sql
 
-bTc
+  # -------------------------------------------------------------------------
   # BE-01 第 2 步新增: Node 单测 + 一条 PG smoke 集成测试。
   # 与 schema job 用 needs 串联: 先确认 schema 可上/幂等/可逆, 再跑 Node 测试。
   # services 是 job 级作用域(不能跨 job 共享同一容器), 这里复用同一份
@@ -180,3 +182,52 @@ bTc
             echo "::error::存在被跳过的测试，RUN_PG_INTEGRATION 或 PG 连接有问题"
             exit 1
           fi
+
+  # -------------------------------------------------------------------------
+  # m21159 E2：Flutter 侧静态检查 + 单元/widget 测试。
+  # 与后端两个 job 无依赖关系（前端不连库），并行跑。
+  # 只跑 `flutter analyze --no-fatal-infos`（把既有 Cupertino deprecation info 当噪音，
+  # 只拦 error/warning 与 API 版本不兼容）与 `flutter test`（纯 Dart/widget 测试，
+  # 不需要真机与后端；集成到 Neon 的手工验证不进 CI）。
+  # 不跑 `flutter build apk`：CI 里打 release 包既慢又需要签名材料，且已被
+  # 本地 + 真机验证覆盖。
+  # -------------------------------------------------------------------------
+  flutter-tests:
+    name: Flutter · analyze + widget tests
+    runs-on: ubuntu-24.04  # 与其它 job 一致, 固定 LTS 镜像
+
+    defaults:
+      run:
+        working-directory: tillroad_app
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      # 不用 subosito/flutter-action 的 `channel: stable`（浮动版本会让 CI 与本地
+      # 3.50.0 悄悄分叉），钉住具体版本；同时缓存 pub 依赖。
+      - name: Setup Flutter 3.50.0
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.50.0'
+          channel: stable
+          cache: true
+
+      - name: Flutter version
+        run: flutter --version
+
+      - name: Install dependencies
+        run: flutter pub get
+
+      - name: Analyze (0 error / 0 warning)
+        run: |
+          set -o pipefail
+          flutter analyze --no-fatal-infos 2>&1 | tee /tmp/analyze.log
+          # --no-fatal-infos 只让 info 不致命；error / warning 仍必须为 0。
+          if grep -Eq '^\s+(error|warning)\s+-' /tmp/analyze.log; then
+            echo "::error::flutter analyze 存在 error 或 warning"
+            exit 1
+          fi
+
+      - name: Widget + unit tests
+        run: flutter test --reporter expanded

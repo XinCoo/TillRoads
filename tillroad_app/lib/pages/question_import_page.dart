@@ -31,7 +31,7 @@
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/cupertino.dart';
 
-import '../api/api_client.dart' show ApiException;
+import '../api/api_client.dart' show ApiClient, ApiException;
 import '../api/defect_api.dart';
 import '../api/question_api.dart';
 import '../config/api_config.dart';
@@ -42,8 +42,12 @@ import '../widgets/common.dart' show SectionHeader;
 const int kMaxImportBytes = 10 * 1024 * 1024;
 
 /// 支持的文件类型（与后端 extract.mjs 的分派一致）。
+///
+/// m18680 C1：补上 `markdown` —— 不少编辑器/导出工具存的是 `.markdown` 后缀，
+/// 后端 `extract.mjs` 按扩展名分派时也是 md/markdown 同等对待，前端不该比后端更严。
 const List<String> kSupportedExtensions = <String>[
   'md',
+  'markdown',
   'txt',
   'csv',
   'pdf',
@@ -58,7 +62,15 @@ class QuestionImportPage extends StatefulWidget {
 }
 
 class _QuestionImportPageState extends State<QuestionImportPage> {
-  final QuestionApi _api = QuestionApi();
+  /// m18680 A6：导入是低频、批量、吃后端 CPU 的操作，
+  /// 50 题在 Neon 冷启动下实测要 20s+，全局 15s 超时会误报「失败」——
+  /// 用户看到超时就会重试，第二次因为已入库反而显示「判重 N」，
+  /// 这正是「判重 50 但云端没有」那类误解的根源。
+  /// 这里单独给导入页一个 60s 超时的 client，不动全局 `kApiTimeout`
+  /// （其他端点的快速失败语义保持不变）。
+  final QuestionApi _api = QuestionApi(
+    client: ApiClient(timeout: const Duration(seconds: 60)),
+  );
   final DefectApi _defectApi = DefectApi();
 
   /// 已选文件。
@@ -108,14 +120,32 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
     }
   }
 
-  Future<void> _pickFile() async {
+  /// 选择要导入的文件。
+  ///
+  /// [anyFile] = true 时用 `FileType.any`（系统文件选择器不做 MIME 过滤），
+  /// 选完再按扩展名自己判 —— m18680 C2：Android 上 `FileType.custom` 是靠
+  /// MIME type 过滤的，`.md` 的 `text/markdown` 在部分 ROM 里没注册，
+  /// 文件会变灰选不到。两级兜底：默认按扩展名过滤（体验好），
+  /// 选不到时用户可以点「所有文件」绕过系统过滤。
+  Future<void> _pickFile({bool anyFile = false}) async {
     try {
       final List<PlatformFile> picked = await FilePicker.pickFiles(
-        type: FileType.custom,
-        allowedExtensions: kSupportedExtensions,
+        type: anyFile ? FileType.any : FileType.custom,
+        allowedExtensions: anyFile ? null : kSupportedExtensions,
       );
       if (picked.isEmpty) return;
       final PlatformFile file = picked.first;
+
+      // 「所有文件」模式下系统不过滤，这里必须自己拦：
+      // 否则用户选了 .docx 会一路传到后端才拿到 415，白等一次上传。
+      if (anyFile && !_isSupportedFilename(file.name)) {
+        setState(() {
+          _error =
+              '不支持的格式（${_extOf(file.name)}），'
+              '请用 ${kSupportedExtensions.join(' / ')}。';
+        });
+        return;
+      }
 
       // file_picker 13 没有 size 字段，要用 length() 读字节数。
       final int? size = await file.length();
@@ -140,6 +170,20 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
       if (!mounted) return;
       setState(() => _error = '选择文件失败：$e');
     }
+  }
+
+  /// 文件后缀（含点，小写）。没有后缀时返回「无后缀」。
+  String _extOf(String filename) {
+    final int dot = filename.lastIndexOf('.');
+    if (dot <= 0 || dot == filename.length - 1) return '无后缀';
+    return filename.substring(dot).toLowerCase();
+  }
+
+  /// 扩展名是否在支持列表里（与后端 extract.mjs 的 EXT_KINDS 同口径）。
+  bool _isSupportedFilename(String filename) {
+    final String ext = _extOf(filename);
+    if (ext == '无后缀') return false;
+    return kSupportedExtensions.contains(ext.substring(1));
   }
 
   /// 选科目 → 拉该科目的考点（考点是可选的，不选也能导）。
@@ -328,12 +372,28 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
                 ),
               ),
               const SizedBox(height: 6),
-              const Text(
-                '支持 md / txt / csv / pdf / xlsx，单个文件不超过 10MB。',
-                style: TextStyle(
+              Text(
+                '支持 ${kSupportedExtensions.join(' / ')}，单个文件不超过 10MB。',
+                style: const TextStyle(
                   fontFamily: kFontFamily,
                   fontSize: 12,
                   color: AppColors.secondaryLabel,
+                ),
+              ),
+              const SizedBox(height: 8),
+              // m18680 C2：系统选择器按 MIME 过滤时 `.md` 可能变灰选不到，
+              // 这里给一条不依赖 MIME 的通道：不过滤任何类型，选完自己按扩展名判。
+              CupertinoButton(
+                padding: EdgeInsets.zero,
+                onPressed:
+                    _uploading ? null : () => _pickFile(anyFile: true),
+                child: const Text(
+                  '选不到文件？用「所有文件」打开',
+                  style: TextStyle(
+                    fontFamily: kFontFamily,
+                    fontSize: 13,
+                    color: AppColors.accent,
+                  ),
                 ),
               ),
             ],
@@ -347,7 +407,7 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
               const SectionHeader(text: '2. 选择科目'),
               if (_profiles.isEmpty)
                 const Text(
-                  '还没有考试档案，无法选科目。',
+                  '还没有考试档案，请先在「我的 → 考试配置」中添加考试目标与科目。',
                   style: TextStyle(
                     fontFamily: kFontFamily,
                     fontSize: 13,

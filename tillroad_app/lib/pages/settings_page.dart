@@ -23,6 +23,7 @@ import 'package:flutter/cupertino.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../api/api_client.dart' show ApiClient, ApiException;
 import '../config/api_config.dart';
 import '../config/app_info.dart';
 import '../logging/app_logger.dart';
@@ -58,6 +59,8 @@ class _SettingsPageState extends State<SettingsPage> {
   /// 账户分区展示用的当前 Token（脱敏后仅显示前 4 位）。
   String? _token = kApiToken;
 
+  /// 云端删除进行中 —— 避免重复点、也让列表项可以置灰。
+  bool _deleting = false;
   @override
   Widget build(BuildContext context) {
     return CupertinoPageScaffold(
@@ -245,18 +248,19 @@ class _SettingsPageState extends State<SettingsPage> {
             color: AppColors.overdue,
           ),
           title: const Text(
-            '清除所有数据',
+            '删除我的所有数据',
             style: TextStyle(fontFamily: kFontFamily, color: AppColors.overdue),
           ),
           subtitle: const Text(
-            '本地数据全清并退出登录',
+            '云端与本机全部删除，不可恢复',
             style: TextStyle(
               fontFamily: kFontFamily,
               fontSize: 12,
               color: AppColors.secondaryLabel,
             ),
           ),
-          onTap: _wipeAll,
+          // 删除进行中时置灰，避免重复提交（云端要跑 9 条 UPDATE）。
+          onTap: _deleting ? null : _deleteAllData,
         ),
       ],
     );
@@ -415,17 +419,52 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  /// 清除所有数据：shared_preferences 全清（含 Token）+ 全部本地缓存，
-  /// 然后把 Token 输入页推到根导航栈顶。
-  Future<void> _wipeAll() async {
-    final bool ok = await _confirm(
-      title: '清除所有数据',
-      message: '将清除本地所有数据并退出登录，云端数据不受影响。此操作不可撤销',
-      confirmText: '全部清除',
-      destructive: true,
+  /// 删除我的所有数据（m18680 B1）：云端软删 + 本机全清，然后退回 Token 页。
+  ///
+  /// 为什么要输入「确认删除」而不是普通二次确认：
+  ///   它同时清云端（缺陷单 / 模考 / 复盘 / 自己导入的题），不可撤销，
+  ///   代价远高于「清除本地缓存」；一次误触就要重录几十张缺陷单。
+  ///   要求手打四个字能拦住绝大多数误触，且不需要用户理解技术细节。
+  ///
+  /// 为什么要先调云端再清本地：
+  ///   云端请求需要 Token；先把本地 Token 清掉就删不了云端了。
+  ///   云端失败时**不清本地**并如实报错 —— 不让用户以为删干净了（这正是本轮要修的旧问题）。
+  Future<void> _deleteAllData() async {
+    final bool? ok = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => const _DeleteAllDialog(),
     );
-    if (!ok || !mounted) return;
+    if (ok != true || !mounted) return;
 
+    setState(() => _deleting = true);
+    int total = 0;
+    Map<String, Object?>? deleted;
+    try {
+      final Object? raw = await ApiClient().delete('/users/$kDemoUserId/data');
+      final Map<String, Object?> body =
+          raw is Map<String, Object?> ? raw : const <String, Object?>{};
+      total = (body['total'] as num?)?.toInt() ?? 0;
+      final Object? d = body['deleted'];
+      deleted = d is Map<String, Object?> ? d : null;
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _deleting = false);
+      AppLogger.instance.error('CLEAR', '删除云端数据失败：${e.message}（status=${e.statusCode}）');
+      await _info(
+        title: '云端删除失败',
+        message: e.isNetworkError
+            ? '无法连接后端，云端数据未删除，本机数据也没有清。请联网后重试。'
+            : '服务端返回 ${e.statusCode}：${e.message}\n\n云端数据未删除，本机数据也没有清。',
+      );
+      return;
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _deleting = false);
+      await _info(title: '云端删除失败', message: '删除过程出错：$e\n\n本机数据未清。');
+      return;
+    }
+
+    // 云端已删 -> 再清本机（顺序不能反，见上面的注释）。
     final SharedPreferences prefs = await SharedPreferences.getInstance();
     await prefs.clear();
     try {
@@ -434,25 +473,33 @@ class _SettingsPageState extends State<SettingsPage> {
       AppLogger.instance.warn('CLEAR', '清空日志失败：$e');
     }
     await _purgeCacheDirectories();
-    // prefs 已经清过键，这里再走一次公开 API 是为了把 api_config 里的
-    // 内存副本 `_apiToken` 也置空（否则本进程内还会带着旧 token 发请求）。
     await saveApiToken('');
     if (!mounted) return;
-    setState(() => _token = null);
+    setState(() {
+      _token = null;
+      _deleting = false;
+    });
+
+    final String detail = deleted == null
+        ? '共删除 $total 行云端数据。'
+        : '线索 ${deleted['defect_tickets'] ?? 0} 张 / 动作 ${deleted['actions'] ?? 0} 条 / '
+            '验证 ${deleted['verifications'] ?? 0} 条 / 自导入题 ${deleted['questions'] ?? 0} 道 / '
+            '模考 ${deleted['mock_exams'] ?? 0} 次 / 复盘 ${deleted['review_cycles'] ?? 0} 份。';
+    await _info(
+      title: '已删除',
+      message: '云端与本地数据已删除，共 $total 行。\n$detail\n\n公共题库不受影响，已退出登录。',
+    );
+    if (!mounted) return;
 
     if (widget.onSessionCleared != null) {
       widget.onSessionCleared!();
       return;
     }
 
-    // 兜底：整棵根导航栈换成 Token 输入页。必须用 rootNavigator —— 设置页
-    // 本身在 Tab 的嵌套 Navigator 里，只在 Tab 栈内 push 会被底部 TabBar 挡住。
     final NavigatorState rootNav = Navigator.of(context, rootNavigator: true);
     await rootNav.pushAndRemoveUntil<void>(
       appRoute<void>(
         context,
-        // 保存成功后没有可回退的页面，`maybePop` 是安全空操作；
-        // 真正的「回到主界面」由 main.dart 的 ApiTokenGate 重建接管。
         ApiTokenPage(onSaved: () => rootNav.maybePop()),
       ),
       (Route<dynamic> route) => false,
@@ -696,6 +743,130 @@ class _TokenDialogState extends State<_TokenDialog> {
           isDefaultAction: true,
           onPressed: _submit,
           child: const Text('保存', style: TextStyle(fontFamily: kFontFamily)),
+        ),
+      ],
+    );
+  }
+}
+
+/// 「删除我的所有数据」确认弹窗（m18680 B1）。
+///
+/// 与 `_TokenDialog` 一样单独做成 StatefulWidget：`TextEditingController`
+/// 必须有人 dispose，放在 `_SettingsPageState` 里会因弹窗反复开关而泄漏。
+///
+/// 为什么不用 `_confirm`：它只支持一行 message，而这里需要「输入四个字
+/// 才能启用按钮」，必须自己控制 [CupertinoDialogAction.onPressed] 的可空。
+class _DeleteAllDialog extends StatefulWidget {
+  const _DeleteAllDialog();
+
+  @override
+  State<_DeleteAllDialog> createState() => _DeleteAllDialogState();
+}
+
+class _DeleteAllDialogState extends State<_DeleteAllDialog> {
+  final TextEditingController _controller = TextEditingController();
+
+  /// 只有逐字打出这四个字才能点「删除」。
+  static const String _keyword = '确认删除';
+
+  @override
+  void initState() {
+    super.initState();
+    _controller.addListener(_onChanged);
+  }
+
+  @override
+  void dispose() {
+    _controller.removeListener(_onChanged);
+    _controller.dispose();
+    super.dispose();
+  }
+
+  void _onChanged() => setState(() {});
+
+  bool get _confirmed => _controller.text.trim() == _keyword;
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoAlertDialog(
+      title: const Text(
+        '删除我的所有数据',
+        style: TextStyle(
+          fontFamily: kFontFamily,
+          fontSize: 17,
+          fontWeight: FontWeight.w600,
+          color: AppColors.overdue,
+        ),
+      ),
+      content: Padding(
+        padding: const EdgeInsets.only(top: 12),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: <Widget>[
+            const Text(
+              '将永久删除云端与本机的全部数据：缺陷单、验证记录、处理动作、模考、'
+              '复盘，以及你自己导入的题目。公共题库与其他用户的数据不受影响。'
+              '此操作不可撤销。',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 13,
+                height: 1.4,
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              '请输入「确认删除」四个字以继续：',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 12,
+                height: 1.4,
+                color: AppColors.secondaryLabel,
+              ),
+            ),
+            const SizedBox(height: 8),
+            CupertinoTextField(
+              controller: _controller,
+              autofocus: true,
+              placeholder: _keyword,
+              placeholderStyle: const TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 14,
+                color: AppColors.tertiaryLabel,
+              ),
+              style: const TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 14,
+                color: AppColors.label,
+              ),
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 10),
+              decoration: BoxDecoration(
+                color: AppColors.groupedBackground,
+                borderRadius: BorderRadius.circular(AppRadii.chip),
+              ),
+              onSubmitted: (_) {
+                if (_confirmed) Navigator.of(context).pop(true);
+              },
+            ),
+          ],
+        ),
+      ),
+      actions: <Widget>[
+        CupertinoDialogAction(
+          onPressed: () => Navigator.of(context).pop(false),
+          child: const Text('取消', style: TextStyle(fontFamily: kFontFamily)),
+        ),
+        CupertinoDialogAction(
+          isDestructiveAction: true,
+          // 未打出四个字时禁用：`onPressed: null` 会让按钮变灰且不可点。
+          onPressed: _confirmed ? () => Navigator.of(context).pop(true) : null,
+          child: const Text(
+            '删除',
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
         ),
       ],
     );

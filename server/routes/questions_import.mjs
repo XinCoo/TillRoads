@@ -146,6 +146,11 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
     );
   }
 
+  // ★ m18680 A3：导入进度日志。50 题在 Neon 冷启动下实测 20s+，
+  //   没有这行日志时线上只能看到「客户端超时」，分不清卡在抽取、切题还是入库。
+  console.log(
+    `[IMPORT] 切题 ${split.questions.length} 道（kind=${extracted.kind}, mime=${extracted.mime}, bytes=${buffer.length}, owner=${ownerUserId ?? 'public'}）`,
+  );
   const createCtx = {
     source: body.source || DEFAULT_SOURCE,
     subject_id: body.subject_id || null,
@@ -175,6 +180,10 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
       ownerUserId ?? null,
     );
 
+    // A3：查重结果 —— 与「插入成功」分开打，才能区分「都是重复题」与「插入失败」。
+    console.log(
+      `[IMPORT] 查重命中 ${duplicates.length} 条，待插入 ${newQuestions.length} 条`,
+    );
     const imported = [];
     for (const item of newQuestions) {
       // create 内部会再查一次 hash：dedupe 与 create 之间可能被并发写入抢先。
@@ -182,6 +191,11 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
       // create 解决「不论如何不允许两行同 hash」。撞上了就跳过，不整批失败。
       try {
         imported.push(await questionsRep.create(client, item));
+        // ★ m18680 A6：每 10 题打一次点。只加日志，不改事务语义 ——
+        //   仍然是整段一个事务，中途失败会整笔回滚。
+        if (imported.length % 10 === 0) {
+          console.log(`[IMPORT] 已插入 ${imported.length}/${newQuestions.length}`);
+        }
       } catch (err) {
         if (err && err.code === 'DUPLICATE_QUESTION') {
           duplicates.push({
@@ -196,6 +210,9 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
       }
     }
 
+    console.log(
+      `[IMPORT] 完成：插入 ${imported.length} 条，重复 ${duplicates.length} 条，耗时见上游`,
+    );
     return {
       imported: imported.length,
       duplicates,

@@ -1785,3 +1785,174 @@ Android 17 模拟器真机（debug APK + `adb reverse tcp:3000`）：「我的 �
 - `npm test` → 317 tests / 194 pass / 0 fail / 123 skipped（集成测试本机仍 skip，CI 用 PG15 容器）。
 - `flutter analyze` → **0 error / 0 warning / 57 info**；`flutter test` → **106/106**。
 - 遗留：题库编辑 / 删除 / 按考点筛选、AI 生成题入口、题库本地缓存（R5 拍板）、`questions` 表的 owner 列**不回填**存量种子题（它们保持公共题 `owner_user_id IS NULL`）。
+
+---
+
+## 38. m18680 归档：分发前四个阻塞项 + 考试配置
+
+### 38.1 范围与硬约束
+
+用户报告四项「分发前阻塞项」并追加考试配置页面需求。硬约束：不改 `schema.sql` / `migrations/`（本轮只新增后端**路由**与前端页面）、不改 `core/`、不改状态机、不引新依赖、不夹带练习模式/题目选择器/筛选器、`flutter analyze` 0 error、不执行 git 命令。
+
+### 38.2 四项「阻塞项」的真相与实修
+
+先是对问题陈述的四次推翻——三项的问题描述与真实原因不一致，只有按真实原因修才有意义。
+
+| # | 用户描述 | 实测真相 | 实修 |
+|---|---|---|---|
+| A | 「导入 50 题，显示判重 50，但云端一条都没有」 | **判重逻辑本身无问题**。`GET /questions` 实测 total=108，其中 50 条 `owner_user_id = cbd8eb64…`（B 在 11-23 导入）全在 B 名下 —— 用户当时用 **A 的 token** 看，看不到 B 的私有题。真正的问题是**首次导入 50 题在 Neon 上耗时 20.3s，超过前端全局 15s 超时**，客户端报失败，用户重试后这次因已入库而判重 50 | ①`questions_import.mjs` 加 4 处 `[IMPORT]` 日志（切题 / 查重命中 / 每 10 题 / 完成，不改事务语义）②导入页单独 `ApiClient(timeout: 60s)`，全局 `kApiTimeout` 仍 15s ③`GET /questions` 默认 `created_at DESC` |
+| B | 「清除所有数据」后数据又回来了 | 真：前端 `_wipeAll()` **只清本地**（shared_preferences + SQLite + 日志），云端一行未动，重装/换设备后全回来 | 后端新增 `DELETE /users/:userId/data`（九类按子→父软删，`withTransaction` 整笔）；前端危险区拆两个入口，后者要手打「确认删除」，云端失败时**不清本地** |
+| B′ | 「今日待验证」显示 3 条旧数据 | 真：`TaskListCard(tasks: _tasks.isEmpty ? _snapshot.tasks : _tasks)` 在本地为空时**回落 mock 三张卡**，其 id 是 `dt-v1-001` 这类**非 UUID**，点击 `/defect-tickets/dt-v1-001` → PG `22P02` → 被 `httpError` 吞成 **500** | 四态分离（mock / 真实 / 同步中 / 真空态），永久移除 mock 回落；`_onTapTask` 先校验 UUID，非法 id 只提示不请求 |
+| C | 「文件选择器找不到 .md 文件」 | 真：`kSupportedExtensions` 只有 `md` 没 `markdown`（后端 `extract.mjs` 的 `EXT_KINDS` 两者都收），且 `FileType.custom` 在部分系统过滤过严 | 扩展名补 `markdown` + 「选不到文件？用「所有文件」打开」兜底（`FileType.any` 后自校验，不支持则明示实际后缀） |
+
+### 38.3 新增 `DELETE /users/:userId/data`
+
+这是本轮唯一新增的后端业务端点。设计取舍：
+
+- **只认 `ctx.authUserId`**。`server/index.mjs` 已把 `/users/:userId` 的 seg[1] **无条件改写**成 authUserId，客户端传别人的 id 也只会删到自己的数据 —— 这是真正的安全边界；模块内的 `seg[1] !== ctx.authUserId` → 403 是第二道闸。已用真库实测验证：B 的 token 请求 `/users/{A}/data` → 200 且返回体 `user_id === B`，A 的数据一条未动。
+- **软删不物理删**。schema 每张业务表都有 `deleted_at`、读路径全带 `deleted_at IS NULL`。物理删会牵动 FK（`verifications`/`actions → defect_tickets` 是 `ON DELETE CASCADE`，但 `mock_exams → exam_profiles` 无级联）。按子→父顺序写，将来要改物理删只换 SQL 不改结构。
+- **公共题绝不删**。`questions` 只删 `owner_user_id = $1`，`owner_user_id IS NULL` 的公共题保留 —— 删自己数据不该影响别人组卷。
+- **整个动作在一个 `withTransaction`** 里，任何一步失败整笔回滚，不会出现「删了一半」。
+
+九类顺序：`verifications` → `actions` → `defect_tickets` → `questions` → `mock_exams` → `review_cycles` → `knowledge_nodes` → `subjects` → `exam_profiles`。
+
+### 38.4 考试配置四页面
+
+| 文件 | 行数 | 职责 |
+|---|---|---|
+| `lib/pages/exam_config_page.dart` | 377 | 考试目标列表（复用 `DefectApi.fetchExamProfiles`），右上「新建」 |
+| `lib/pages/exam_profile_create_page.dart` | 445 | 新建目标：类型 5 chip / 目标名称 / 目标分 / 日期 / 每日分钟 / 资料范围；**`civil_service` 后端自动预置 6 个科目** |
+| `lib/pages/subject_config_page.dart` | 532 | 科目列表 + 添加/编辑/删除 |
+| `lib/pages/knowledge_node_page.dart` | 1031 | 考点树（父子、频率、权重）+ 尾部菜单编辑删除 |
+
+入口：「我的 → 考试配置」；首页空目标卡片的「去设置」与导入页「还没有考试档案」文案也指向此页（两处原本只弹 toast 说「后续里程碑实现」）。
+
+**DELETE 的 version 走 body 而不是 query**：`server/routes/_http.mjs:71` 的 `readBaseVersion(body)` 只读 `body.version`（注释明确「刻意不支持 If-Match」）。我写契约探针时曾用 `?version=N`，三个 DELETE 全 400 `INVALID_BASE_VERSION`；改用 `{version}` body 后全部 200。前端三个页面本来就正确传 body。
+
+### 38.5 真机验收（Android 17 + 本地 WebSocket 后端 + Neon）
+
+| 项 | 结果 |
+|---|---|
+| E1 首次填充 | `[SYNC] 写入 49 行 … 5199ms`、`[FILL] 缺陷单 15 / 动作 14 / 验证 15，7284ms`、一致性校验通过；首页 15 总/3 关闭/20%/进行中 2；**mock 三张卡不再出现** |
+| A 判重（E2/E3） | 首次导入 50 题 → **「新增题目 50 / 已存在 0 / 解析失败 0」**；再导入同文件 → **「没有新题入库 / 新增 0 / 已存在（判重）50」**；后端日志四段 `[IMPORT]` 齐全 |
+| B′ 残留 | 首页「今日待验证」无 mock 卡，非法 id 不再发请求 |
+| C 文件选择器 | 系统选择器能列出并选中 `e2e-50.md`（16.2 KB）；`.md`/`.markdown` 均收 |
+| D 四页面 | 新建目标 201 且**模板预置 6 科目**；建科目 201；建根考点 + 子考点 201，树正确缩进展开；PATCH 改名 200 且 version 1→2；无 version 400；尾部菜单弹 `CupertinoActionSheet`（编辑/删除/取消）；DELETE 带 body.version 全 200 |
+| 危险区 UI | 「清除本地缓存」与「删除我的所有数据」并列；后者弹窗标题红色、正文说明五类数据、输入框 placeholder「确认删除」、未输入时「删除」按钮**不可点**（实测点击无反应） |
+
+**8 张截图**（`tillroad_app/screenshots/`）：`fe-import-50.png`（新增 50）/ `fe-import-dupes.png`（判重 50）/ `fe-exam-config.png`（目标列表）/ `fe-exam-create.png`（新建目标）/ `fe-subject-config.png`（科目管理 6 预置 + E2E Subject）/ `fe-knowledge-tree.png`（考点树父子）/ `fe-settings-danger.png`（危险区两入口）/ `fe-delete-confirm.png`（确认删除弹窗）。
+
+### 38.6 数字与遗留
+
+- `flutter analyze --no-fatal-infos` → **68 issues，0 error / 0 warning**；`flutter test` → **106/106**。
+- `node --test` → **321 tests / 194 pass / 0 fail / 127 skipped**（本机无 PG，集成测试 skip；CI 用 PG15 容器）。
+- `lib/` 66 个 dart：pages 22 / widgets 11 / api 6 / logging 4 / local 16（含 dao 5）/ mock 2 / config 3 / theme 1。
+- 遗留：①「删除我的所有数据」只软删不物理删（数据仍在库里，合规的彻底抹除需物理删除与保留期策略）②科目页的考点数没做（避免 N+1）③题库仍只有导入/查看 ④考试配置的 `daily_minutes`/`source_scope` 只存不参与任何计算。
+
+---
+
+## 39. 分发前最后一步：release 签名 + CI 工作流修复
+
+### 39.1 修掉一个会让 CI 完全失效的 YAML 损坏
+
+`.github/workflows/schema-ci.yml` 第 116 行有一行孤立的 `bTc`（三个字符、顶格、既不是注释也不是键值）——是早前编辑残留。
+**后果**：整个 workflow 文件 YAML 解析失败，GitHub 不会创建 workflow，连报错都不会出现在 Actions 页面，等于 CI 静默消失。
+
+- 修法：该行改回它本来应该是的 `# ----` 分隔注释行；同时删掉文件头重复的一行 `#   **不是**业务语义验证: ...`。
+- 验证方式（不靠肉眼）：临时 `npm install --no-save yaml`，用 `YAML.parse` 解析整份文件，断言 `Object.keys(doc) === ['name','on','jobs']`、`jobs` 为 `['schema','node-tests']`、两个 job 的 steps 序列完整；验完 `npm prune`（`package.json` 从未写入 yaml）。
+
+教训：`edit` 工具的锚点是 3 字符哈希，**误把锚点文本写进文件内容**会产生这种「看起来像乱码的短行」。任何改完 workflow / JSON / YAML 的操作，都应用解析器验证一遍，不要只看 diff 里「改了 3 行」就认为对了。
+
+### 39.2 release 签名从「debug 密钥」改为条件式正式签名
+
+原状：`android/app/build.gradle.kts` 里 `release.signingConfig = signingConfigs.getByName("debug")`（Flutter 模板默认）。
+**后果**：APK 能用，但 ①不能上架；②换机 / 重装时若签名不同无法覆盖升级；③别人拿到包也验不出发布者。
+
+改法（`android/app/build.gradle.kts`）：
+
+- 读 `tillroad_app/android/key.properties`（若存在）→ `Properties.load`；
+- 存在则 `signingConfigs.create("release")`，四个字段 `keyAlias` / `keyPassword` / `storeFile` / `storePassword`；
+- `buildTypes.release.signingConfig = if (hasReleaseKeystore) release else debug` —— **保持「没有 keystore 也能 `flutter build apk --release`」的可用性**，只是那种包不可分发。
+
+配套 `tillroad_app/scripts/make-keystore.ps1`：生成 PKCS12 keystore（RSA 2048 / 10000 天）+ 写 `key.properties`，并打印备份提醒。两个文件都命中 `android/.gitignore`（`key.properties`、`**/*.jks`），已用 `git check-ignore -v` 逐一确认。
+
+实测验证（用一次性口令生成临时 keystore，验完即删）：
+
+- `flutter build apk --release` → Built `app-release.apk` 51.8MB；
+- `apksigner verify --print-certs` → `certificate DN: CN=TillRoad, OU=Mobile, O=TillRoad, L=Shanghai, ST=Shanghai, C=CN`，与 debug 证书不同 → **证明 key.properties 真的被 Gradle 读到**；
+- 删掉 keystore 与 key.properties 后再构建，仍成功（回落 debug），说明条件分支两种路径都可用。
+
+两个脚本级坑（已修）：
+
+1. **PowerShell 脚本必须存成带 BOM 的 UTF-8**，否则 Windows PowerShell 5.1 按 ANSI 解码中文注释，报 `表达式或语句中包含意外的标记`。用 `[System.IO.File]::WriteAllText(..., UTF8Encoding($false))` 写出的 `.ps1` 反而会被自己坑到，所以脚本文件本身要带 BOM。
+2. **keytool 正常输出写到 stderr**，在 `$ErrorActionPreference='Stop'` 下被 PowerShell 当成 `NativeCommandError` 直接终止（`[exit code: 1]` 但 keystore 根本没生成）。修法：调用原生命令前后临时切 `Continue`，只以 `$LASTEXITCODE` 判成败。
+
+### 39.3 仍未完成的分发闭环
+
+- **Railway 上跑的还是 m17431**（生产探测：`GET /questions` 200 但无 `DELETE /users/:id/data`；`railway` CLI 本机未安装）→ m18680 的后端改动需要用户在 Railway 面板重新部署（`redeploy` 最新 commit 即可）。
+- 正式 keystore 需要用户用自己的口令执行一次 `make-keystore.ps1`，并离线备份；我验证时用的临时 keystore 已删除。
+- ~~`tillroad_app/**` 不在 CI 触发路径里~~：**已在 §40 补上**（paths 加 `tillroad_app/**` + 新增 `flutter-tests` job）。
+
+## 40. m21159 归档：四项阻塞项复核 + CI 接入 Flutter
+
+### 40.1 先盘点再动手（结论：四项都已修）
+
+用户要求「先盘点、逐项回答已修/未修/部分修」再修。读源码逐项确认的结果：
+
+| 项 | 结论 | 关键证据 |
+| --- | --- | --- |
+| A 判重 | **已修** | `server/import/dedupe.mjs` 查重 SQL 按 owner 分域（`content_hash = ANY($1::text[]) AND deleted_at IS NULL AND owner_user_id = $2`，匿名题走 `owner_user_id IS NULL`）；`duplicates` 由逐条 `existing.get()` 命中构建，不是「总数 - 新题」反推 |
+| B 重置语义 | **已修** | `settings_page.dart` 危险区两个独立按钮：「清除本地缓存」/「删除我的所有数据」；`_DeleteAllDialog` 要求手打「确认删除」四字才解禁按钮 |
+| B 待验证残留 | **已修** | `home_page.dart` 的 `_buildTaskList()` 三态：`_syncPending` → 「正在同步验证任务…」；同步完成且为空 → 「今天没有待验证的题」；**mock 回落（`_tasks.isEmpty ? _snapshot.tasks : _tasks`）已删除** |
+| B 非法 id | **已修** | `home_page.dart` 的 `_isUuid()` 前置校验，点击非 UUID 卡片只弹「数据异常」不发请求 |
+| C 文件选择器 | **已修** | `kSupportedExtensions = ['md','markdown','txt','csv','pdf','xlsx']`；「选不到文件？用「所有文件」打开」走 `FileType.any` 后自校验扩展名；导入 client 单独 60s 超时 |
+| D 考试配置 | **已修** | 四个页面齐备（377 / 445 / 532 / 1031 行）；首页空目标卡片的「去设置」已从 toast 改为真跳转 `ExamConfigPage` |
+
+所以本轮**没有新增业务代码修复**，工作量落在两件真正缺的事上：**用真实后端做 A 的双向验证**（用户硬约束要求 curl 形态）与 **E 项把 Flutter 纳入 CI**。
+
+### 40.2 A 判重双向验证（真后端，非 mock）
+
+本机到 Neon 的 TLS 仍被中间设备重置（`PG_FAIL ECONNRESET`），沿用 WebSocket 驱动起本地后端（`@neondatabase/serverless` 的 `Pool({..., ws: true})` 包成 `{query, connect}` 适配器 + `createApp`），再用 HTTP 打 `/questions/import`：
+
+```
+第一次导入 -> 200 imported= 3 duplicates= 0
+第二次导入 -> 200 imported= 0 duplicates= 3
+DEDUPE_BOTH_WAYS_OK
+CLEANED 3
+```
+
+后端 `[IMPORT]` 日志同步印证（说明 A2 要求的打点确实在生产路径上）：
+
+```
+[IMPORT] 切题 3 道（kind=markdown, mime=text/markdown, bytes=611, owner=11111111-...）
+[IMPORT] 查重命中 0 条，待插入 3 条
+[IMPORT] 完成：插入 3 条，重复 0 条
+[IMPORT] 切题 3 道（kind=markdown, mime=text/markdown, bytes=611, owner=11111111-...）
+[IMPORT] 查重命中 3 条，待插入 0 条
+[IMPORT] 完成：插入 0 条，重复 3 条
+```
+
+验证完把这次导入的 3 题软删（`CLEANED 3`），未在云端留垃圾。
+
+### 40.3 E 项：CI 接入 Flutter
+
+`.github/workflows/schema-ci.yml` 改三处：
+
+1. `push.paths` 与 `pull_request.paths` 各追加 `'tillroad_app/**'`；
+2. 新增 `flutter-tests` job（与后端两个 job 并行，无 `needs`）；
+3. 该 job 的 `defaults.run.working-directory: tillroad_app`，步骤为 Checkout → `subosito/flutter-action@v2`（**钉住 `flutter-version: '3.50.0'`**，不用浮动的 `channel`，避免 CI 与本地悄悄分叉）→ `flutter pub get` → `flutter analyze --no-fatal-infos` → `flutter test --reporter expanded`。
+
+`analyze` 步骤用 `grep -Eq '^\s+(error|warning)\s+-'` 显式拦截，因为 `--no-fatal-infos` 会让 info 不致命（既有 68 条全是 Cupertino deprecation info），但 error / warning 必须为 0。**没跑 `flutter build apk`**：CI 里打 release 包既慢又需要签名材料，且已被本地构建 + 真机验证覆盖。
+
+YAML 不能靠肉眼判断，用 `yaml` 包 `YAML.parse` 断言结构：`TOP_KEYS name,on,jobs` / `JOBS schema,node-tests,flutter-tests` / `JOB schema steps=9` / `JOB node-tests steps=4 needs=schema` / `JOB flutter-tests steps=6` / 两个 paths 数组末尾均为 `tillroad_app/**` → `CI_YAML_OK`。验完 `npm prune`。
+
+### 40.4 校验数字
+
+- `flutter analyze --no-fatal-infos` → **68 issues，0 error / 0 warning**；
+- `flutter test` → **106/106 All tests passed**；
+- 判重双向：`imported 3→0`、`duplicates 0→3`。
+
+### 40.5 遗留
+
+- Railway 仍需 redeploy 才能让 m18680 的 `DELETE /users/:id/data` 上线（本地已验证端点正确）。
+- CI 的 `flutter-tests` job 只在推到 GitHub 后才会真跑一次，本机只能验证 YAML 结构 + 本地等价命令。
