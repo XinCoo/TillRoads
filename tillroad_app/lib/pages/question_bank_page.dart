@@ -27,6 +27,7 @@ import 'package:flutter/cupertino.dart';
 import '../api/api_client.dart' show ApiException;
 import '../api/defect_api.dart';
 import '../api/question_api.dart';
+import '../pages/practice_config_page.dart';
 import '../config/api_config.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart' show EmptyState, SectionHeader;
@@ -127,6 +128,17 @@ class _QuestionBankPageState extends State<QuestionBankPage> {
     );
     if (created == true) await _load();
   }
+
+  /// 「练习这批题」：带当前范围去练习配置页（练习模式 R1）。
+  ///
+  /// 题库页目前**没有**科目/考点筛选 UI（只有按科目分组的标题），
+  /// 所以这里不预置范围 —— 练习配置页自己会列科目让用户选。
+  Future<void> _openPractice() async {
+    await Navigator.of(context).push<void>(
+      appRoute<void>(context, const PracticeConfigPage()),
+    );
+  }
+
 
   /// 打开一道已有题的编辑页。
   ///
@@ -395,6 +407,19 @@ class _QuestionBankPageState extends State<QuestionBankPage> {
                   onPressed: _openImport,
                   child: const Text(
                     '导入',
+                    style: TextStyle(
+                      fontFamily: kFontFamily,
+                      fontSize: 17,
+                      color: AppColors.accent,
+                    ),
+                  ),
+                ),
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  minimumSize: const Size(36, 36),
+                  onPressed: _openPractice,
+                  child: const Text(
+                    '练习',
                     style: TextStyle(
                       fontFamily: kFontFamily,
                       fontSize: 17,

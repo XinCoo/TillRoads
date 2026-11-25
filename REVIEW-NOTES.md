@@ -2289,3 +2289,159 @@ UI 复用 `lib/widgets/form_field.dart` 的 `FormScaffold` / `FormFieldGroup` / 
 - `npm test` → **tests 328 / pass 194 / fail 0 / skipped 134**。
 - 临时文件与临时依赖已清：`.tmp-dev-ws.mjs`、`.tmp-*.png/.xml/.cjs/.mjs/.md`、`.tmp-backend.log/.err` 全部删除；`@neondatabase/serverless` 是 `--no-save` 装的，已 `npm prune` 移除（package.json 从未写入）。
 - `git status` = 7 M + 10 ??（1 个新页面 + 9 张截图）。
+
+---
+
+## 44. 练习模式 R1 归档（抽题 → 答题 → 客户端判分 → 错题去归因）
+
+### 44.1 范围与硬约束
+
+任务书：用户 m24650。硬约束逐条遵守情况：
+
+| 约束 | 遵守情况 |
+|---|---|
+| 不改 `schema.sql`（用 0003 迁移） | ✅ 只新增 `migrations/0003_practice.sql` + `0003_practice_down.sql` |
+| 不改 `core/`、不改状态机、不改导入管线 | ✅ 零改动 |
+| 不改 FE-02 的写端点 | ✅ `server/routes/questions.mjs` 本轮零改动 |
+| 不改现有 `GET /questions` | ✅ 练习走新端点 `GET /questions/practice` |
+| answer 只下发给用户自己的题，**在 repository 层保证** | ✅ 抽题 SQL 用 `CASE WHEN owner_user_id = $n THEN answer ELSE NULL END`，公共题答案恒为 null |
+| 多用户隔离绑 token 映射的 userId | ✅ 所有端点从 `ctx.authUserId` 取，不信任请求体；别人的会话回 404 |
+| 不引新依赖 | ✅ Flutter 端零新依赖；后端零新依赖 |
+| `flutter analyze` 0 error / 0 warning | ✅ 84 issues，全部是既有 `deprecated_member_use` info |
+| 集成测试必须在 CI 真跑（skipped 0） | ✅ 已加进 `package.json` 的 `test:integration`（11 个文件）；本机无 PG，用 PGlite 真库跑出 **8/8 通过** |
+| 不夹带掌握度标记、删题、题目选择器 | ✅ 均未做，写进遗留 |
+| 不执行 git 命令 | ✅ 只给提交命令文本 |
+
+### 44.2 迁移 `0003_practice`
+
+`migrations/0003_practice.sql`：
+
+```sql
+CREATE TABLE IF NOT EXISTS practice_sessions (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id),
+  subject_id uuid REFERENCES subjects(id),
+  knowledge_node_id uuid REFERENCES knowledge_nodes(id),
+  source text,
+  total int NOT NULL DEFAULT 0,
+  correct int NOT NULL DEFAULT 0,
+  wrong int NOT NULL DEFAULT 0,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  version int NOT NULL DEFAULT 1,
+  deleted_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_ps_user ON practice_sessions(user_id, created_at DESC);
+
+CREATE TABLE IF NOT EXISTS practice_answers (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  session_id uuid NOT NULL REFERENCES practice_sessions(id) ON DELETE CASCADE,
+  question_id uuid NOT NULL REFERENCES questions(id),
+  user_answer text,
+  is_correct boolean,           -- null = 无标准答案，由用户自评
+  duration_ms int,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  version int NOT NULL DEFAULT 1,
+  deleted_at timestamptz
+);
+CREATE INDEX IF NOT EXISTS idx_pa_session ON practice_answers(session_id);
+```
+
+down 脚本先删索引再删表（子表先删，否则 FK 挡着）。
+
+`scripts/migrate.mjs` 的 `UP_MIGRATIONS` 追加 `0003`，`DOWN_MIGRATIONS` 追加 `0003_down`（**回滚顺序与建表相反**）。`server/db/test_schema.mjs` 的 `MIGRATION_FILES` 同步追加，集成测试的 `FULL_SCHEMA_SQL` 才会带上新表。
+
+Neon 真库执行：`node scripts/migrate.mjs` → `CREATE（建表）← schema.sql , migrations/0002_questions_owner.sql , migrations/0003_practice.sql` / `执行完成，用时 1860 ms`。
+
+### 44.3 后端四端点
+
+`server/routes/practice.mjs` + `server/repositories/practice_sessions.mjs`。
+
+| 方法 & 路径 | 关键点 |
+|---|---|
+| `GET /questions/practice` | `source`=mine/public/all；`count` 默认 10、上限 50（>50 夹回 50，≤0 → 400 `INVALID_COUNT`）。**题量不足不报错**，返回 200 且 body 带 `available` |
+| `POST /practice-sessions` | `answers` 非数组 → 400 `INVALID_ANSWERS`；空 → 400 `EMPTY_ANSWERS`；返回 201 `{session_id,total,correct,wrong,unjudged,accuracy,created_at}` |
+| `GET /practice-sessions` | 只返回 `user_id = token 映射值` 的会话，按 `created_at DESC` |
+| `GET /practice-sessions/:id` | 会话查不到（含别人的）→ **404**（不用 403，避免枚举 id） |
+
+抽题 SQL 的安全底线（写死在仓储层，不靠路由层过滤）：
+
+```sql
+SELECT id, stem, type, options,
+       CASE WHEN owner_user_id = $N THEN answer ELSE NULL END AS answer,
+       CASE WHEN owner_user_id = $N THEN analysis ELSE NULL END AS analysis,
+       ...
+FROM questions
+WHERE deleted_at IS NULL AND (...)
+ORDER BY random() LIMIT $M
+```
+
+来源分域：`mine` → `owner_user_id = $1`；`public` → `owner_user_id IS NULL`；`all` → `(owner_user_id IS NULL OR owner_user_id = $1)`。
+
+**路由顺序是硬要求**：`server/routes/index.mjs` 里 `{ name: 'practice', match: practice.match }` 必须排在 `{ name: 'questions', ... }` **之前** —— 否则 `GET /questions/practice` 会被 questions 模块当成 `GET /questions/:id`（id='practice'）→ 404。
+
+### 44.4 集成测试清单（8 条，PGlite 真库 8/8）
+
+`server/routes/practice.integration.test.mjs`：
+
+1. `source=mine` 抽到的都是自己的题，`answer` 有值、`has_answer=true`、`is_mine=true`（3 道，available=3）
+2. `source=public` 的 `answer` 与 `analysis` **均为 null**、`has_answer=false`（2 道）
+3. `source=all` 混合 5 道（3 道自己的带答案 + 2 道公共题答案为 null）
+4. `count=50` 题量不足 → **200**，`items` 3、`available` 3、`requested` 50
+5. `POST /practice-sessions` → `total 3 / correct 1 / wrong 1 / unjudged 1`（`is_correct=null` 即自评题），详情能读每题对错
+6. 练习历史只返回自己的（A 1 条 / B 0 条）
+7. 读别人的会话 → **404**
+8. 不带 Token → 401
+
+### 44.5 前端四页
+
+| 文件 | 关键内容 |
+|---|---|
+| `lib/api/practice_api.dart` | `PracticeSource`（mine/public/all）、`PracticeQuestion`（含 `hasAnswer`）、`PracticePick`（`insufficient` 判定）、`PracticeLocalAnswer`、`PracticeAnswerInput`、`PracticeSessionSummary/Detail`；四个方法 `pickQuestions` / `submitSession` / `listSessions` / `fetchSession` |
+| `lib/pages/practice_config_page.dart` | 科目（exam_profiles → subjects）/ 考点（可选）/ 来源 / 题量 10·20·30·50。题量不足弹「该范围只有 N 道题，是否按 N 道开始？」；空范围提示「这个范围里还没有题目」 |
+| `lib/pages/practice_answering_page.dart` | 不限时；顶部「第 X/Y 题」；有标准答案自动判分（归一：大写→只留字母→排序拼接），公共题显示橙色「该题不提供答案，请自评」+「我答对了 / 我答错了」；提交前若公共题没自评会再问一次 |
+| `lib/pages/practice_result_page.dart` | 正确率大字 + 四格（答对/答错/未判定/总题数）；错题卡「去归因」→ 建单页并预填错因「练习中未掌握」+ question_id；对题默认折叠；底部「再练一次 / 返回首页」 |
+| `lib/pages/practice_history_page.dart` | 「我的 → 练习记录」列表 + 详情页 + 「重做这次练习」 |
+
+入口三处：首页快捷入口「开始练习」、题库页导航栏「练习」、「我的」功能列表「练习记录」。
+
+去归因链路的参数打通：`DefectCreatePage` 新增 `initialQuestionId` / `initialErrorCause` / `initialQType` 三个可选参数并在 `initState` 预填；`DefectApi.createDefectTicket` 与 `WriteQueue.enqueueCreateDefect` 均补传 `question_id`（本地路径也要落库 + 进队列 payload，否则联网推送后云端拿不到题目）。
+
+### 44.6 本轮抓到并修掉的缺陷
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | `GET /questions/practice?source=public` → **500 internal** | `pickQuestions` 开头就 `const params = [userId]`，但 public 分支的 where 不引用 userId → count 查询多带一个参数 → PG `bind message supplies 1 parameters, but prepared statement requires 0` → 被 `httpError` 第②分支吞成 500 | params 改为按需追加 + `$${params.length}` 动态编号；答案 CASE 用独立占位符 |
+| 2 | `question_bank_page.dart` 70+ 条编译错误 | `_openCreate()` 的收尾 `}` 被 edit 吞掉 → `_openPractice()` 塞进了方法体内 → 后续方法全变局部函数 | 补回 `}`。**教训**：这类症状报的是「referenced_before_declaration」，不是「缺大括号」 |
+| 3 | `practice_api.dart` 8 条 `expected_token` + `argument_type_not_assignable` | `map['items']! as List<Object?>]` 多一个 `]`；accuracy 传的是 String | 删 `]`；accuracy 直接算 `correct / total * 100` |
+| 4 | `practice_answering_page.dart` 三处报错 | `pushReplacement<void>` 少一个类型参数；`FormErrorBanner` 未导入；用了 Material 的 `Colors.transparent` | 改 `pushReplacement<void, void>`；补 import；改 `CupertinoColors.transparent` |
+
+### 44.7 真机验证（Android 17 模拟器 + 本地后端连 Neon）
+
+本地后端 `.tmp-dev-ws.mjs`（`@neondatabase/serverless` websocket Pool 适配成 `pg.Pool` 形状）起在 `0.0.0.0:3000`，App 用 `--dart-define=API_BASE_URL=http://10.0.2.2:3000 --dart-define=API_TOKEN=tk_test_001`。
+
+- **坑**：练习端点返回 401「练习需要有效的 Bearer Token」—— 本地起进程时**没设 `TOKENS` 环境变量**（`server/index.mjs` 只在 `TOKENS` 存在时强制鉴权，练习端点则是自己的「无 token 直接 401」逻辑）。补 `TOKENS=tk_test_001:1111...,tk_test_002:cbd8...` 重启即通。
+- **E1** 配置页（来源/题量/科目/考点）→ 答题页「第 1/10 题」→ 答 8 题全选 A → 提交 → 结果页「**80.0% / 8 答对 / 0 答错 / 2 未判定 / 10 总题数**」。
+- **E3** 切「公共题」抽题 → 橙色块「**该题不提供答案，请自评**｜公共题由他人上传，标准答案不对外公开，所以只能由你自己判断对错。」+「我答对了 / 我答错了」→ **答案安全底线在真机上确认**。
+- **E2** 全答 B（正确答案 A）→ 结果页「10.0% / 1 答对 / 6 答错 / 3 未判定」，错题卡带「去归因」。**踩了坐标坑**：直接点卡片中心点不到「去归因」—— Flutter 把整张卡合并成一个 Button 节点，content-desc 是整卡文字拼接，「去归因」是卡片内部的子按钮，要点卡片**右下角**才命中。命中后建单页的错因输入框**已被预填「练习中未掌握」**（EditText 内容核对过）。
+- **E4** 「我的 → 练习记录」列出三次会话（80.0% / 10.0% / 0.0%），进详情显示逐题对错与「你的答案 / 正确答案」。
+- **E5** 多用户隔离：`GET /practice-sessions`（`Bearer tk_test_002`）→ `{"items":[],"total":0}`，B 看不到 A 的会话。
+
+截图 8 张（`tillroad_app/screenshots/`）：`r1-practice-config.png`、`r1-practice-answering.png`、`r1-practice-selfjudge.png`、`r1-practice-result.png`、`r1-practice-result-wrong.png`、`r1-practice-attribute.png`、`r1-practice-history.png`、`r1-practice-history-detail.png`。
+
+### 44.8 收尾校验
+
+- `flutter analyze --no-fatal-infos` → **84 issues，0 error / 0 warning**。
+- `flutter test` → **All tests passed! (106 tests)**。
+- `npm test` → **tests 336 / pass 194 / fail 0 / skipped 142**。
+- `node scripts/migrate.mjs` → Neon 真库建表成功（1860 ms）。
+
+### 44.9 遗留
+
+1. **掌握度标记**未做（对题只折叠展示，不记录掌握程度）——R2。
+2. **删题**未做——R3。
+3. **按题目选择器组练习**未做（练习只能按科目/考点抽，不能像提交验证那样挑具体题目）。
+4. 公共题自评的对错**只存在练习记录里**，不回流题库（题目没有「掌握度」字段可写）。
+5. 练习记录**没有删除入口**（`practice_sessions` 有 `deleted_at` 字段但没做端点）。
+6. `duration_ms` 已经在收，但结果页与历史页**还没展示每题用时**。

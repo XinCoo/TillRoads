@@ -91,6 +91,7 @@ abstract final class WriteQueue {
     String? errorLayer,
     String? knowledgeNodeId,
     String? priority,
+    String? questionId,
     List<String> actions = const <String>[],
   }) async {
     final String? layer = errorLayer?.trim();
@@ -122,7 +123,9 @@ abstract final class WriteQueue {
         'knowledge_node_id': (knowledgeNodeId?.trim().isEmpty ?? true)
             ? null
             : knowledgeNodeId!.trim(),
-        'question_id': null,
+        'question_id': (questionId?.trim().isEmpty ?? true)
+            ? null
+            : questionId!.trim(),
         'q_type': qType,
         'error_layer': analyzable ? layer : null,
         'error_cause': cause.isEmpty ? null : cause,
@@ -171,6 +174,8 @@ abstract final class WriteQueue {
             'knowledge_node_id': knowledgeNodeId.trim(),
           if (priority != null && priority.trim().isNotEmpty)
             'priority': priority.trim(),
+          if (questionId != null && questionId.trim().isNotEmpty)
+            'question_id': questionId.trim(),
           if (cleanedActions.isNotEmpty) 'actions': cleanedActions,
           // 显式声明建出来的状态，避免服务端按「有没有 error_layer」二次猜测。
           'status': status,

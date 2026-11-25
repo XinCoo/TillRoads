@@ -238,6 +238,7 @@ class DefectApi {
     String? errorLayer,
     String? knowledgeNodeId,
     String? priority,
+    String? questionId,
     List<String> actions = const <String>[],
     bool draft = false,
   }) async {
@@ -250,6 +251,8 @@ class DefectApi {
       if (knowledgeNodeId != null && knowledgeNodeId.isNotEmpty)
         'knowledge_node_id': knowledgeNodeId,
       if (priority != null && priority.isNotEmpty) 'priority': priority,
+      if (questionId != null && questionId.isNotEmpty)
+        'question_id': questionId,
       if (actions.isNotEmpty) 'actions': actions,
       if (draft) 'status': 'DRAFT',
     };

@@ -20,6 +20,7 @@ import '../pages/defect_create_page.dart';
 import '../pages/defect_detail_page.dart';
 import '../pages/exam_config_page.dart';
 import '../pages/mock_create_page.dart';
+import '../pages/practice_config_page.dart';
 import '../pages/review_page.dart';
 import '../pages/settings_page.dart';
 import '../pages/verify_page.dart';
@@ -789,6 +790,19 @@ class _HomePageState extends State<HomePage> {
       appRoute<bool>(context, const MockCreatePage()),
     );
   }
+  /// 「开始练习」：push 练习配置页（练习模式 R1）。
+  ///
+  /// 与「开始模考」并列但语义不同：模考限时、生成报告、走 mock_exams；
+  /// 练习不限时、客户端判分、走 practice_sessions。
+  Future<void> _openPracticeConfig() async {
+    if (kUseMock) {
+      _toast('开始练习', '离线演示模式（kUseMock=true）下无法抽题。');
+      return;
+    }
+    await Navigator.of(context).push<void>(
+      appRoute<void>(context, const PracticeConfigPage()),
+    );
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -935,6 +949,11 @@ class _HomePageState extends State<HomePage> {
                         icon: CupertinoIcons.chart_bar,
                         label: '复盘',
                         onTap: _openReview,
+                      ),
+                      QuickAction(
+                        icon: CupertinoIcons.pencil_outline,
+                        label: '开始练习',
+                        onTap: _openPracticeConfig,
                       ),
                     ],
                   ),

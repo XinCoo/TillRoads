@@ -28,7 +28,10 @@ export const SCHEMA_SQL = readFileSync(join(ROOT, 'schema.sql'), 'utf8');
  * 增量迁移（按顺序）。都是幂等的纯 SQL。
  * 新增迁移时把文件加进这个数组即可 —— 顺序即执行顺序。
  */
-export const MIGRATION_FILES = Object.freeze(['migrations/0002_questions_owner.sql']);
+export const MIGRATION_FILES = Object.freeze([
+  'migrations/0002_questions_owner.sql',
+  'migrations/0003_practice.sql',
+]);
 
 const MIGRATION_SQL = MIGRATION_FILES.map((f) => ({
   file: f,

@@ -37,6 +37,9 @@ class DefectCreatePage extends StatefulWidget {
     required this.examProfileId,
     required this.subjectId,
     required this.subjectName,
+    this.initialQuestionId,
+    this.initialErrorCause,
+    this.initialQType,
   });
 
   /// 建单必填：后端 `defect_tickets.exam_profile_id` 是 NOT NULL 外键。
@@ -45,6 +48,18 @@ class DefectCreatePage extends StatefulWidget {
   /// 建单页从「当前科目」加载考点列表，避免一次性拉全库考点。
   final String subjectId;
   final String subjectName;
+
+  /// 练习模式 R1：从练习结果页「去归因」进来时预填的题目 id。
+  ///
+  /// 后端 `POST /defect-tickets` 接受 `question_id`，所以这里直接带上，
+  /// 用户不用再回题库挑一次题 —— 练习与缺陷单的闭环就靠这一条。
+  final String? initialQuestionId;
+
+  /// 预填的具体错因（练习场景默认「练习中未掌握」）。
+  final String? initialErrorCause;
+
+  /// 预填的题型 / 考点摘要（练习场景用题干前若干字）。
+  final String? initialQType;
 
   @override
   State<DefectCreatePage> createState() => _DefectCreatePageState();
@@ -75,6 +90,14 @@ class _DefectCreatePageState extends State<DefectCreatePage> {
   @override
   void initState() {
     super.initState();
+    // 练习模式 R1：带参进来时预填题干摘要与错因，用户不用重写。
+    if (widget.initialQType != null && widget.initialQType!.isNotEmpty) {
+      _qType.text = widget.initialQType!;
+    }
+    if (widget.initialErrorCause != null &&
+        widget.initialErrorCause!.isNotEmpty) {
+      _errorCause.text = widget.initialErrorCause!;
+    }
     _loadNodes();
   }
 
@@ -230,6 +253,7 @@ class _DefectCreatePageState extends State<DefectCreatePage> {
           errorLayer: _errorLayer,
           knowledgeNodeId: _knowledgeNodeId,
           priority: _priority,
+          questionId: widget.initialQuestionId,
           actions: actions,
         );
         AppLogger.instance.info(
@@ -253,6 +277,7 @@ class _DefectCreatePageState extends State<DefectCreatePage> {
         errorLayer: _errorLayer,
         knowledgeNodeId: _knowledgeNodeId,
         priority: _priority,
+        questionId: widget.initialQuestionId,
         actions: actions,
       );
       if (!mounted) return;

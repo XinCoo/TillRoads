@@ -44,6 +44,7 @@ import '../widgets/common.dart';
 import 'api_token_page.dart';
 import 'exam_config_page.dart';
 import 'mock_page.dart';
+import 'practice_history_page.dart';
 import 'question_bank_page.dart';
 import 'review_page.dart';
 import 'settings_page.dart';
@@ -444,6 +445,14 @@ class _ProfilePageState extends State<ProfilePage> {
       context,
     ).push<void>(appRoute<void>(context, const ExamConfigPage()));
   }
+  /// 练习记录（练习模式 R1 的历史入口）。
+  ///
+  /// 服务端按 token 映射 userId，只能看到自己的练习，所以这里不做筛选。
+  void _openPracticeHistory() {
+    Navigator.of(
+      context,
+    ).push<void>(appRoute<void>(context, const PracticeHistoryPage()));
+  }
 
   void _openSettings() {
     Navigator.of(
@@ -743,6 +752,11 @@ class _ProfilePageState extends State<ProfilePage> {
         icon: CupertinoIcons.square_stack_3d_up,
         title: '考试配置',
         onTap: _openExamConfig,
+      ),
+      _EntryRow(
+        icon: CupertinoIcons.pencil_outline,
+        title: '练习记录',
+        onTap: _openPracticeHistory,
       ),
       _EntryRow(
         icon: CupertinoIcons.gear,

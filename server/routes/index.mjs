@@ -26,6 +26,10 @@ import * as mockExams from './mock_exams.mjs';
 import * as defectTickets from './defect_tickets.mjs';
 import * as questionsImport from './questions_import.mjs';
 import * as questions from './questions.mjs';
+// 练习模式 R1：/questions/practice 与 /practice-sessions。
+// ★ 必须排在 questions **之前**：questions 模块把 GET /questions/:id 当单题详情，
+//   若它先匹配上，/questions/practice 会被当成「读 id='practice' 的题」→ 404。
+import * as practice from './practice.mjs';
 import * as verificationTasks from './verification_tasks.mjs';
 import * as reviewCycles from './review_cycles.mjs';
 // m18680 B1：删除「我的所有数据」（DELETE /users/:userId/data）。
@@ -53,6 +57,10 @@ export const ROUTE_MODULES = Object.freeze([
   // m17431：题库列表读取端点（GET /questions）。
   // 必须排在 questions_import 之后 —— 前者只认 POST /questions/import，
   // 但保持「长/具体在前」的顺序习惯，将来加 POST /questions 时不会被截胡。
+  // 练习模式 R1：GET /questions/practice + /practice-sessions。
+  // ★ 必须排在 questions **之前**：questions 把 GET /questions/:id 当单题详情，
+  //   若它先匹配，/questions/practice 会被当成读 id='practice' 的题 → 404。
+  { name: 'practice', match: practice.match },
   { name: 'questions', match: questions.match },
   // BE-04：纯查询端点（GET /users/:id/verification-tasks|verification-summary）。
   // 放最后是因为它只认 seg.length===3 且 seg[2] 是固定字面量，不会遮蔽任何已有路径。

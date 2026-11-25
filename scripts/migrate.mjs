@@ -34,8 +34,15 @@ const down = process.argv.includes('--down');
 // ★ m17431：schema 解冻后，schema.sql 不再是唯一事实来源。
 //   这里按顺序执行「增量迁移文件」——它们都是纯 SQL 且幂等（IF NOT EXISTS / IF EXISTS），
 //   可以重复执行。新增迁移时把文件加进对应数组即可，不要改 0001。
-const UP_MIGRATIONS = ['migrations/0002_questions_owner.sql'];
-const DOWN_MIGRATIONS = ['migrations/0002_questions_owner_down.sql'];
+const UP_MIGRATIONS = [
+  'migrations/0002_questions_owner.sql',
+  'migrations/0003_practice.sql',
+];
+// 回滚顺序与建表相反（先回 0003 再回 0002），否则外键依赖会挡住。
+const DOWN_MIGRATIONS = [
+  'migrations/0003_practice_down.sql',
+  'migrations/0002_questions_owner_down.sql',
+];
 
 const files = down
   ? [...DOWN_MIGRATIONS, 'migrations/0001_init_down.sql']
