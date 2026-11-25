@@ -1942,13 +1942,13 @@ CLEANED 3
 2. 新增 `flutter-tests` job（与后端两个 job 并行，无 `needs`）；
 3. 该 job 的 `defaults.run.working-directory: tillroad_app`，步骤为 Checkout → `subosito/flutter-action@v2`（**钉住 `flutter-version: '3.50.0'`**，不用浮动的 `channel`，避免 CI 与本地悄悄分叉）→ `flutter pub get` → `flutter analyze --no-fatal-infos` → `flutter test --reporter expanded`。
 
-`analyze` 步骤用 `grep -Eq '^\s+(error|warning)\s+-'` 显式拦截，因为 `--no-fatal-infos` 会让 info 不致命（既有 68 条全是 Cupertino deprecation info），但 error / warning 必须为 0。**没跑 `flutter build apk`**：CI 里打 release 包既慢又需要签名材料，且已被本地构建 + 真机验证覆盖。
+`analyze` 步骤显式拦截 error / warning，因为 `--no-fatal-infos` 会让 info 不致命，但 error / warning 必须为 0。**这个判据第一版写错了**（`grep -Eq '^\s+(error|warning)\s+-'`，把分隔符写死成 ` - `），导致本机 13 条 warning 被漏判成「0 warning」；CI 真跳后暴露，修正细节见 §41.2。
 
 YAML 不能靠肉眼判断，用 `yaml` 包 `YAML.parse` 断言结构：`TOP_KEYS name,on,jobs` / `JOBS schema,node-tests,flutter-tests` / `JOB schema steps=9` / `JOB node-tests steps=4 needs=schema` / `JOB flutter-tests steps=6` / 两个 paths 数组末尾均为 `tillroad_app/**` → `CI_YAML_OK`。验完 `npm prune`。
 
 ### 40.4 校验数字
 
-- `flutter analyze --no-fatal-infos` → **68 issues，0 error / 0 warning**；
+- `flutter analyze --no-fatal-infos` → **68 issues，当时误报「0 error / 0 warning」**（13 条 warning 因 grep 写错分隔符而漏计，§41.1 已列出并修完）；
 - `flutter test` → **106/106 All tests passed**；
 - 判重双向：`imported 3→0`、`duplicates 0→3`。
 
@@ -1956,3 +1956,119 @@ YAML 不能靠肉眼判断，用 `yaml` 包 `YAML.parse` 断言结构：`TOP_KEY
 
 - Railway 仍需 redeploy 才能让 m18680 的 `DELETE /users/:id/data` 上线（本地已验证端点正确）。
 - CI 的 `flutter-tests` job 只在推到 GitHub 后才会真跑一次，本机只能验证 YAML 结构 + 本地等价命令。
+
+## 41. CI 首次真跑失败：2 条集成测试 + 13 条 Flutter warning
+
+`flutter-tests` job 上线后第一次真跑（m21384）暴露两类问题。**这两条后端失败都不是产品 bug，是测试自己的 bug**；13 条 warning 是真实存在的代码问题，且此前被我误判为 0。
+
+### 41.1 13 条 warning 的真实清单
+
+用 `flutter analyze --no-fatal-infos` 的**原始输出**逐条列出（本机 `^\s*(error|warning)\s` 精确匹配，共 13 行），全部已修：
+
+| # | 文件 | 规则 | 修法 |
+|---|------|------|------|
+| 1 | `lib/api/question_api.dart:150` | `unnecessary_cast` | `(e as Map)['message']` → `e['message']`（`is Map` 已提升） |
+| 2 | `lib/local/local.dart:115` | `undefined_shown_name` | barrel 的 `show` 里删 `stripInternalKeys`（它是 `PushEngine` 的静态方法，不走顶层导出） |
+| 3 | `lib/local/push_engine.dart:615` | `unnecessary_cast` | `(inner as Map)['version']` → `inner['version']` |
+| 4 | `lib/local/write_queue.dart:31` | `unused_import` | 删 `import 'dao/sync_table_dao.dart';` |
+| 5 | `lib/local/write_queue.dart:34` | `unused_import` | 删 `import 'local_queries.dart';` |
+| 6 | `lib/pages/defect_analyze_page.dart:18` | `unused_import` | 删 `import '../../config/api_config.dart';` |
+| 7 | `lib/pages/defect_analyze_page.dart:29` | `unused_shown_name` | `show` 里删 `kLocalFirstEnabled` |
+| 8 | `lib/pages/defect_verify_page.dart:21` | `unused_import` | 同上 |
+| 9 | `lib/pages/defect_verify_page.dart:31` | `unused_shown_name` | 同上 |
+| 10–13 | `lib/pages/defects_page.dart:205,226,251,252` | `unnecessary_non_null_assertion` | `profileId!` / `subjectId!` 去掉 `!`（在 `if (profileId == null \|\| subjectId == null)` 之后已被提升为非空） |
+
+修后 `flutter analyze --no-fatal-infos` → **55 issues，0 error / 0 warning**（55 条全是 `deprecated_member_use` / `use_null_aware_elements` / `use_build_context_synchronously` 等 info）。
+
+**为什么之前误报「0 error / 0 warning」**：我用 `Select-String -Pattern '^\s+(error|warning)\s+-'` 过滤。实际输出行的前缀空格数与分隔符并不固定（本机是 `warning - ...`，CI 的 `dart analyze` 机器可读格式用 `warning • ...`），这个正则既漏了本机 13 条、也在 CI 上完全失配。**教训：判据不要写死格式，只认开头的级别词**（`'^[[:space:]]*(error|warning)[[:space:]]'`），并且要用真实日志验证判据本身。
+
+### 41.2 CI 的 Analyze 判据修正
+
+`.github/workflows/schema-ci.yml` 的 Analyze 步骤改三处：
+
+1. 分隔符不再写死：`grep -Eq '^[[:space:]]*(error|warning)[[:space:]]'`；
+2. 用 `PIPESTATUS[0]` 捕获 `flutter analyze` 的真实退出码（`| tee` 会把退出码换成 tee 的），并在通过 grep 检查后仍校验它，避免「没有 error/warning 行但命令本身失败」被吞掉；
+3. 命中时把命中行打印出来，失败原因直接可见。
+
+判据本身用真实 bash 验过三份日志：干净日志 → `GATE=PASS`；含 1 条 `warning -` 的日志 → `GATE=BLOCK` 并打印该行；含 info 但无 error/warning → `GATE=PASS`。
+
+### 41.3 后端集成测试失败（都是测试 bug，共 3 处）
+
+**失败 1：`after()` 清理违反外键**
+`server/routes/questions.integration.test.mjs` 的 `after()` 只按 `owner_user_id IN (A, B)` 删题。但第 4 个用例为了测组卷会给 B 的科目插 2 道**公共题**（`owner_user_id IS NULL`），它们引用着 `subjects`，于是随后 `DELETE FROM subjects` 报 `23503 questions_subject_id_fkey`。CI 输出：
+
+```
+Error: after(): 清理数据失败：update or delete on table "subjects" violates foreign key constraint "questions_subject_id_fkey" on table "questions"
+```
+
+修法：删题条件加上「或位于这两个用户的科目下」——`owner_user_id IN ($1,$2) OR subject_id IN (SELECT s.id FROM subjects s JOIN exam_profiles p ON p.id = s.exam_profile_id WHERE p.user_id IN ($1,$2))`。
+
+**失败 2：可见性断言把公共题当成泄漏**
+同一文件第 5 个用例断言「B 的列表里不应出现 A 的题」，实现是拿 A 看到的**全部** id 与 B 的全部 id 取交集。但公共题本来就会同时出现在两边，第 4 个用例刚往 B 的科目插了 2 道公共题 → 交集 = 2 → `2 !== 0`。CI 输出：
+
+```
+AssertionError: B 的列表里不应出现 A 的题
+2 !== 0
+```
+
+修法：只比 **A 的私有题**（`q.owner_user_id === seed.userA`）与 B 的列表，并额外断言 A 的私有题恰好 12 道（防止过滤条件写错导致集合为空而「假通过」）。
+
+**失败 3（修好前两个才浮出来）：`after()` 从未删 `mock_exams`**
+用 PGlite 直接跑真实测试文件时，前两个修好后立刻报：
+
+```
+Error: after(): 清理数据失败：update or delete on table "exam_profiles" violates foreign key constraint "mock_exams_exam_profile_id_fkey" on table "mock_exams"
+```
+
+第 4 个用例 `POST /mock-exams` 建了 1 条引用 `seed.profileB` 的模考记录，而 `after()` 的清理链里根本没有 `mock_exams`。**CI 上同样会炸**，只是当时被 `questions_subject_id_fkey` 挡在前面没跑到这一步。修法：在 `DELETE FROM exam_profiles` 之前补一条 `DELETE FROM mock_exams WHERE exam_profile_id IN (SELECT id FROM exam_profiles WHERE user_id IN ($1,$2))`。
+
+**教训：删表顺序要按「子 → 父」一次排完**，而不是遇到一个外键补一个；每修一次 FK 都该重跑整条清理链。
+
+### 41.4 验证方式（没有本地 PG，用 PGlite 跑真触发器/真 SQL）
+
+`npm install --no-save @electric-sql/pglite`（真实 Postgres WASM）。做**两层**验证，第二层才是决定性证据：
+
+**第一层：手写脚本复刻 8 步**（`{query, connect}` 适配器驱动 `createApp({pool})`，真 HTTP 打真路由）：
+
+```
+OK  1 A 导入 12 题
+OK  2 B 导入同文件不判重
+OK  3 A 二次导入判重 12
+OK  4 往 B 科目插 2 道公共题
+OK  5 可见性 owner 集合合法 A=[null,"0b68…"] B=[null,"869f…"]
+OK  6 A 私有题 12 道
+OK  7 B 列表无 A 私有题（修复后的断言口径）
+OK  8 after() 清理顺序通过（无 23503）
+PG_VERIFY_ALL_OK
+```
+
+**第二层：直接跑真实测试文件（更有说服力）**。把 `server/routes/questions.integration.test.mjs` 复制成临时文件，**只替换一行 import**（`../db/pool.mjs` → 一个把 PGlite 包成 `pg.Pool` 形状的适配器），然后 `RUN_PG_INTEGRATION=1 node --test` 跑那个副本——断言、用例结构、`before`/`after` 全是产品测试原样：
+
+```
+✔ m17431：用户 A 导入的题 owner_user_id = A
+✔ m17431：用户 B 导入同样 3 题不判重（owner 维度隔离）
+✔ m17431：用户 A 二次导入同样内容判重（duplicates = 12）
+✔ m17431：组卷只抽「公共题 + 自己的题」，抽不到别人的私有题
+✔ m17431：GET /questions 只返回「公共题 + 自己的题」
+ℹ tests 5 / pass 5 / fail 0 / skipped 0
+```
+
+**这层验证揪出了第三个 bug（CI 上同样会炸，只是被前一层的报错挡住了）**：`after()` 从未删 `mock_exams`，而第 4 个用例 `POST /mock-exams` 建了 1 条引用 `seed.profileB` 的记录 → 删 `exam_profiles` 时报 `23503 mock_exams_exam_profile_id_fkey`。**这是「修好第一个 FK 才浮出第二个 FK」的典型连锁**，只在 `questions_subject_id_fkey` 被修掉后才看得到。修法：在删 `exam_profiles` 之前补一条 `DELETE FROM mock_exams WHERE exam_profile_id IN (SELECT id FROM exam_profiles WHERE user_id IN ($1,$2))`，并加注释说明为什么必须在这里删。
+
+适配层唯一的坑：`schema.sql` 是「一次传多条语句」，`pg` 的 simple query 协议支持，PGlite 的 `query()` 走 prepared statement 会报 `42601 cannot insert multiple commands into a prepared statement` → 适配器里「无参数且含分号 → `db.exec(text)` 返回 `{rows: [], rowCount: 0}`，否则 `db.query()`」。
+
+验完删临时脚本与副本、`npm prune` + 手动删 `node_modules/@electric-sql`，`dependencies` 仍只有 `pdfjs-dist` / `pg`（`npm ls --depth=0` 确认）。
+### 41.5 最终数字
+
+- `flutter analyze --no-fatal-infos` → **55 issues，0 error / 0 warning**（全部 info）；
+- `flutter test` → **106/106 All tests passed，TEST_EXIT=0**；
+- `npm test` → **tests 321 / pass 194 / fail 0 / skipped 127，TEST_EXIT=0**（本机无 PG，127 skip；CI 上这 127 条会真跑）；
+- CI YAML：`TOP_KEYS name,on,jobs` / `JOBS schema,node-tests,flutter-tests` / `flutter-tests steps=6` / 两条 `paths` 含 `tillroad_app/**` → `CI_YAML_OK`。
+
+### 41.6 教训
+
+1. **「全部通过」的判据本身要验**。把分隔符写死的正则让我连续两轮误报 0 warning；正确做法是拿真实输出跑一遍判据，并构造「应该拦住」和「应该放行」两类样本。
+2. **测试里的清理代码和断言也是代码**，CI 真跑（`skipped 0`）才会暴露；本机全 skip 的绿灯不构成证据。
+3. **断言「没有泄漏」要先把公共资源排除在比较集合外**，否则共用资源会导致误报；这类断言还应该带上基数断言，避免集合意外为空时的假通过。
+4. **修好一个外键失败，会浮出下一个**。`after()` 里 `questions_subject_id_fkey` 挡住了 `mock_exams_exam_profile_id_fkey`——删表顺序要按「子 → 父」排一遍，而不是遇到一个补一个。**每修一次 FK 就重跑一遍完整清理链**，别只看当前这条错误消失。
+5. **验证要靠「跑原物」而不是「复刻原物」**。手写脚本复刻 8 步全绿，却漏掉了第 4 个用例建的 `mock_exams`；把真实测试文件只改一行 import 直接在 PGlite 上跑，第三个 bug 立刻现形。复刻物会不经意地比原物宽松。

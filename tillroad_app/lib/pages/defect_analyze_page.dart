@@ -15,7 +15,6 @@ import 'package:flutter/cupertino.dart';
 
 import '../../api/api_client.dart';
 import '../../api/defect_api.dart';
-import '../../config/api_config.dart';
 import '../../logging/app_logger.dart';
 // 只取写队列相关符号：`local.dart` 也导出 `findForbiddenPhrases`，与 defect_api 冲突。
 import '../../local/local.dart'
@@ -25,8 +24,7 @@ import '../../local/local.dart'
         WriteQueue,
         WriteQueueResult,
         kLocalDataRevision,
-        kLocalDbReady,
-        kLocalFirstEnabled;
+        kLocalDbReady;
 import '../../theme/app_theme.dart';
 // CardShell / InfoRow 等卡片壳复用 FE-03 列表页的组件，保证圆角/阴影一致
 import '../../widgets/defect_badges.dart';

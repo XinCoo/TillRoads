@@ -202,7 +202,7 @@ class _DefectsPageState extends State<DefectsPage> {
           profileId = '${profile['id']}';
           examLabel = '${profile['target_label'] ?? profile['exam_type'] ?? '考试目标'}';
           final Map<String, Object?>? subject =
-              await loadFirstSubject(profileId!);
+              await loadFirstSubject(profileId);
           if (subject != null) {
             subjectId = '${subject['id']}';
             subjectName = '${subject['name'] ?? '未命名科目'}';
@@ -223,7 +223,7 @@ class _DefectsPageState extends State<DefectsPage> {
           final Map<String, Object?> first = profiles.first;
           profileId = '${first['id']}';
           examLabel = '${first['target_label'] ?? first['exam_type'] ?? '考试目标'}';
-          final subjects = await _api.fetchSubjects(profileId!);
+          final subjects = await _api.fetchSubjects(profileId);
           if (!mounted) return;
           if (subjects.isEmpty) {
             setState(() => _creating = false);
@@ -248,8 +248,8 @@ class _DefectsPageState extends State<DefectsPage> {
         appRoute<bool>(
           context,
           DefectCreatePage(
-            examProfileId: profileId!,
-            subjectId: subjectId!,
+            examProfileId: profileId,
+            subjectId: subjectId,
             subjectName: '$examLabel · ${subjectName ?? '未命名科目'}',
           ),
         ),

@@ -214,13 +214,28 @@ export async function listByKnowledgeNode(
  * 可见集合 = 公共题（owner_user_id IS NULL）+ 该用户自己的题。
  * 只读端点，不含 answer / analysis 的剔除 —— 那由路由层做。
  */
-export async function listVisible(client, { limit, offset, ownerUserId, subjectId, orderBy } = {}) {
+export async function listVisible(
+  client,
+  { limit, offset, ownerUserId, subjectId, knowledgeNodeId, q, orderBy } = {},
+) {
   const p = pageParams({ limit, offset });
   const where = ['deleted_at IS NULL'];
   const params = [];
   if (subjectId) {
     params.push(subjectId);
     where.push(`subject_id = $${params.length}`);
+  }
+  // m21780：考点过滤。前端题目选择器按考点筛题用。
+  if (knowledgeNodeId) {
+    params.push(knowledgeNodeId);
+    where.push(`knowledge_node_id = $${params.length}`);
+  }
+  // m21780：题干关键字。参数化拼接进 ILIKE 模式，不拼进 SQL 字符串。
+  // %% 由数据库侧做模糊匹配，这里只转义 LIKE 的元字符（\ % _），
+  // 否则用户搜 "100%" 会变成通配符。（ESCAPE '\' 显式声明，不依赖默认行为。）
+  if (q) {
+    params.push(`%${escapeLikePattern(q)}%`);
+    where.push(`stem ILIKE $${params.length} ESCAPE '\\'`);
   }
   if (ownerUserId) {
     params.push(ownerUserId);
@@ -229,6 +244,16 @@ export async function listVisible(client, { limit, offset, ownerUserId, subjectI
   // 题库列表默认「最新导入的排最前」—— 用户刚导入完要能立刻在第一屏看到自己导入的题。
   // 其余调用方（目前只有题库端点）可传 orderBy 覆盖。
   return listRows(client, TABLE, where, params, { ...p, orderBy: orderBy || 'created_at DESC, id DESC' });
+}
+
+/**
+ * 把用户输入转成 LIKE 模式里的字面量：转义 `\`、`%`、`_`。
+ *
+ * 不转义的话搜「100%」会匹配一切、搜「a_b」会匹配「axb」。
+ * 只处理这三个字符——因为调用方固定用 `ESCAPE '\'`。
+ */
+function escapeLikePattern(value) {
+  return `${value}`.replace(/[\\%_]/g, (ch) => `\\${ch}`);
 }
 
 /**

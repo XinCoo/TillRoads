@@ -645,6 +645,37 @@ CREATE INDEX IF NOT EXISTS idx_q_owner
 
 **前端入口**（「我的 → 题库管理」）：`lib/pages/question_bank_page.dart`（列表，按科目分组）与 `lib/pages/question_import_page.dart`（选文件 → 选科目 → 选考点（可选）→ 上传 → 结果），新增依赖 `file_picker ^13.4.1`。
 
+### 题目选择器（m21779：`GET /questions` 的 `q` / `knowledge_node_id`）
+
+提交验证时「关联题目」原来是手输 UUID（`如：f47ac10b-…`），现实中没人能背出 UUID，等于该字段从未被用过。本轮把它换成选择器。
+
+**后端只加两个查询参数**（不改返回结构、`items` 仍不含 `answer` / `analysis`）：
+
+| 参数 | 语义 | 实现 |
+|---|---|---|
+| `q` | 题干关键字 | `stem ILIKE $n ESCAPE '\'`，参数是 `%关键字%` |
+| `knowledge_node_id` | 考点过滤 | `knowledge_node_id = $n` |
+
+三个容易踩的点：
+
+1. **`%` `_` `\` 必须转义**（`escapeLikePattern()`）：不转义时搜「100%」会变成「任意字符串」、搜「a_b」会匹配「axb」。配 `ESCAPE '\'` 显式声明，不依赖默认行为。
+2. **空白关键字当没传**：`rawQ.trim().length > 0 ? rawQ.trim() : null`，否则 `ILIKE '%%'` 会多一次全表扫描。
+3. **顺手修了一个既有 bug**：`knowledgeNodeId` 原来从 query 读出来却**没传给仓储**，考点过滤实际一直失效。
+
+**前端 `lib/pages/question_picker_page.dart`**（新建）：
+
+| 能力 | 做法 |
+|---|---|
+| 搜索 | `CupertinoSearchTextField` + `Timer(300ms)` 防抖，不用 rxdart |
+| 分页 | 首屏 `limit=50`，`ScrollController` 剩余 < 400px 触发下一页；**`_hasMore` 只看服务器返回的原始条数**（` >= 50`），不看前端过滤后的条数，否则一过滤就误判没更多 |
+| 去重 | 翻页期间若有新题入库，同一条会出现在两页 → 追加时按 `id` 去重 |
+| 筛选 | 来源（全部/我导入的/公共题，本地 `isMine`）/ 题型（本地 `type`）/ 导入时间（本地 `created_at`；**`createdAt == null` 不匹配任何时间段**，避免时间不明的旧题混进「最近 7 天」） |
+| 空态 | 「没有匹配的题目，换个关键词试试」+「清空搜索与筛选」 |
+| 进度 | 搜索/翻页时列表顶部 3px 色条（`ColoredBox`，**不能用 `LinearProgressIndicator`——那是 Material**） |
+
+返回 `PickedQuestion{id, stem}`；右上「不关联」直接 `pop()`（无返回值 = 清空）。`defect_verify_page.dart` 的字段由 `FormTextField` 换成 `_QuestionSelector`：未选显示「选择题目（可选）」，已选显示题干前 30 字（`shortStem`）+「更换」「不关联」。提交仍走原 `_questionId.text`，提交路径没动。
+
+**集成测试**（`m21780：GET /questions 支持 q 与 knowledge_node_id 过滤`）有一条通用教训：**别写绝对条数断言**。该文件前 5 个用例已把 `sample-01-markdown.md` 的 12 道题导入同一科目，其中就有含「马克思主义」的题，断言「q 应该 3 条」实测 4 条；正确写法是先取基线、再断言「等于基线里含关键字的条数」。同理断言「没有泄漏」时要把公共资源排除在比较集合外，并加基数断言防止空集合假通过。
 ### 分发前四个阻塞项修复与考试配置（m18680）
 
 | 问题 | 真因（实测） | 修法 |
@@ -683,11 +714,12 @@ CREATE INDEX IF NOT EXISTS idx_q_owner
 
 ### 目录与依赖
 
-- `tillroad_app/lib/` 66 个 dart 文件：`main.dart` / `theme/` 1 / `config/` 3（`api_config`、`app_info`、`local_config`）/ `mock/` 2（`home_mock`、`defects_mock`）/ `api/` 6 / `logging/` 4 / `local/` 16（其中 `local/dao/` 5）/ `pages/` 22 / `widgets/` 11。
+- `tillroad_app/lib/` 67 个 dart 文件：`main.dart` / `theme/` 1 / `config/` 3（`api_config`、`app_info`、`local_config`）/ `mock/` 2（`home_mock`、`defects_mock`）/ `api/` 6 / `logging/` 4 / `local/` 16（其中 `local/dao/` 5）/ `pages/` 23 / `widgets/` 11。
 - 运行时依赖 `cupertino_icons` + `http` + `shared_preferences` + `share_plus` + `sqflite` + `path` + `file_picker`（后两个是本地优先 R1 引入、`file_picker` 是题库导入入口引入，见下节）；dev 依赖 `flutter_lints` + `flutter_launcher_icons` + `sqflite_common_ffi`（**仅测试用**，不进产物）。**无状态管理库、无路由库、无图表库、无 ORM、无 build_runner**。
 - ⚠️ `file_picker` 版本必须是 **^13.4.1**（不是 8.x）：8.x 依赖 `win32 ^5`，与 `share_plus 13.x`（`win32 ^6`）冲突，pub 解析不出来。13.x 的 API 也变了——`FilePicker.pickFiles(...)` 是**静态方法**直接返回 `List<PlatformFile>`（没有 `.platform`、没有 `FilePickerResult`），文件大小用 `await file.length()` 取、内容用 `await file.readAsBytes()` 取（没有 `size`/`bytes` 字段）。
 - 兼容平台：`android` / `ios` / `windows`（Windows 仅为本机开发期验证用，交付目标是移动端；**Windows 上不启用本地库**，见下节）。
-- 已知 `flutter analyze` 输出：**0 error / 0 warning / 68 info**（R1 前是 30 info，R1 新增 2 条、R2 新增 5 条、R4a 新增 14 条、R4b 新增 3 条、题库导入新增 3 条、m18680 新增 11 条，均为同一 `deprecated_member_use`）。全部 info 都是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「纯 Cupertino」的约束冲突。
+- 已知 `flutter analyze` 输出：**0 error / 0 warning / 56 info**（R1 前是 30 info；R1 +2、R2 +5、R4a +14、R4b +3、题库导入 +3、m18680 +11、§41 修完 13 条 warning 后为 55、题目选择器 +1）。全部 info 都是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「纯 Cupertino」的约束冲突。
+- **判断 analyze 结果时不要写死行的格式**：本机是 `warning - …`，CI 的机器可读格式是 `warning • …`。写死分隔符会漏判（这坑踩过，见 REVIEW-NOTES §41）。CI 的判据用 `grep -Eq '^[[:space:]]*(error|warning)[[:space:]]'`。
 
 ### 缺陷单界面（FE-03）
 
@@ -1083,7 +1115,8 @@ Select-String -Path tillroad_app\build\app\intermediates\merged_manifest\release
 - ✅ **本地优先 R4b**：修掉 R4a 的三个集成缺口。①**根因不是「写队列没接」**（五页早就有分支），而是 `kLocalFirstEnabled` 是个一票否决开关——本地库初始化失败一次就置 false，**整个 App（含写操作）静默退回直连云端**，用户看到「提交成功」其实请求打到了云端；R4b 拆出 **`kLocalDbReady`**（写路径判据）与 `kLocalFirstEnabled`（读路径判据）②详情页改用 `loadDefectTicketById`（`local_id = ? OR server_id = ?`）取代「拉全量再内存匹配」，修掉离线新建/推送回填/旧快照三种 id 对不上导致的「列表与详情不一致」③首页「今日待验证」改读本地真实任务（此前只渲染 mock）④写操作反馈措辞区分「已保存（联网后自动同步）」与「已提交」⑤新增启动一致性校验（本地 vs 云端 status 分布不一致 → warn + 全量对账）与三类埋点（`[QUEUE]` / `[PUSH]` / `[LOCAL]`）；`flutter test` **106/106**、`flutter analyze` 0 error / 54 info；Android 真机 E1 断网首页读本地 4 条 / E2 断网详情页本地命中 / E3 断网提交 V3 pass 入队（本地 CLOSED，队列 +1）/ E4 联网推送成功（`[PUSH] 提交验证成功，本地 status=CLOSED version=2`，队列清空）/ E7 adb 核对队列，7 张截图留证
 - ✅ **题库导入入口 + owner_user_id 多用户隔离（m17431）**：后端新增 `questions.owner_user_id`（独立幂等迁移 `migrations/0002_questions_owner.sql` + down 脚本，不改 `schema.sql`/0001）+ 查重按 owner 分域（单题/批量/更新三处）+ 组卷抽题限「公共题 + 自己的题」+ 新增只读端点 `GET /questions`（原先后端**没有**题库列表端点，items 不含 answer/analysis）+ 导入路由只认 token 映射的 userId（不信任请求体）；前端新增「我的 → 题库管理」入口 + `question_bank_page.dart`（按科目分组、默认最新在前）+ `question_import_page.dart`（file_picker 选文件 md/txt/csv/pdf/xlsx → 选科目 → 选考点可选 → base64 上传 → 结果页 imported/duplicates/errors + 413/422/415/400 分档人话提示）+ `question_api.dart`；唯一新依赖 `file_picker`（必须 ^13.4.1，8.x 与 `share_plus 13.x` 的 `win32` 版本冲突）；Neon 真库验证：A 导入 12 → B 导入同文件 12（**不判重**）→ A 再导入 0 新增/12 判重 → B 组卷抽题 **A 私有题 0 命中** → `GET /questions` A 私有题**泄漏给 B = 0**；Android 17 真机走通「我的 → 题库管理 → 导入 → 选文件 → 选科目 → 上传 → 新增 12 → 列表显示「我导入的」→ 再导入同文件判重 12」，7 张截图留证
 （`fe-import-50.png` / `fe-import-dupes.png` / `fe-exam-config.png` / `fe-exam-create.png` / `fe-subject-config.png` / `fe-knowledge-tree.png` / `fe-settings-danger.png` / `fe-delete-confirm.png`）
-- ✅ **四项阻塞项复核 + CI 接入 Flutter（m21159）**：先读源码盘点，四项（判重 / 重置语义与待验证残留 / 文件选择器 / 考试配置）**均已修**，本轮未再改业务代码。真正补的两件：①**真后端判重双向验证**（`imported 3 → 0`、`duplicates 0 → 3`，后端 `[IMPORT]` 四段日志同步印证，验完软删 3 道测试题不留垃圾）；②**CI 新增 `flutter-tests` job**（`subosito/flutter-action@v2` 钉 `3.50.0` → `pub get` → `analyze --no-fatal-infos` 并用 `grep -Eq '^\s+(error|warning)\s+-'` 硬拦 → `flutter test`），两个 `paths` 补 `tillroad_app/**`；YAML 用 `yaml` 包解析断言结构（3 job / steps 9·4·6）而非肉眼。新增截图 `fe-reset-home-empty.png`（全新空用户的首页三空态：无考试目标、待验证 0、缺陷 0）；`flutter analyze` 68 issues / **0 error / 0 warning**、`flutter test` **106/106**
+- ✅ **四项阻塞项复核 + CI 接入 Flutter（m21159）**：先读源码盘点，四项（判重 / 重置语义与待验证残留 / 文件选择器 / 考试配置）**均已修**，本轮未再改业务代码。真正补的两件：①**真后端判重双向验证**（`imported 3 → 0`、`duplicates 0 → 3`，后端 `[IMPORT]` 四段日志同步印证，验完软删 3 道测试题不留垃圾）；②**CI 新增 `flutter-tests` job**（`subosito/flutter-action@v2` 钉 `3.50.0` → `pub get` → `analyze --no-fatal-infos` 并用 `grep -Eq '^[[:space:]]*(error|warning)[[:space:]]'` 硬拦 → `flutter test`），两个 `paths` 补 `tillroad_app/**`；YAML 用 `yaml` 包解析断言结构（3 job / steps 9·4·6）而非肉眼。新增截图 `fe-reset-home-empty.png`（全新空用户的首页三空态：无考试目标、待验证 0、缺陷 0）；`flutter analyze` 55 issues / **0 error / 0 warning**、`flutter test` **106/106**
+- ✅ **CI 首次真跑修复（m21384）**：`flutter-tests` 真跑后暴露两类问题，**后端全部失败都是测试自身 bug、不是产品 bug**：①`questions.integration.test.mjs` 的 `after()` 只按 owner 删题，漏掉第 4 个用例插在 B 科目下的 2 道公共题 → `DELETE FROM subjects` 报 `23503 questions_subject_id_fkey`（修为「或位于这两个用户的科目下」）；②可见性用例拿 A 的全部题与 B 的全部题取交集，把公共题误判为泄漏（`2 !== 0`）→ 改为只比 **A 的私有题**并附基数断言；③修好前两个才浮出的第三个：`after()` 从未删 `mock_exams`，第 4 个用例建的模考记录引用 `exam_profiles` → `23503 mock_exams_exam_profile_id_fkey`（在删 `exam_profiles` 前补删）。另修 **13 条 Flutter warning**（`unnecessary_cast` ×2、`unused_import` ×4、`unused_shown_name` ×3、`unnecessary_non_null_assertion` ×4），并把 CI 的 grep 判据从写死 ` - ` 改为只认开头级别词、用 `PIPESTATUS[0]` 捕获 analyze 真退出码。验证用 PGlite（真实 Postgres WASM）**直接跑真实测试文件**（只替换一行 import）→ **5/5 通过**，正是这层揭出了第三个 FK bug；CI 判据用真 bash 跑 6 份日志（干净 PASS / `warning -` BLOCK / `warning •` BLOCK / 仅 info PASS / `error` BLOCK / 仅汇总行 PASS）。最终 `flutter analyze` 55 issues 0 error 0 warning、`flutter test` 106/106、`npm test` 321 tests / 194 pass / 0 fail / 127 skipped
 - ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两个节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）；⑥本地优先 R3 的增量对账尚未实现（后端需加 `updated_since` 或变更日志）；⑦R4a 的冲突只做「丢弃本地 + 以云端为准」，字段级自动仲裁与写队列的删除操作未做；⑧R4b 未做 dead 队列的 UI 管理入口（死信行只能在数据库里看），也未做删除操作的入队；⑨题库只有「导入 + 查看」，编辑/删除/按考点筛选与 AI 生成题入口都没做（题库本地缓存待 R5 拍板）；⑩「删除我的所有数据」只软删不物理删（数据仍在库里可恢复，合规的「彻底抹除」需物理删除与保留期策略）
 
 ---

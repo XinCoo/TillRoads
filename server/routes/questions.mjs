@@ -31,6 +31,9 @@ function resolve(ctx) {
 async function listQuestions(ctx) {
   const subjectId = ctx.searchParams.get('subject_id');
   const knowledgeNodeId = ctx.searchParams.get('knowledge_node_id');
+  // m21780：题干关键字。空串/纯空白当作没传，避免 `ILIKE '%%'` 白白走一次模糊匹配。
+  const rawQ = ctx.searchParams.get('q');
+  const q = rawQ && rawQ.trim().length > 0 ? rawQ.trim() : null;
 
   // limit/offset 复用 pagination（字符串→数字），非法值由仓储层 pageParams 兜底。
   const page = pagination(ctx.searchParams);
@@ -41,6 +44,8 @@ async function listQuestions(ctx) {
     offset: page.offset,
     ownerUserId: ctx.authUserId ?? null,
     subjectId: subjectId || null,
+    knowledgeNodeId: knowledgeNodeId || null,
+    q,
   });
 
   const items = rows.map((r) => ({

@@ -28,10 +28,8 @@ import 'package:sqflite/sqflite.dart';
 
 import 'dao/dao_base.dart';
 import 'dao/pending_operations_dao.dart';
-import 'dao/sync_table_dao.dart';
 import 'dao/table_daos.dart';
 import 'local_db.dart';
-import 'local_queries.dart';
 import 'local_state_machine.dart';
 
 /// 生成一个 v4 UUID（本地主键用）。

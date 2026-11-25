@@ -612,7 +612,7 @@ abstract final class PushEngine {
     if (raw is! Map) return null;
     final Map<String, Object?> map = raw.cast<String, Object?>();
     final Object? inner = map['ticket'];
-    if (inner is Map) return _intOf((inner as Map)['version']);
+    if (inner is Map) return _intOf(inner['version']);
     return _intOf(map['version']);
   }
 

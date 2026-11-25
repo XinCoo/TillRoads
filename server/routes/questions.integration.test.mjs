@@ -133,7 +133,24 @@ after(async () => {
   let cleanupFailure = null;
   try {
     // 删题（owner_user_id 指向 users，先删子表再删父表）
-    await c.query(`DELETE FROM questions WHERE owner_user_id IN ($1, $2)`, [seed.userA, seed.userB]);
+    // 删题：既删 A/B 名下的私有题，也要删掉挂在他们科目下的公共题
+    // （第 4 个用例往 seed.subjectB 里插了 2 道 owner_user_id IS NULL 的题，
+    //   只按 owner 删会漏掉它们，随后删 subjects 直接 23503 questions_subject_id_fkey）。
+    await c.query(
+      `DELETE FROM questions
+        WHERE owner_user_id IN ($1, $2)
+           OR subject_id IN (
+                SELECT s.id FROM subjects s
+                  JOIN exam_profiles p ON p.id = s.exam_profile_id
+                 WHERE p.user_id IN ($1, $2))`,
+      [seed.userA, seed.userB],
+    );
+    // 模考记录引用 exam_profiles（mock_exams_exam_profile_id_fkey），必须在删 exam_profiles
+    // 之前删掉。第 4 个用例 POST /mock-exams 建了 1 条，漏掉它 after() 会 23503。
+    await c.query(
+      `DELETE FROM mock_exams WHERE exam_profile_id IN (SELECT id FROM exam_profiles WHERE user_id IN ($1, $2))`,
+      [seed.userA, seed.userB],
+    );
     await c.query(
       `DELETE FROM subjects WHERE exam_profile_id IN (SELECT id FROM exam_profiles WHERE user_id IN ($1, $2))`,
       [seed.userA, seed.userB],
@@ -294,8 +311,116 @@ test('m17431：GET /questions 只返回「公共题 + 自己的题」', skipOpt,
     `B 只能看到自己的题和公共题，实际看到 ${JSON.stringify([...ownersB])}`,
   );
 
-  // A 的题不出现在 B 的列表里
-  const aIds = new Set(rA.data.items.map((q) => q.id));
-  const leaked = rB.data.items.filter((q) => aIds.has(q.id));
-  assert.equal(leaked.length, 0, 'B 的列表里不应出现 A 的题');
+  // A 的私有题不出现在 B 的列表里。
+  // 注意：公共题（owner_user_id IS NULL）本来就会同时出现在两边，不能算泄漏——
+  // 第 4 个用例就往 B 的科目里插了 2 道公共题，按「id 交集」直接比会误判 2 条。
+  const aPrivateIds = new Set(
+    rA.data.items.filter((q) => q.owner_user_id === seed.userA).map((q) => q.id),
+  );
+  assert.equal(aPrivateIds.size, 12, `A 应有 12 道私有题，实际 ${aPrivateIds.size}`);
+  const leaked = rB.data.items.filter((q) => aPrivateIds.has(q.id));
+  assert.equal(leaked.length, 0, 'B 的列表里不应出现 A 的私有题');
+});
+
+// ---------------------------------------------------------------------------
+// 6) m21780：GET /questions 的 q / knowledge_node_id 过滤
+// ---------------------------------------------------------------------------
+test('m21780：GET /questions 支持 q 与 knowledge_node_id 过滤', skipOpt, async () => {
+  const c = await pool.connect();
+  let nodeHit;
+  let nodeMiss;
+  try {
+    const mkNode = async (title) => {
+      const r = await c.query(
+        `INSERT INTO knowledge_nodes (subject_id, title, freq_tag)
+         VALUES ($1, $2, 'high') RETURNING id`,
+        [seed.subjectA, title],
+      );
+      return r.rows[0].id;
+    };
+    nodeHit = await mkNode('马克思主义哲学');
+    nodeMiss = await mkNode('逻辑填空');
+
+    // 3 道含「马克思主义」（2 道挂 nodeHit、1 道挂 nodeMiss），2 道不含。
+    // content_hash 必须唯一，否则撞 dedupe 的唯一索引（按 owner 分域）。
+    await c.query(
+      `INSERT INTO questions (source, subject_id, knowledge_node_id, type, stem, content_hash, owner_user_id, is_subjective)
+       VALUES ('manual', $1, $2, 'choice', '马克思主义哲学的直接理论来源是（ ）', 'hash-q-1', $4, false),
+              ('manual', $1, $2, 'choice', '马克思主义政治经济学的核心是（ ）', 'hash-q-2', $4, false),
+              ('manual', $1, $3, 'choice', '马克思主义中国化的第一次飞跃（ ）', 'hash-q-3', $4, false),
+              ('manual', $1, $3, 'choice', '逻辑填空：望洋兴叹的意思（ ）', 'hash-q-4', $4, false),
+              ('manual', $1, $2, 'choice', '图形推理的对称轴数量（ ）', 'hash-q-5', $4, false)`,
+      [seed.subjectA, nodeHit, nodeMiss, seed.userA],
+    );
+  } finally {
+    c.release();
+  }
+
+  // ═══ 断言口径：用「相对基线」，不用绝对条数 ═══
+  // 前 5 个用例已把 sample-01-markdown.md 的 12 道题导入 subjectA，其中就含
+  // 「马克思主义」字样的题；所以「搜马克思主义 = 3 条」这种绝对断言会随种子
+  // 文件内容变化而脆断。正确做法是先取基线，再断言「过滤结果 = 基线里满足
+  // 条件的那些」，这样既验证了过滤真的生效，又不依赖前置用例的副作用。
+  const rBase = await req('GET', '/questions?limit=200', undefined, TOKEN_A);
+  assert.equal(rBase.status, 200, JSON.stringify(rBase.data));
+  const baseItems = rBase.data.items;
+  const baseQ = baseItems.filter((it) => String(it.stem).includes('马克思主义'));
+
+  // 1) 只搜关键字
+  const qUrl = encodeURIComponent('马克思主义');
+  const rQ = await req('GET', `/questions?q=${qUrl}&limit=200`, undefined, TOKEN_A);
+  assert.equal(rQ.status, 200, JSON.stringify(rQ.data));
+  assert.equal(
+    rQ.data.items.length,
+    baseQ.length,
+    `q 过滤结果应等于基线中含关键字的条数（基线 ${baseQ.length}），实际 ${rQ.data.items.length}`,
+  );
+  for (const item of rQ.data.items) {
+    assert.ok(String(item.stem).includes('马克思主义'), `不应出现不含关键字的题：${item.stem}`);
+  }
+
+  // 2) 只按考点过滤（nodeHit 是本用例新建的考点，只有本轮 3 道新题挂它，
+  //    所以这里可以安全用绝对条数：2 道含关键字 + 1 道不含）
+  const rNode = await req('GET', `/questions?knowledge_node_id=${nodeHit}&limit=200`, undefined, TOKEN_A);
+  assert.equal(rNode.status, 200, JSON.stringify(rNode.data));
+  assert.equal(rNode.data.items.length, 3, `nodeHit 下应 3 条，实际 ${rNode.data.items.length}`);
+  for (const item of rNode.data.items) {
+    assert.equal(item.knowledge_node_id, nodeHit, 'knowledge_node_id 过滤失效');
+  }
+  // 反过来：nodeMiss 只能命中那 2 道
+  const rMiss = await req('GET', `/questions?knowledge_node_id=${nodeMiss}&limit=200`, undefined, TOKEN_A);
+  assert.equal(rMiss.status, 200, JSON.stringify(rMiss.data));
+  assert.equal(rMiss.data.items.length, 2, `nodeMiss 下应 2 条，实际 ${rMiss.data.items.length}`);
+
+  // 3) 两个参数组合：马克思主义 + nodeHit → 2 条
+  const rBoth = await req(
+    'GET',
+    `/questions?q=${qUrl}&knowledge_node_id=${nodeHit}&limit=200`,
+    undefined,
+    TOKEN_A,
+  );
+  assert.equal(rBoth.status, 200, JSON.stringify(rBoth.data));
+  assert.equal(rBoth.data.items.length, 2, `组合过滤应 2 条，实际 ${rBoth.data.items.length}`);
+
+  // 4) 空白 q 视同没传，返回全量（与基线一致）
+  const rAll = await req('GET', '/questions?q=%20%20&limit=200', undefined, TOKEN_A);
+  assert.equal(rAll.status, 200, JSON.stringify(rAll.data));
+  assert.equal(
+    rAll.data.items.length,
+    baseItems.length,
+    '空白 q 不应该过滤，应与基线全量一致',
+  );
+
+  // 5) 关键字按字面量匹配：搜「100%」不能因为 % 未转义而变成通配符
+  const rPct = await req('GET', `/questions?q=${encodeURIComponent('100%')}&limit=200`, undefined, TOKEN_A);
+  assert.equal(rPct.status, 200, JSON.stringify(rPct.data));
+  assert.equal(rPct.data.items.length, 0, '`%` 未被转义，LIKE 元字符泄漏成了通配符');
+
+  // 6) 底线：过滤结果里绝不能出现别人的私有题（回归 owner 隔离没被新参数破坏）
+  for (const item of [...rQ.data.items, ...rNode.data.items, ...rBoth.data.items]) {
+    assert.ok(
+      item.owner_user_id === null || item.owner_user_id === seed.userA,
+      `过滤结果里出现了不属于自己的题：owner=${item.owner_user_id}`,
+    );
+  }
 });

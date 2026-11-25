@@ -18,7 +18,6 @@ import 'package:flutter/cupertino.dart';
 
 import '../../api/api_client.dart';
 import '../../api/defect_api.dart';
-import '../../config/api_config.dart';
 import '../../logging/app_logger.dart';
 import '../../local/local.dart'
     show
@@ -27,12 +26,12 @@ import '../../local/local.dart'
         WriteQueue,
         WriteQueueResult,
         kLocalDataRevision,
-        kLocalDbReady,
-        kLocalFirstEnabled;
+        kLocalDbReady;
 import '../../theme/app_theme.dart';
 import '../../widgets/defect_badges.dart';
 import '../../widgets/form_field.dart';
 import '../mock/defects_mock.dart';
+import 'question_picker_page.dart' show PickedQuestion, QuestionPickerPage;
 
 class DefectVerifyPage extends StatefulWidget {
   const DefectVerifyPage({super.key, required this.ticket});
@@ -48,6 +47,10 @@ class _DefectVerifyPageState extends State<DefectVerifyPage> {
 
   final TextEditingController _evidence = TextEditingController();
   final TextEditingController _questionId = TextEditingController();
+
+  /// 已选题目（m21780）。只用来显示「已选：题干前 30 字」，
+  /// 真正提交的仍是 `_questionId.text`（保持原有提交路径不变）。
+  PickedQuestion? _picked;
 
   /// 当前阶段（V1/V2/V3），来自 ticket.status，不可选。
   String get _stage => widget.ticket.status.wire.toUpperCase();
@@ -82,6 +85,32 @@ class _DefectVerifyPageState extends State<DefectVerifyPage> {
         'V3' => 'V3 · 限时模考中稳定做对（时间压力下也不出错）。',
         _ => '',
       };
+  /// 打开题目选择器（m21780）。
+  ///
+  /// 原来这里是一格手输 UUID 的输入框 —— 人记不住 UUID，也没有地方能查到，
+  /// 所以它事实上永远是空的；而 question_id 是把「这次做错的题」与
+  /// 「同类错误」聚起来的唯一外键。现在改成从题库里挑。
+  Future<void> _openPicker() async {
+    final PickedQuestion? picked = await Navigator.of(context).push<PickedQuestion>(
+      appRoute<PickedQuestion>(
+        context,
+        QuestionPickerPage(
+          initialSelectedId: _questionId.text.trim().isEmpty ? null : _questionId.text.trim(),
+        ),
+      ),
+    );
+    if (!mounted) return;
+    setState(() {
+      if (picked == null) {
+        // 「不关联」：既有值也清掉，否则用户以为取消了其实还带着旧题。
+        _questionId.clear();
+        _picked = null;
+      } else {
+        _questionId.text = picked.id;
+        _picked = picked;
+      }
+    });
+  }
 
   bool _validate() {
     final Map<String, String> errors = <String, String>{};
@@ -332,11 +361,17 @@ class _DefectVerifyPageState extends State<DefectVerifyPage> {
         ),
 
         FormFieldGroup(
-          label: '关联题目 ID',
-          hint: '可选。填了就能在复盘里按题目聚合同类错误',
-          child: FormTextField(
-            controller: _questionId,
-            placeholder: '如：f47ac10b-58cc-4372-a567-0e02b2c3d479',
+          label: '关联题目',
+          hint: '可选。挑一道题后，复盘里就能按题目聚合同类错误',
+          child: _QuestionSelector(
+            picked: _picked,
+            onTap: _busy ? null : _openPicker,
+            onClear: _busy
+                ? null
+                : () => setState(() {
+                      _questionId.clear();
+                      _picked = null;
+                    }),
           ),
         ),
 
@@ -370,6 +405,107 @@ class _DefectVerifyPageState extends State<DefectVerifyPage> {
           ),
         ),
       ],
+    );
+  }
+}
+
+/// 关联题目选择器（m21780）：未选时是一行「选择题目（可选）」，已选时
+/// 显示题干前 30 字 + 「更换」/「不关联」。
+class _QuestionSelector extends StatelessWidget {
+  const _QuestionSelector({
+    required this.picked,
+    required this.onTap,
+    required this.onClear,
+  });
+
+  final PickedQuestion? picked;
+  final VoidCallback? onTap;
+  final VoidCallback? onClear;
+
+  @override
+  Widget build(BuildContext context) {
+    final PickedQuestion? value = picked;
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: AppColors.card,
+        borderRadius: BorderRadius.circular(AppRadii.chip + 2),
+        border: Border.all(color: AppColors.separator, width: 0.5),
+      ),
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      child: value == null
+          ? GestureDetector(
+              onTap: onTap,
+              behavior: HitTestBehavior.opaque,
+              child: Row(
+                children: <Widget>[
+                  const Icon(
+                    CupertinoIcons.search,
+                    size: 17,
+                    color: AppColors.accent,
+                  ),
+                  const SizedBox(width: 8),
+                  const Expanded(
+                    child: Text(
+                      '选择题目（可选）',
+                      style: TextStyle(
+                        fontFamily: kFontFamily,
+                        fontSize: 15,
+                        color: AppColors.accent,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            )
+          : Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  value.shortStem,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: const TextStyle(
+                    fontFamily: kFontFamily,
+                    fontSize: 15,
+                    height: 1.4,
+                    color: AppColors.label,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Row(
+                  children: <Widget>[
+                    CupertinoButton(
+                      padding: EdgeInsets.zero,
+                      minimumSize: const Size(0, 28),
+                      onPressed: onTap,
+                      child: const Text(
+                        '更换',
+                        style: TextStyle(
+                          fontFamily: kFontFamily,
+                          fontSize: 14,
+                          color: AppColors.accent,
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 16),
+                    CupertinoButton(
+                      padding: EdgeInsets.zero,
+                      minimumSize: const Size(0, 28),
+                      onPressed: onClear,
+                      child: const Text(
+                        '不关联',
+                        style: TextStyle(
+                          fontFamily: kFontFamily,
+                          fontSize: 14,
+                          color: AppColors.secondaryLabel,
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ],
+            ),
     );
   }
 }

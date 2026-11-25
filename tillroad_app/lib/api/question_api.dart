@@ -31,6 +31,7 @@ class BankQuestion {
     this.difficulty,
     this.isSubjective = false,
     this.isMine = false,
+    this.createdAt,
     this.options = const <String>[],
   });
 
@@ -45,6 +46,10 @@ class BankQuestion {
 
   /// true = 这是「我」导入的题（owner_user_id == 当前用户）；false = 公共题。
   final bool isMine;
+
+  /// 入题时间（列表按它倒序）。题库页的「最近 7 天 / 30 天」筛选要用，
+  /// 后端 `created_at` 缺失或不可解析时为 null（筛选时按「不在时间窗内」处理）。
+  final DateTime? createdAt;
 
   final List<String> options;
 
@@ -110,6 +115,7 @@ class BankQuestion {
       difficulty: _strOrNull(json['difficulty']),
       isSubjective: json['is_subjective'] == true,
       isMine: owner.isNotEmpty && owner == currentUserId,
+      createdAt: _dateOrNull(json['created_at']),
       options: _stringList(json['options']),
     );
   }
@@ -147,7 +153,7 @@ class ImportResult {
           .whereType<Map>()
           .map((Map m) => ImportDuplicate.fromJson(m.cast<String, Object?>()))
           .toList(growable: false),
-      errors: rawErrors.map((Object? e) => e is Map ? _str((e as Map)['message']) : '$e').toList(growable: false),
+      errors: rawErrors.map((Object? e) => e is Map ? _str(e['message']) : '$e').toList(growable: false),
       stats: _asMap(json['stats']),
     );
   }
@@ -176,11 +182,16 @@ class QuestionApi {
 
   final ApiClient _client;
 
+  /// 释放底层 HTTP client（页面 dispose 时调）。
+  void close() => _client.close();
+
   /// 题库列表：`GET /questions?subject_id=&limit=&offset=`。
   ///
   /// 后端只返回「公共题 + 当前 token 用户自己的题」，别人的私有题不可见。
   Future<List<BankQuestion>> fetchQuestions({
     String? subjectId,
+    String? knowledgeNodeId,
+    String? q,
     int limit = 50,
     int offset = 0,
     String? currentUserId,
@@ -189,6 +200,11 @@ class QuestionApi {
       '/questions',
       query: <String, String>{
         if (subjectId != null && subjectId.isNotEmpty) 'subject_id': subjectId,
+        if (knowledgeNodeId != null && knowledgeNodeId.isNotEmpty)
+          'knowledge_node_id': knowledgeNodeId,
+        // m21780：题干关键字由后端 ILIKE 过滤（已做 LIKE 元字符转义），
+        // 空白串不当参数传，免得白白走一次 `ILIKE '%%'`。
+        if (q != null && q.trim().isNotEmpty) 'q': q.trim(),
         'limit': '$limit',
         'offset': '$offset',
       },
@@ -234,6 +250,13 @@ String _str(Object? v) => v == null ? '' : '$v';
 String? _strOrNull(Object? v) {
   final String s = _str(v).trim();
   return s.isEmpty ? null : s;
+}
+
+/// 时间解析：后端给的是 ISO 8601 字符串，解析失败返回 null（不抛，不让一条烂数据拖死整页）。
+DateTime? _dateOrNull(Object? v) {
+  final String s = _str(v).trim();
+  if (s.isEmpty) return null;
+  return DateTime.tryParse(s)?.toLocal();
 }
 
 int _int(Object? v, int fallback) {

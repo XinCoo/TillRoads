@@ -221,12 +221,20 @@ jobs:
 
       - name: Analyze (0 error / 0 warning)
         run: |
-          set -o pipefail
+          set +e
           flutter analyze --no-fatal-infos 2>&1 | tee /tmp/analyze.log
+          ANALYZE_EXIT=${PIPESTATUS[0]}
+          set -e
           # --no-fatal-infos 只让 info 不致命；error / warning 仍必须为 0。
-          if grep -Eq '^\s+(error|warning)\s+-' /tmp/analyze.log; then
+          # 分隔符在不同版本/平台上可能是 `-`、`•` 或 `?`，不要写死，只认开头的级别词。
+          if grep -Eq '^[[:space:]]*(error|warning)[[:space:]]' /tmp/analyze.log; then
             echo "::error::flutter analyze 存在 error 或 warning"
+            grep -E '^[[:space:]]*(error|warning)[[:space:]]' /tmp/analyze.log
             exit 1
+          fi
+          if [ "$ANALYZE_EXIT" -ne 0 ]; then
+            echo "::error::flutter analyze 退出码 $ANALYZE_EXIT（无 error/warning 行，可能是依赖或版本问题）"
+            exit "$ANALYZE_EXIT"
           fi
 
       - name: Widget + unit tests

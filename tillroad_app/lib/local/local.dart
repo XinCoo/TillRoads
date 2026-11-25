@@ -111,5 +111,4 @@ export 'push_engine.dart'
         PushScheduler,
         kPushBackoffCapSeconds,
         kPushBackoffBaseSeconds,
-        kPushMaxRetry,
-        stripInternalKeys;
+        kPushMaxRetry;
