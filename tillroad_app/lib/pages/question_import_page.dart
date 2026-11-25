@@ -41,6 +41,16 @@ import '../widgets/common.dart' show SectionHeader;
 /// 后端限制：单文件最大 10MB。
 const int kMaxImportBytes = 10 * 1024 * 1024;
 
+/// 导入用的请求超时（秒）。
+///
+/// 50 题在 Neon 冷启动下实测要 20s+，所以导入单独放宽到 60s，
+/// 不动全局 `kApiTimeout`（其他端点仍要快速失败）。
+const int _importTimeoutSeconds = 60;
+
+/// 「大文件」阈值：超过这个体积就提前提醒用户拆分，
+/// 免得等上传完才看到 413。
+const int kLargeImportBytes = 2 * 1024 * 1024;
+
 /// 支持的文件类型（与后端 extract.mjs 的分派一致）。
 ///
 /// m18680 C1：补上 `markdown` —— 不少编辑器/导出工具存的是 `.markdown` 后缀，
@@ -53,6 +63,14 @@ const List<String> kSupportedExtensions = <String>[
   'pdf',
   'xlsx',
 ];
+
+/// 导入的三个阶段。
+///
+/// 后端 `POST /questions/import` 是**一次性同步接口**：没有 job id，
+/// 也没有进度查询端点（本轮不建 import_jobs 表），
+/// 所以进度只能在客户端分成三段呈现：
+/// [encoding] 本地读文件 + base64 编码 → [processing] 服务端解析/切题/入库 → [done]。
+enum ImportStage { encoding, processing, done }
 
 class QuestionImportPage extends StatefulWidget {
   const QuestionImportPage({super.key});
@@ -95,6 +113,13 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
   bool _uploading = false;
   ImportResult? _result;
   String? _error;
+
+  /// 导入的三个阶段（m23700 拍板「客户端进度 + 预检提示」）。
+  ///
+  /// 后端是一次性同步接口，没有进度查询端点（也不建 import_jobs 表），
+  /// 所以客户端只能把「本地编码」和「服务端处理」分成两段显示：
+  /// 读文件 + base64 编码是本地耗时，请求发出后是服务端耗时。
+  ImportStage? _stage;
 
   @override
   void initState() {
@@ -219,10 +244,14 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
       _uploading = true;
       _error = null;
       _result = null;
+      _stage = ImportStage.encoding;
     });
 
     try {
       final String base64 = await _readBase64(file);
+      if (!mounted) return;
+      // 字节已读完、请求即将发出：后面都是服务端的时间。
+      setState(() => _stage = ImportStage.processing);
       final ImportResult result = await _api.importQuestions(
         filename: file.name,
         contentBase64: base64,
@@ -240,12 +269,14 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
       setState(() {
         _error = _friendlyError(e);
         _uploading = false;
+        _stage = null;
       });
     } catch (e) {
       if (!mounted) return;
       setState(() {
         _error = '导入失败：$e';
         _uploading = false;
+        _stage = null;
       });
     }
   }
@@ -279,6 +310,13 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
         return '文件内容读取失败，请重新选择文件。';
       }
       return '导入失败，请检查题号格式（例如「1.」「第1题」「1、」）。';
+    }
+    // 超时是最容易让用户误判的一种失败：服务端可能已经把题写进去了，
+    // 只是响应没在 60s 内回来。此时再让用户「重试」只会得到一堆「判重」。
+    if (code == 0 && e.message.contains('超时')) {
+      return '这次导入超时了（${_importTimeoutSeconds}s 没等到服务端回应）。\n'
+          '但服务端可能已经写入了部分或全部题目，请先到题库页确认，'
+          '确认后再决定要不要重传。';
     }
     return e.message;
   }
@@ -380,6 +418,18 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
                   color: AppColors.secondaryLabel,
                 ),
               ),
+              // 大文件预检（m23700 拍板「客户端进度 + 预检提示」）：
+              // 超过 2MB 就先提醒「建议拆分 + 会更慢」，不用等上传完才看到 413。
+              if (_fileBytes > kLargeImportBytes) ...<Widget>[
+                const SizedBox(height: 8),
+                _ImportNotice(
+                  icon: CupertinoIcons.exclamationmark_triangle,
+                  color: AppColors.dueSoon,
+                  text: '这个文件 ${_sizeLabel(_fileBytes)}，属于大文件。'
+                      '导入会明显变慢（base64 上传体积约多三成），'
+                      '建议先按题号拆成几份再导。',
+                ),
+              ],
               const SizedBox(height: 8),
               // m18680 C2：系统选择器按 MIME 过滤时 `.md` 可能变灰选不到，
               // 这里给一条不依赖 MIME 的通道：不过滤任何类型，选完自己按扩展名判。
@@ -466,16 +516,8 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
                 ),
         ),
         if (_uploading) ...<Widget>[
-          const SizedBox(height: 10),
-          const Text(
-            '正在编码并上传，大文件可能需要几秒…',
-            textAlign: TextAlign.center,
-            style: TextStyle(
-              fontFamily: kFontFamily,
-              fontSize: 12,
-              color: AppColors.secondaryLabel,
-            ),
-          ),
+          const SizedBox(height: 12),
+          _ImportProgress(stage: _stage),
         ],
       ],
     );
@@ -866,6 +908,109 @@ class _CardBox extends StatelessWidget {
         ],
       ),
       child: child,
+    );
+  }
+}
+
+/// 导入三段进度提示（m23700）。
+///
+/// 后端没有进度查询端点，所以这里只能把「本地编码」与「服务端处理」
+/// 分开显示；具体百分比拿不到，就不假装有。
+class _ImportProgress extends StatelessWidget {
+  const _ImportProgress({this.stage});
+
+  final ImportStage? stage;
+
+  @override
+  Widget build(BuildContext context) {
+    final bool encoding = stage == ImportStage.encoding;
+    final String title = encoding ? '正在读取并编码文件…' : '服务端正在解析与入库…';
+    final String hint = encoding
+        ? '这一步在手机本地做，base64 会让体积多约三成。'
+        : '解析、切题、判重、入库都在后端完成，大文件可能要等一会儿。';
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: AppColors.accent.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(AppRadii.card),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          const CupertinoActivityIndicator(radius: 9),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                Text(
+                  title,
+                  style: const TextStyle(
+                    fontFamily: kFontFamily,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.label,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  hint,
+                  style: const TextStyle(
+                    fontFamily: kFontFamily,
+                    fontSize: 12,
+                    height: 1.4,
+                    color: AppColors.secondaryLabel,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+/// 预检提示（颜色可调）。
+class _ImportNotice extends StatelessWidget {
+  const _ImportNotice({
+    required this.icon,
+    required this.color,
+    required this.text,
+  });
+
+  final IconData icon;
+  final Color color;
+  final String text;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(12),
+      decoration: BoxDecoration(
+        color: color.withValues(alpha: 0.10),
+        borderRadius: BorderRadius.circular(AppRadii.chip),
+      ),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          Icon(icon, size: 16, color: color),
+          const SizedBox(width: 8),
+          Expanded(
+            child: Text(
+              text,
+              style: const TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 12,
+                height: 1.4,
+                color: AppColors.label,
+              ),
+            ),
+          ),
+        ],
+      ),
     );
   }
 }

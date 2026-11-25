@@ -424,3 +424,245 @@ test('m21780：GET /questions 支持 q 与 knowledge_node_id 过滤', skipOpt, a
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// 6) m23700（FE-02）：手动建题 / 编辑 / 删除
+//    为什么必须连真库：查重命中 409、乐观锁 409、owner 门禁 404 这三件事
+//    依赖 questions 表真的写了 owner_user_id / version / deleted_at，fake 仓储伪造不出。
+// ---------------------------------------------------------------------------
+test('m23700：POST /questions 手动建题 -> 201，source=manual、owner=自己、version=1', skipOpt, async () => {
+  const r = await req(
+    'POST',
+    '/questions',
+    {
+      subject_id: seed.subjectA,
+      type: 'choice',
+      stem: '手动建题：下列说法正确的是哪一个？',
+      // 两种选项写法都要能进：字符串形式会被归一成 {key,text}
+      options: ['A. 甲说法', 'B、乙说法', 'C 丙说法'],
+      answer: 'A',
+      analysis: '乙、丙两说法与题干条件矛盾。',
+      difficulty: 'medium',
+      tags: ['手动', '  ', '测试'],
+      is_subjective: false,
+    },
+    TOKEN_A,
+  );
+
+  assert.equal(r.status, 201, JSON.stringify(r.data));
+  assert.equal(r.data.source, 'manual', 'source 必须被强制为 manual');
+  assert.equal(r.data.owner_user_id, seed.userA, 'owner 必须取自 token');
+  assert.equal(r.data.version, 1);
+  assert.equal(r.data.subject_id, seed.subjectA);
+  assert.equal(r.data.answer, 'A');
+  assert.equal(r.data.analysis, '乙、丙两说法与题干条件矛盾。');
+  assert.equal(r.data.difficulty, 'medium');
+  assert.equal(r.data.is_subjective, false);
+  assert.deepEqual(r.data.tags, ['手动', '测试'], 'tags 应剔空串');
+  assert.equal(r.data.options.length, 3);
+  assert.deepEqual(r.data.options[0], { key: 'A', text: '甲说法' });
+  assert.deepEqual(r.data.options[1], { key: 'B', text: '乙说法' });
+  assert.deepEqual(r.data.options[2], { key: 'C', text: '丙说法' });
+  assert.ok(r.data.content_hash, 'content_hash 应由服务端算出');
+  assert.ok(r.data.id);
+});
+
+test('m23700：手动建题缺字段 / 值域非法 -> 400 且错误码明确', skipOpt, async () => {
+  const noStem = await req(
+    'POST',
+    '/questions',
+    { subject_id: seed.subjectA, type: 'choice' },
+    TOKEN_A,
+  );
+  assert.equal(noStem.status, 400, JSON.stringify(noStem.data));
+  assert.equal(noStem.data.error, 'MISSING_QUESTION_STEM');
+
+  const noType = await req(
+    'POST',
+    '/questions',
+    { subject_id: seed.subjectA, stem: '缺题型的手动题' },
+    TOKEN_A,
+  );
+  assert.equal(noType.status, 400, JSON.stringify(noType.data));
+  assert.equal(noType.data.error, 'MISSING_QUESTION_TYPE');
+
+  const badType = await req(
+    'POST',
+    '/questions',
+    { subject_id: seed.subjectA, type: 'cloud', stem: '题型不存在' },
+    TOKEN_A,
+  );
+  assert.equal(badType.status, 400, JSON.stringify(badType.data));
+  assert.equal(badType.data.error, 'INVALID_QUESTION_TYPE');
+
+  const badDifficulty = await req(
+    'POST',
+    '/questions',
+    { subject_id: seed.subjectA, type: 'choice', stem: '难度值不对', difficulty: '0.5' },
+    TOKEN_A,
+  );
+  assert.equal(badDifficulty.status, 400, JSON.stringify(badDifficulty.data));
+  assert.equal(badDifficulty.data.error, 'INVALID_DIFFICULTY');
+
+  // 未鉴权建题必须 401（否则任何人可往公共题库塞题）
+  const noToken = await req('POST', '/questions', {
+    subject_id: seed.subjectA,
+    type: 'choice',
+    stem: '匿名建题',
+  });
+  assert.equal(noToken.status, 401, JSON.stringify(noToken.data));
+});
+
+test('m23700：同样题干再建一次 -> 409 DUPLICATE_QUESTION（按 owner 分域）', skipOpt, async () => {
+  const payload = {
+    subject_id: seed.subjectA,
+    type: 'choice',
+    stem: '判重题：同一题干连续提交两次',
+  };
+  const first = await req('POST', '/questions', payload, TOKEN_A);
+  assert.equal(first.status, 201, JSON.stringify(first.data));
+
+  const second = await req('POST', '/questions', payload, TOKEN_A);
+  assert.equal(second.status, 409, JSON.stringify(second.data));
+  assert.equal(second.data.error, 'DUPLICATE_QUESTION');
+  assert.equal(second.data.current.id, first.data.id, '409 应带上已有题便于前端展示');
+
+  // 换个 owner 建同样的题不应被判重
+  const other = await req('POST', '/questions', payload, TOKEN_B);
+  assert.equal(other.status, 201, JSON.stringify(other.data));
+  assert.notEqual(other.data.id, first.data.id);
+});
+
+test('m23700：PATCH /questions/:id 改题干后重算 hash；version 不符 -> 409；走旧 version -> 409', skipOpt, async () => {
+  const created = await req(
+    'POST',
+    '/questions',
+    { subject_id: seed.subjectA, type: 'choice', stem: '待编辑题：原始题干', answer: 'A' },
+    TOKEN_A,
+  );
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const { id, version, content_hash: hash1 } = created.data;
+
+  const patched = await req(
+    'PATCH',
+    `/questions/${id}`,
+    { version, stem: '待编辑题：改过的题干', analysis: '补充解析' },
+    TOKEN_A,
+  );
+  assert.equal(patched.status, 200, JSON.stringify(patched.data));
+  assert.equal(patched.data.stem, '待编辑题：改过的题干');
+  assert.equal(patched.data.analysis, '补充解析');
+  assert.equal(patched.data.version, version + 1, '成功编辑 version 应 +1');
+  assert.notEqual(patched.data.content_hash, hash1, '改题干必须重算 content_hash');
+  assert.equal(patched.data.answer, 'A', '没传的字段不能被清空');
+
+  const stale = await req(
+    'PATCH',
+    `/questions/${id}`,
+    { version, stem: '待编辑题：又改一次' },
+    TOKEN_A,
+  );
+  assert.equal(stale.status, 409, JSON.stringify(stale.data));
+  assert.equal(stale.data.error, 'conflict');
+  assert.equal(stale.data.current.version, version + 1);
+  assert.equal(stale.data.resolution, 'client_merge');
+
+  const noVersion = await req('PATCH', `/questions/${id}`, { stem: '没带 version' }, TOKEN_A);
+  assert.equal(noVersion.status, 400, JSON.stringify(noVersion.data));
+  assert.equal(noVersion.data.error, 'INVALID_BASE_VERSION');
+
+  const emptyPatch = await req('PATCH', `/questions/${id}`, { version: version + 1 }, TOKEN_A);
+  assert.equal(emptyPatch.status, 400, JSON.stringify(emptyPatch.data));
+  assert.equal(emptyPatch.data.error, 'empty_patch');
+});
+
+test('m23700：GET /questions/:id 可见性；别人的私有题 / 公共题 -> 404', skipOpt, async () => {
+  const mine = await req(
+    'POST',
+    '/questions',
+    { subject_id: seed.subjectA, type: 'fill', stem: '单题详情：只有出题人看得到' },
+    TOKEN_A,
+  );
+  assert.equal(mine.status, 201, JSON.stringify(mine.data));
+  const id = mine.data.id;
+
+  const own = await req('GET', `/questions/${id}`, undefined, TOKEN_A);
+  assert.equal(own.status, 200, JSON.stringify(own.data));
+  assert.equal(own.data.id, id);
+  assert.equal(own.data.owner_user_id, seed.userA);
+
+  // 别人的私有题：404（不用 403，避免枚举）
+  const other = await req('GET', `/questions/${id}`, undefined, TOKEN_B);
+  assert.equal(other.status, 404, JSON.stringify(other.data));
+
+  // 公共题（owner_user_id IS NULL）对所有人可见，但不是「我的题」，不能改
+  const c = await pool.connect();
+  let publicId;
+  try {
+    const ins = await c.query(
+      `INSERT INTO questions (source, subject_id, type, stem, content_hash, is_subjective)
+       VALUES ('manual', $1, 'choice', '公共题：任何人都能看到', 'hash-m23700-public', false)
+       RETURNING id`,
+      [seed.subjectA],
+    );
+    publicId = ins.rows[0].id;
+  } finally {
+    c.release();
+  }
+
+  const readPublic = await req('GET', `/questions/${publicId}`, undefined, TOKEN_A);
+  assert.equal(readPublic.status, 200, JSON.stringify(readPublic.data));
+  assert.equal(readPublic.data.owner_user_id, null);
+
+  const patchPublic = await req('PATCH', `/questions/${publicId}`, { version: 1, stem: '改公共题' }, TOKEN_A);
+  assert.equal(patchPublic.status, 404, JSON.stringify(patchPublic.data));
+
+  const missing = await req('GET', '/questions/00000000-0000-4000-8000-000000000000', undefined, TOKEN_A);
+  assert.equal(missing.status, 404, JSON.stringify(missing.data));
+});
+
+test('m23700：DELETE /questions/:id 软删；删后列表不再出现、可重新建同题干', skipOpt, async () => {
+  const created = await req(
+    'POST',
+    '/questions',
+    {
+      subject_id: seed.subjectA,
+      type: 'choice',
+      stem: '待删除题：删完应该能重建同一题干',
+    },
+    TOKEN_A,
+  );
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+  const { id, version } = created.data;
+
+  const del = await req('DELETE', `/questions/${id}`, { version }, TOKEN_A);
+  assert.equal(del.status, 200, JSON.stringify(del.data));
+  assert.equal(del.data.deleted, true);
+  assert.equal(del.data.id, id);
+
+  const gone = await req('GET', `/questions/${id}`, undefined, TOKEN_A);
+  assert.equal(gone.status, 404, JSON.stringify(gone.data));
+
+  const listed = await req('GET', '/questions?limit=200', undefined, TOKEN_A);
+  assert.equal(listed.status, 200, JSON.stringify(listed.data));
+  assert.ok(!listed.data.items.some((q) => q.id === id), '软删的题不应出现在列表里');
+
+  // 软删后同 hash 可以重新建（查重只看 deleted_at IS NULL）
+  const again = await req(
+    'POST',
+    '/questions',
+    { subject_id: seed.subjectA, type: 'choice', stem: '待删除题：删完应该能重建同一题干' },
+    TOKEN_A,
+  );
+  assert.equal(again.status, 201, JSON.stringify(again.data));
+  assert.notEqual(again.data.id, id);
+
+  // 重复删除同一个 id -> 404（已软删 = 不存在）
+  const delAgain = await req('DELETE', `/questions/${id}`, { version: version + 1 }, TOKEN_A);
+  assert.equal(delAgain.status, 404, JSON.stringify(delAgain.data));
+
+  // 删别人的题 -> 404
+  const delOther = await req('DELETE', `/questions/${again.data.id}`, { version: 1 }, TOKEN_B);
+  assert.equal(delOther.status, 404, JSON.stringify(delOther.data));
+});
+

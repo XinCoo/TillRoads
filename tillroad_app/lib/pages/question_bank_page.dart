@@ -30,8 +30,8 @@ import '../api/question_api.dart';
 import '../config/api_config.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart' show EmptyState, SectionHeader;
+import 'question_edit_page.dart';
 import 'question_import_page.dart';
-
 class QuestionBankPage extends StatefulWidget {
   const QuestionBankPage({super.key});
 
@@ -120,6 +120,240 @@ class _QuestionBankPageState extends State<QuestionBankPage> {
     if (changed == true) await _load();
   }
 
+  /// 新建题目（FE-02）。建完回来刷新列表。
+  Future<void> _openCreate() async {
+    final bool? created = await Navigator.of(context).push<bool>(
+      appRoute<bool>(context, const QuestionEditPage()),
+    );
+    if (created == true) await _load();
+  }
+
+  /// 打开一道已有题的编辑页。
+  ///
+  /// 列表口径的 [BankQuestion] 不带 answer / analysis / version，
+  /// 所以先拉详情（`GET /questions/:id`）再进编辑页；
+  /// 顺带这一步也是「这题还在不在」的一次确认 —— 后端对别人的私有题返回 404。
+  Future<void> _openEdit(BankQuestion question) async {
+    try {
+      final QuestionDetail detail = await _api.fetchQuestion(question.id);
+      if (!mounted) return;
+      final bool? changed = await Navigator.of(context).push<bool>(
+        appRoute<bool>(context, QuestionEditPage(existing: detail)),
+      );
+      if (changed == true) await _load();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      await _showMessage('打不开这道题', e.message);
+    } catch (e) {
+      if (!mounted) return;
+      await _showMessage('打不开这道题', '加载详情失败：$e');
+    }
+  }
+
+  /// 卡片上的「⋯」：编辑 / 删除。
+  ///
+  /// 删除要带 version（乐观锁），而列表没有这个字段，
+  /// 所以删除前先拉一次详情拿 version —— 顺带避免「拿旧 version 去删」被判 409。
+  Future<void> _openActions(BankQuestion question) async {
+    final String? action = await showCupertinoModalPopup<String>(
+      context: context,
+      builder: (BuildContext ctx) {
+        return CupertinoActionSheet(
+          title: const Text(
+            '题目操作',
+            style: TextStyle(fontFamily: kFontFamily, fontSize: 14),
+          ),
+          message: Text(
+            question.preview,
+            style: const TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 13,
+              color: AppColors.secondaryLabel,
+            ),
+          ),
+          actions: <Widget>[
+            CupertinoActionSheetAction(
+              onPressed: () => Navigator.of(ctx).pop('edit'),
+              child: const Text(
+                '编辑',
+                style: TextStyle(
+                  fontFamily: kFontFamily,
+                  fontSize: 17,
+                  color: AppColors.accent,
+                ),
+              ),
+            ),
+            CupertinoActionSheetAction(
+              isDestructiveAction: true,
+              onPressed: () => Navigator.of(ctx).pop('delete'),
+              child: const Text(
+                '删除',
+                style: TextStyle(
+                  fontFamily: kFontFamily,
+                  fontSize: 17,
+                  color: AppColors.overdue,
+                ),
+              ),
+            ),
+          ],
+          cancelButton: CupertinoActionSheetAction(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text(
+              '取消',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 17,
+                fontWeight: FontWeight.w600,
+                color: AppColors.accent,
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    if (!mounted) return;
+    if (action == 'edit') {
+      await _openEdit(question);
+      return;
+    }
+    if (action == 'delete') {
+      await _deleteQuestion(question);
+    }
+  }
+
+  Future<void> _deleteQuestion(BankQuestion question) async {
+    final bool confirmed = await _confirmDelete(question);
+    if (!confirmed || !mounted) return;
+    try {
+      final QuestionDetail detail = await _api.fetchQuestion(question.id);
+      await _api.deleteQuestion(id: detail.id, version: detail.version);
+      if (!mounted) return;
+      await _showMessage('已删除', '这道题已从题库移除。');
+      await _load();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      final Object? body = e.body;
+      final String code = body is Map && body['error'] != null
+          ? '${body['error']}'
+          : '';
+      if (code == 'not_found') {
+        await _showMessage(
+          '删不掉',
+          '只能删除自己建的题。公共题和别人的题不能删。',
+        );
+      } else if (code == 'conflict') {
+        await _showMessage(
+          '删除失败',
+          '这道题在你打开期间被改过，请刷新列表后再试。',
+        );
+      } else {
+        await _showMessage('删除失败', e.message);
+      }
+    } catch (e) {
+      if (!mounted) return;
+      await _showMessage('删除失败', '请求失败：$e');
+    }
+  }
+
+  Future<bool> _confirmDelete(BankQuestion question) async {
+    final bool? ok = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) {
+        return CupertinoAlertDialog(
+          title: const Text(
+            '删除这道题？',
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 17,
+              fontWeight: FontWeight.w600,
+              color: AppColors.overdue,
+            ),
+          ),
+          content: Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(
+              '删除后题库里就看不到它了。',
+              style: const TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 13,
+                color: AppColors.secondaryLabel,
+              ),
+            ),
+          ),
+          actions: <Widget>[
+            CupertinoDialogAction(
+              onPressed: () => Navigator.of(ctx).pop(false),
+              child: const Text(
+                '取消',
+                style: TextStyle(
+                  fontFamily: kFontFamily,
+                  fontSize: 17,
+                  color: AppColors.accent,
+                ),
+              ),
+            ),
+            CupertinoDialogAction(
+              isDestructiveAction: true,
+              onPressed: () => Navigator.of(ctx).pop(true),
+              child: const Text(
+                '删除',
+                style: TextStyle(
+                  fontFamily: kFontFamily,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w600,
+                  color: AppColors.overdue,
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+    return ok == true;
+  }
+
+  Future<void> _showMessage(String title, String message) {
+    return showCupertinoDialog<void>(
+      context: context,
+      builder: (BuildContext ctx) {
+        return CupertinoAlertDialog(
+          title: Text(
+            title,
+            style: const TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 17,
+              fontWeight: FontWeight.w600,
+            ),
+          ),
+          content: Padding(
+            padding: const EdgeInsets.only(top: 6),
+            child: Text(
+              message,
+              style: const TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 13,
+                color: AppColors.secondaryLabel,
+              ),
+            ),
+          ),
+          actions: <Widget>[
+            CupertinoDialogAction(
+              onPressed: () => Navigator.of(ctx).pop(),
+              child: const Text(
+                '好',
+                style: TextStyle(
+                  fontFamily: kFontFamily,
+                  fontSize: 17,
+                  color: AppColors.accent,
+                ),
+              ),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return CupertinoPageScaffold(
@@ -139,18 +373,36 @@ class _QuestionBankPageState extends State<QuestionBankPage> {
                 color: AppColors.label,
               ),
             ),
-            trailing: CupertinoButton(
-              padding: EdgeInsets.zero,
-              minimumSize: const Size(36, 36),
-              onPressed: _openImport,
-              child: const Text(
-                '导入',
-                style: TextStyle(
-                  fontFamily: kFontFamily,
-                  fontSize: 17,
-                  color: AppColors.accent,
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  minimumSize: const Size(36, 36),
+                  onPressed: _openCreate,
+                  child: const Text(
+                    '建题',
+                    style: TextStyle(
+                      fontFamily: kFontFamily,
+                      fontSize: 17,
+                      color: AppColors.accent,
+                    ),
+                  ),
                 ),
-              ),
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  minimumSize: const Size(36, 36),
+                  onPressed: _openImport,
+                  child: const Text(
+                    '导入',
+                    style: TextStyle(
+                      fontFamily: kFontFamily,
+                      fontSize: 17,
+                      color: AppColors.accent,
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
           ..._buildBody(),
@@ -185,9 +437,9 @@ class _QuestionBankPageState extends State<QuestionBankPage> {
           child: EmptyState(
             icon: CupertinoIcons.doc_text,
             title: '还没有题目',
-            message: '还没有题目，点右上角导入',
-            actionLabel: '导入题目',
-            onAction: _openImport,
+            message: '还没有题目。点右上角「建题」手动录一道，或用「导入」批量灌题。',
+            actionLabel: '建第一道题',
+            onAction: _openCreate,
           ),
         ),
       ];
@@ -231,7 +483,11 @@ class _QuestionBankPageState extends State<QuestionBankPage> {
               for (final BankQuestion q in entry.value)
                 Padding(
                   padding: const EdgeInsets.only(bottom: 8),
-                  child: _QuestionCard(question: q),
+                  child: _QuestionCard(
+                    question: q,
+                    onTap: () => _openEdit(q),
+                    onMore: () => _openActions(q),
+                  ),
                 ),
             ],
           ),
@@ -248,13 +504,51 @@ class _QuestionBankPageState extends State<QuestionBankPage> {
 
 /// 一道题的卡片：题干前两行 + 题型徽标 + 来源徽标 + 「我的」标记。
 class _QuestionCard extends StatelessWidget {
-  const _QuestionCard({required this.question});
+  const _QuestionCard({
+    required this.question,
+    this.onTap,
+    this.onMore,
+  });
 
   final BankQuestion question;
+  final VoidCallback? onTap;
+  final VoidCallback? onMore;
 
   @override
   Widget build(BuildContext context) {
-    return Container(
+    // 题干 + 徽标。
+    final Widget content = Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: <Widget>[
+        Text(
+          question.preview,
+          style: const TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 15,
+            height: 1.4,
+            color: AppColors.label,
+          ),
+        ),
+        const SizedBox(height: 10),
+        Row(
+          children: <Widget>[
+            _Tag(text: question.typeLabel, color: AppColors.accent),
+            const SizedBox(width: 6),
+            _Tag(text: question.sourceLabel, color: AppColors.secondaryLabel),
+            if (question.isMine) ...<Widget>[
+              const SizedBox(width: 6),
+              // 手动建题（FE-02）不是「导入」来的，别混用同一个标签。
+              _Tag(
+                text: question.source == 'manual' ? '我建的' : '我导入的',
+                color: AppColors.normal,
+              ),
+            ],
+          ],
+        ),
+      ],
+    );
+
+    final Widget card = Container(
       width: double.infinity,
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
@@ -268,32 +562,34 @@ class _QuestionCard extends StatelessWidget {
           ),
         ],
       ),
-      child: Column(
+      child: Row(
         crossAxisAlignment: CrossAxisAlignment.start,
         children: <Widget>[
-          Text(
-            question.preview,
-            style: const TextStyle(
-              fontFamily: kFontFamily,
-              fontSize: 15,
-              height: 1.4,
-              color: AppColors.label,
+          Expanded(child: content),
+          if (onMore != null) ...<Widget>[
+            const SizedBox(width: 8),
+            CupertinoButton(
+              padding: EdgeInsets.zero,
+              minimumSize: const Size(28, 28),
+              onPressed: onMore,
+              child: const Icon(
+                CupertinoIcons.ellipsis,
+                size: 18,
+                color: AppColors.secondaryLabel,
+              ),
             ),
-          ),
-          const SizedBox(height: 10),
-          Row(
-            children: <Widget>[
-              _Tag(text: question.typeLabel, color: AppColors.accent),
-              const SizedBox(width: 6),
-              _Tag(text: question.sourceLabel, color: AppColors.secondaryLabel),
-              if (question.isMine) ...<Widget>[
-                const SizedBox(width: 6),
-                const _Tag(text: '我导入的', color: AppColors.normal),
-              ],
-            ],
-          ),
+          ],
         ],
       ),
+    );
+
+    if (onTap == null) return card;
+
+    // 整张卡片可点（去编辑页）；右上角「⋯」给「编辑 / 删除」动作表。
+    return GestureDetector(
+      behavior: HitTestBehavior.opaque,
+      onTap: onTap,
+      child: card,
     );
   }
 }

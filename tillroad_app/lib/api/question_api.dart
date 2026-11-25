@@ -177,6 +177,93 @@ class ImportDuplicate {
   }
 }
 
+/// 一道题的完整详情（m23700 FE-02）。
+///
+/// 与 [BankQuestion]（列表口径）的区别：**带 answer / analysis**。
+/// 列表页不给答案是有意的（避免在浏览题库时剧透），
+/// 但出题人自己在建题/编辑页必须看到答案与解析。
+class QuestionDetail {
+  const QuestionDetail({
+    required this.id,
+    required this.stem,
+    required this.type,
+    this.source = 'manual',
+    this.subjectId = '',
+    this.knowledgeNodeId = '',
+    this.options = const <QuestionOption>[],
+    this.answer = '',
+    this.analysis = '',
+    this.formulaText = '',
+    this.difficulty = '',
+    this.tags = const <String>[],
+    this.isSubjective = false,
+    this.version = 1,
+  });
+
+  final String id;
+  final String stem;
+  final String type;
+  final String source;
+  final String subjectId;
+  final String knowledgeNodeId;
+
+  /// 选项（后端归一成 `{key, text}`）。
+  final List<QuestionOption> options;
+  final String answer;
+  final String analysis;
+  final String formulaText;
+  final String difficulty;
+  final List<String> tags;
+  final bool isSubjective;
+
+  /// 乐观锁版本号（编辑与删除都要带上）。
+  final int version;
+
+  /// 是否主观题（用于「是/否」开关的初值）。
+  ///
+  /// 后端另有 [type] 可表达同一件事（short_answer/subjective/essay/material），
+  /// 但老数据 is_subjective 可能为 false 而 type 确实是主观题 ——
+  /// 所以这里取「或」而不是只看一个字段。
+  bool get looksSubjective =>
+      isSubjective ||
+      type == 'short_answer' ||
+      type == 'subjective' ||
+      type == 'essay' ||
+      type == 'material';
+
+  factory QuestionDetail.fromJson(Map<String, Object?> json) {
+    return QuestionDetail(
+      id: _str(json['id']),
+      stem: _str(json['stem']),
+      type: _str(json['type']),
+      source: _str(json['source']),
+      subjectId: _str(json['subject_id']),
+      knowledgeNodeId: _str(json['knowledge_node_id']),
+      options: _optionList(json['options']),
+      answer: _str(json['answer']),
+      analysis: _str(json['analysis']),
+      formulaText: _str(json['formula_text']),
+      difficulty: _str(json['difficulty']),
+      tags: _tagList(json['tags']),
+      isSubjective: json['is_subjective'] == true,
+      version: _int(json['version'], 1),
+    );
+  }
+}
+
+/// 一个选项（后端统一形状 `{key, text}`）。
+class QuestionOption {
+  const QuestionOption({required this.key, required this.text});
+
+  final String key;
+  final String text;
+
+  /// 发给后端的形状。
+  Map<String, String> toJson() => <String, String>{'key': key, 'text': text};
+
+  @override
+  String toString() => '$key. $text';
+}
 class QuestionApi {
   QuestionApi({ApiClient? client}) : _client = client ?? ApiClient();
 
@@ -241,6 +328,94 @@ class QuestionApi {
     if (raw is! Map) throw ApiException('导入响应不是 JSON 对象', body: raw);
     return ImportResult.fromJson(raw.cast<String, Object?>());
   }
+  /// 单题详情（m23700 FE-02）。
+  ///
+  /// 列表口径（[fetchQuestions]）刻意不含 answer/analysis；但出题人自己在
+  /// 编辑页要看到答案与解析，所以单题详情端点会返回它们。
+  Future<QuestionDetail> fetchQuestion(String id) async {
+    final Object? raw = await _client.get('/questions/$id');
+    if (raw is! Map) throw ApiException('题目详情不是 JSON 对象', body: raw);
+    return QuestionDetail.fromJson(raw.cast<String, Object?>());
+  }
+
+  /// 手动建题：`POST /questions`。
+  ///
+  /// 后端强制 `source='manual'`、`owner_user_id` 取 token，
+  /// 所以这里不用（也不该）传这两个字段。
+  Future<QuestionDetail> createQuestion({
+    required String type,
+    required String stem,
+    String? subjectId,
+    String? knowledgeNodeId,
+    List<Map<String, String>>? options,
+    String? answer,
+    String? analysis,
+    String? formulaText,
+    String? difficulty,
+    List<String>? tags,
+    bool isSubjective = false,
+  }) async {
+    final Map<String, Object?> body = <String, Object?>{
+      'type': type,
+      'stem': stem,
+      if (subjectId != null && subjectId.isNotEmpty) 'subject_id': subjectId,
+      if (knowledgeNodeId != null && knowledgeNodeId.isNotEmpty)
+        'knowledge_node_id': knowledgeNodeId,
+      if (options != null) 'options': options,
+      if (answer != null) 'answer': answer,
+      if (analysis != null) 'analysis': analysis,
+      if (formulaText != null) 'formula_text': formulaText,
+      if (difficulty != null) 'difficulty': difficulty,
+      if (tags != null) 'tags': tags,
+      'is_subjective': isSubjective,
+    };
+    final Object? raw = await _client.post('/questions', body: body);
+    if (raw is! Map) throw ApiException('建题响应不是 JSON 对象', body: raw);
+    return QuestionDetail.fromJson(raw.cast<String, Object?>());
+  }
+
+  /// 编辑题目：`PATCH /questions/:id`。
+  ///
+  /// [version] 是乐观锁基准 —— 拿的是打开编辑页时读到的版本；
+  /// 别人改过这题就会 409 conflict，前端要提示「已被修改」而不是静默覆盖。
+  Future<QuestionDetail> updateQuestion({
+    required String id,
+    required int version,
+    String? type,
+    String? stem,
+    String? subjectId,
+    String? knowledgeNodeId,
+    List<Map<String, String>>? options,
+    String? answer,
+    String? analysis,
+    String? formulaText,
+    String? difficulty,
+    List<String>? tags,
+    bool? isSubjective,
+  }) async {
+    final Map<String, Object?> body = <String, Object?>{
+      'version': version,
+      if (type != null) 'type': type,
+      if (stem != null) 'stem': stem,
+      if (subjectId != null) 'subject_id': subjectId,
+      if (knowledgeNodeId != null) 'knowledge_node_id': knowledgeNodeId,
+      if (options != null) 'options': options,
+      if (answer != null) 'answer': answer,
+      if (analysis != null) 'analysis': analysis,
+      if (formulaText != null) 'formula_text': formulaText,
+      if (difficulty != null) 'difficulty': difficulty,
+      if (tags != null) 'tags': tags,
+      if (isSubjective != null) 'is_subjective': isSubjective,
+    };
+    final Object? raw = await _client.patch('/questions/$id', body: body);
+    if (raw is! Map) throw ApiException('改题响应不是 JSON 对象', body: raw);
+    return QuestionDetail.fromJson(raw.cast<String, Object?>());
+  }
+
+  /// 删除题目：`DELETE /questions/:id`（软删，version 必填）。
+  Future<void> deleteQuestion({required String id, required int version}) async {
+    await _client.delete('/questions/$id', body: <String, Object?>{'version': version});
+  }
 }
 
 // ── 映射辅助（与 review_api.dart / defect_api.dart 同风格）───────────────────
@@ -269,6 +444,48 @@ int _int(Object? v, int fallback) {
 Map<String, Object?> _asMap(Object? v) {
   if (v is Map) return v.cast<String, Object?>();
   return const <String, Object?>{};
+}
+/// tags 是 jsonb 数组，只取字符串元素。
+List<String> _tagList(Object? v) {
+  if (v is! List) return const <String>[];
+  return v
+      .whereType<String>()
+      .map((String t) => t.trim())
+      .where((String t) => t.isNotEmpty)
+      .toList(growable: false);
+}
+
+/// options 是 jsonb 数组。后端建题/改题统一成 `{key, text}`，
+/// 但老数据（导入的题）可能是纯字符串或 `{key, value}` —— 三种都要能读。
+List<QuestionOption> _optionList(Object? v) {
+  if (v is! List) return const <QuestionOption>[];
+  final List<QuestionOption> out = <QuestionOption>[];
+  int index = 0;
+  for (final Object? item in v) {
+    final String fallbackKey = String.fromCharCode(65 + index);
+    index++;
+    if (item is String) {
+      final String text = item.trim();
+      if (text.isEmpty) continue;
+      // 'A. 选项文本' / 'A、选项文本' —— 取首字母当 key（与后端 normalizeOptions 同口径）
+      final RegExpMatch? m = RegExp(r'^([A-Za-z])\s*[.、．:：)]?\s*(.*)$').firstMatch(text);
+      out.add(
+        QuestionOption(
+          key: m == null ? fallbackKey : m.group(1)!.toUpperCase(),
+          text: m == null ? text : m.group(2)!,
+        ),
+      );
+    } else if (item is Map) {
+      final Map<String, Object?> m = item.cast<String, Object?>();
+      final String key = _str(m['key']).trim();
+      final String text = _str(m['text']).trim().isNotEmpty
+          ? _str(m['text']).trim()
+          : _str(m['value']).trim();
+      if (text.isEmpty) continue;
+      out.add(QuestionOption(key: key.isEmpty ? fallbackKey : key.toUpperCase(), text: text));
+    }
+  }
+  return out;
 }
 
 /// options 是 jsonb 数组，元素可能是字符串，也可能是 `{key, value}` 形状。

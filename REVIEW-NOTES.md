@@ -1063,8 +1063,6 @@ Android 17 模拟器 + Neon 云库（三色数据用脚本构造：直接 `INSER
 1. `defect_events` 表缺失 → 时间线只有两个节点。
 2. CORS `*` 生产前收窄；无 userId 鉴权。
 3. 前端建单后逐条 `POST /:id/actions` 的补丁可移除（后端已同事务），保留只为向后兼容旧后端。
-CUG
-
 ---
 
 ## 28. FE-07 归档（首页真实看板、冷启动骨架与离线降级）
@@ -2072,3 +2070,222 @@ PG_VERIFY_ALL_OK
 3. **断言「没有泄漏」要先把公共资源排除在比较集合外**，否则共用资源会导致误报；这类断言还应该带上基数断言，避免集合意外为空时的假通过。
 4. **修好一个外键失败，会浮出下一个**。`after()` 里 `questions_subject_id_fkey` 挡住了 `mock_exams_exam_profile_id_fkey`——删表顺序要按「子 → 父」排一遍，而不是遇到一个补一个。**每修一次 FK 就重跑一遍完整清理链**，别只看当前这条错误消失。
 5. **验证要靠「跑原物」而不是「复刻原物」**。手写脚本复刻 8 步全绿，却漏掉了第 4 个用例建的 `mock_exams`；把真实测试文件只改一行 import 直接在 PGlite 上跑，第三个 bug 立刻现形。复刻物会不经意地比原物宽松。
+
+## 42. 题目选择器：把「手输 UUID」换成能用的选择器（m21779）
+
+### 42.1 为什么做
+
+提交验证页的「关联题目 ID」是一个空白 `FormTextField`，placeholder 写着 `如：f47ac10b-58cc-4372-a567-0e02b2c3d479`。**没有人能背出 UUID**，所以这个字段自 FE-04 上线以来实际上从未被填过——`verifications.question_id` 一直是 NULL，「复盘里按题目聚合同类错误」这个设计意图等于没落地。
+
+### 42.2 后端：只加两个查询参数
+
+`GET /questions` 新增 `q`（题干关键字）与 `knowledge_node_id`（考点），**返回结构不变**，`items` 仍不含 `answer` / `analysis`。
+
+`server/repositories/questions.mjs` 的 `listVisible` 里，参数顺序是 **subject → knowledgeNode → q → owner**（owner 必须在最后，因为它的 `where` 带 `IS NULL` 分支，插在中间会让 `$n` 编号错位）。
+
+三个非平凡点：
+
+1. **LIKE 元字符必须转义**。`escapeLikePattern()` 转义 `\` `%` `_`，SQL 里配 `ESCAPE '\'` 显式声明。不转义时：搜「100%」→ 模式变成 `%100%%` → 匹配任意含「100」的题；搜「a_b」→ `_` 是单字符通配 → 匹配「axb」。集成测试里专门有一条「搜 `100%` 应返回 0 条」来锁这个行为。
+2. **空白关键字当没传**。`rawQ.trim().length > 0 ? rawQ.trim() : null`，否则 `ILIKE '%%'` 会白扫一遍表；集成测试用 `%20%20` 验证。
+3. **顺手修了一个既有 bug**：`knowledgeNodeId` 原本从 query 读出来，却**没传给 `listVisible`** —— 考点过滤参数发出去一直是无效的，只是因为前端从来没传过这个参数，所以没人发现。
+
+### 42.3 前端：`lib/pages/question_picker_page.dart`（740 行，新建）
+
+| 能力 | 做法 | 踩过的坑 |
+|---|---|---|
+| 搜索防抖 | `Timer(Duration(milliseconds: 300))` | 不用 rxdart（硬约束）；`dispose` 里必须 `_debounceTimer?.cancel()`，否则页面 pop 后定时器还会触发 `setState` |
+| 分页 | 首屏 `limit=50`，`ScrollController` 剩余 < 400px 触发下一页 | **`_hasMore` 只看服务器原始返回条数**（` >= 50`）。若拿前端过滤后的条数判断，一旦用户选了「我导入的」就会误判「没有更多了」 |
+| 翻页去重 | 追加时按 `id` 去重 | 翻页期间若有别的设备导入新题，同一条会同时出现在第 1 页和第 2 页 |
+| 来源筛选 | 本地 `q.isMine` | 后端不加参数——加 `owner=self/public` 会让「公共题」与「我导入的」两套 SQL 分叉，本地过滤只有一行 |
+| 题型筛选 | 本地 `q.type` | 同上 |
+| 时间筛选 | 本地 `q.created_at` | **`createdAt == null` 不匹配任何时间段**（不是按「全部」处理），否则时间不明的旧题会混进「最近 7 天」 |
+| 加载态 | 首屏 `CupertinoActivityIndicator`；搜索/翻页时列表顶部 3px 色条 | **不能用 `LinearProgressIndicator`**（Material，纯 Cupertino 工程里不存在）；用 `ColoredBox(color: AppColors.accent.withValues(alpha: 0.55))` |
+| 空态 | 「没有匹配的题目，换个关键词试试」+「清空搜索与筛选」 | 清空要把搜索框、三个筛选一起复位再重拉 |
+
+返回值是一个 `PickedQuestion{id, stem}`，不是裸 id——因为详情页要显示题干前 30 字，重新查一次是多余的网络往返。右上「不关联」直接 `pop()`（无返回值 = 清空）。
+
+`defect_verify_page.dart` 的接入改动很小：字段从 `FormTextField` 换成 `_QuestionSelector`，新增 `PickedQuestion? _picked` 只用于显示，`_questionId.text` 仍是提交的唯一真源——提交路径一行没改，所以不会影响已有的状态机与乐观锁逻辑。
+
+### 42.4 集成测试：别写绝对条数断言
+
+新用例 `m21780：GET /questions 支持 q 与 knowledge_node_id 过滤` 建 2 个考点、5 道题（3 道含「马克思主义」，其中 2 道挂 `nodeHit`）。
+
+第一版断言「q=马克思主义 应该 3 条」，**实测 4 条**——因为同一文件的**前 5 个用例**已经把 `sample-01-markdown.md` 的 12 道题导入 `subjectA`，里面正好有含「马克思主义」的题。
+
+修法：**先取基线，再相对断言**。
+
+```js
+const base = await api.get(`/questions?limit=200`);
+const baseHit = base.items.filter((q) => q.stem.includes('马克思主义'));
+const rQ = await api.get(`/questions?q=${encodeURIComponent('马克思主义')}&limit=200`);
+assert.equal(rQ.items.length, baseHit.length, 'q 过滤结果数应等于基线中含关键字的条数');
+rQ.items.forEach((q) => assert.ok(q.stem.includes('马克思主义')));
+```
+
+**为什么不直接把期望值改成 4**：期望值会随种子文件内容变化而脆断（换一份 markdown、加一道题都会变），而「等于基线里含关键字的条数」是自洽的。这条和前一轮 §41.3 的「泄漏断言要先排除公共资源」是同一类问题：**断言里的常量只要依赖共享夹具，就一定会漂**。
+
+### 42.5 真机验收
+
+| 项 | 结果 |
+|---|---|
+| 选择器首屏 | 大标题 + 不关联 + 搜索框 + 两行 chips + 「共 50 道」+ 卡片列表（题干两行 / 题型 / 来源徽标） |
+| 搜索（ASCII `35`） | 300ms 防抖生效 → 「共 1 道（已筛选）」+ 单条命中 |
+| 选中回填 | 验证页「关联题目」显示 `【导入计时测试 …】第 35 题：下…`（30 字截断）+「更换」「不关联」 |
+| 提交成功 | **云端实证**：`GET /defect-tickets/ccdc531c-…` → `status=V2 version=4`，`verifications` 里 `V1 r1 pass q=fa68a44e-…`；单的 version 从 3 → 4 是 `begin-verification` 两跳 + 提交验证 |
+| 「我导入的」筛选 | 「共 50 道（已筛选）」，抽到的卡片全部带「我导入的」徽标 |
+| 空态 | 选「公共题」→「没有匹配的题目，换个关键词试试」+「清空搜索与筛选」；点它回「共 50 道」 |
+
+截图 4 张存 `tillroad_app/screenshots/`：`q-picker-home.png`（308,760 B）/ `q-picker-search.png`（182,354 B）/ `q-picker-selected.png`（278,860 B）/ `q-picker-empty.png`（162,041 B）。
+
+### 42.6 未做到的一件事：中文关键字没能真机输入
+
+任务书要求搜「马克思」，但**在这台 Android 17 模拟器上无法把中文输进 Flutter 输入框**：
+
+- `adb shell input text '马克思'` → `java.lang.NullPointerException: Attempt to get length of null array at InputShellCommand.sendText(...)`（ASCII 正常，`35` 可用）；
+- ADBKeyboard（`ADBKeyboard.apk`，v2.0，targetSdk 33）能安装、能 `ime set` 选中、`am broadcast -a ADB_INPUT_TEXT --es msg '马克思'` 返回 `result=0`，但**文字从未进入输入框**（`EditText` 的 `text` 始终为空，列表始终「共 50 道」）；试过 `ADB_INPUT_B64`、`ADB_INPUT_CHARS`、`--include-stopped-packages`、`show_ime_with_hard_keyboard=1`、指定 `-p` 包名，均无效；`dumpsys activity broadcasts` 能看到广播已入队、receiver 在进程内，但输出没到 `InputConnection`（怀疑是该 APK 在 API 37 上的 `RECEIVER_EXPORTED`/receiver 注册限制，未深究）；
+- `cmd clipboard set-text` 在 API 37 上「No shell command implementation.」。
+
+结论：**中文 `q` 过滤只在 API 层验证过**（`GET /questions?q=马克思主义` → 1 条命中），UI 层用 ASCII 关键字（`35`）验证了防抖/请求/渲染/回填全链路。这是验证手段的限制，不是功能缺陷；下一步若要真机验中文，用可注入文本的自动化框架（如 `flutter_test` 的 integration_test + 真机 driver），或直接改用带剪贴板桥接的输入法。
+
+### 42.7 数字
+
+- `flutter analyze --no-fatal-infos` → **56 issues，0 error / 0 warning**（新增 1 条 `use_build_context_synchronously` info，在 `defect_verify_page.dart` 既有的 `pop` 位置）；
+- `flutter test` → **106/106 All tests passed**；
+- `npm test` → **tests 322 / pass 194 / fail 0 / skipped 128**（本机无 PG；新版集成用例在 CI 上真跑）；
+- PGlite 真库跑 `server/routes/questions.integration.test.mjs` 全部 6 个用例 → **6/6 pass**。
+
+### 42.8 遗留
+
+1. **练习模式**（下一轮）：选择题干 → 刷题 → 记录，本轮只做了「挑一道题关联到验证记录」，没有独立的练习流。
+2. **标签筛选**：筛选器里没有「按标签」，因为目前没有打标系统——`questions.tags` 是 jsonb 但导入管线不填。做标签筛选之前得先有打标入口。
+3. **考点筛选未做进 UI**（任务书 B3 的可选项）：后端 `knowledge_node_id` 参数已可用且有集成测试覆盖，但选择器页面里没有「考点」chip；要做得先决定是「列该科目全部考点」还是「从已加载题目里取 `knowledge_node_id` 去重」，前者需要一次额外请求且考点多时体验差。
+
+---
+
+## 43. FE-02 归档（建题 / 编辑 / 删除题目 + 导入三态进度）
+
+### 43.1 范围与硬约束
+
+用户拍板的三条边界（决定了这一轮「做什么、不做什么」）：
+
+| 议题 | 决定 | 原因（写在这里是为了以后别再讨论一遍） |
+| --- | --- | --- |
+| 拍照 OCR | **本轮不做，入口完全不出现** | 后端 `server/import/extract.mjs` 的 `case 'image'` 直接抛 `UNSUPPORTED_IMAGE`（422，原话「V1 将支持 OCR」）；服务端既没有 provider adapter，也没有密钥管理（`user_model_credentials` 只有表结构）。真 OCR 前置是：BYOK 服务端密钥管理（`encrypted_key` / DEK / KMS）+ vision adapter + 图像存储 + 置信度阈值（AC-Q-01 写的是 <0.6 强制人工核对）。这些与「建题」正交，混在一起会让这一轮做不完。 |
+| 后端是否新增题目写端点 | **允许** | `POST /questions`（单题）、`PATCH /questions/:id`（编辑，带 version 乐观锁）、`DELETE /questions/:id`（软删，带 version）。**不改 schema** —— 仓储层的 `create` / `update` / `archive` 早就写好了，缺的只是路由与归属校验。 |
+| 批量导入的进度与排队 UI | **只做客户端进度 + 预检提示** | 不建 `import_jobs` 表。后端 `POST /questions/import` 是**一次性同步接口**，没有 job id、没有进度端点，客户端拿不到百分比。与其编一个假的百分比，不如诚实地分两段显示（本地编码 / 服务端处理）。 |
+
+硬约束：不改 schema、不改 `core/`、不改题目状态机（题目本来就没有状态机）、不引新依赖、不夹带练习模式 / AI 生成题 / 标签筛选。
+
+### 43.2 后端：三个写端点（`server/routes/questions.mjs` 181 → 395 行）
+
+仓储层 `server/repositories/questions.mjs` 的 `create` / `update` / `archive` 早已存在且行为正确（`update` 会在 stem/options/formula_text 变动时重算 `content_hash` 并按 owner 分域重新查重；`UPDATE_COLUMNS` 刻意剔除 `owner_user_id`，所以 PATCH 改不了归属）。本轮只补路由层。
+
+**最关键的一处改动**：`match()` 原来第一行是 `if (method !== 'GET') return null;` —— 那是只读模块的写法，直接把它删掉，否则自家新增的 POST/PATCH/DELETE 会被自己挡在门外。改写后按「方法 + 路径形态」逐个匹配：`POST /questions` → create；`GET /questions` → list；`seg[0] === 'questions' && seg.length === 2` → GET / PATCH / DELETE；`GET /subjects/:id/questions` 分支保留。
+
+其余要点：
+
+- `pickQuestionFields(body, { partial })`（与 `server/routes/subjects.mjs` 的 `pickSubjectFields` 同形）只收 `subject_id / knowledge_node_id / type / stem / options / answer / analysis / formula_text / difficulty / tags / is_subjective`；**刻意不收 `source` / `content_hash` / `owner_user_id`** —— source 恒 `manual`、hash 由仓储算、owner 只认 token。
+- `normalizeOptions()` 把三种写法归一成 schema 的 `[{key,text}]`：字符串数组 `'B、乙说法'` 用正则 `/^([A-Za-z])\s*[.、．:：)]?\s*(.*)$/` 取首字母为 key；`{key,text}` 原样；`{key,value}` 取 value。**归一是必须的** —— 不归一的话同一道题从「导入」和「手动录入」两条路进去形状不一样，答案解析要写两套。
+- `requireOwnQuestion()`：无 token → 401；别人的私有题 → **404 而不是 403**。用 404 是刻意的，避免题目 id 可被枚举探测归属。
+- `readBaseVersion(body)` 复用既有工具（只认 `body.version`，缺失 → 400 `INVALID_BASE_VERSION`）。
+
+新增错误码：`MISSING_QUESTION_TYPE` / `MISSING_QUESTION_STEM` / `INVALID_QUESTION_TYPE` / `INVALID_DIFFICULTY` / `INVALID_OPTIONS` / `INVALID_TAGS` / `INVALID_IS_SUBJECTIVE` / `empty_patch`（PATCH 空补丁）。
+
+### 43.3 后端：6 条新集成用例（`server/routes/questions.integration.test.mjs` 427 → 670 行）
+
+1. `POST /questions` 手动建题 → 201（断言 source=manual、owner=自己、version=1、选项三种写法归一、tags 剔空串、hash 由服务端算）。
+2. 缺字段 / 值域非法 → 400（MISSING_QUESTION_STEM / MISSING_QUESTION_TYPE / INVALID_QUESTION_TYPE / INVALID_DIFFICULTY）；未鉴权 → 401。
+3. 同样题干再建一次 → **409 DUPLICATE_QUESTION**（body 带 `current.id`）；换 owner 建同题干 → 201（查重按 owner 分域）。
+4. PATCH 改题干后重算 hash；version 不符 → **409 conflict**（`current.version` + `resolution='client_merge'`）；不带 version → 400 INVALID_BASE_VERSION；空 patch → 400 empty_patch；**断言未传的 `answer` 不会被清空**。
+5. 可见性：自己的 200 / 别人的私有题 404 / 公共题（`owner_user_id IS NULL`）200 但 PATCH → 404 / 随机 uuid → 404。
+6. DELETE 软删：200 `{deleted:true}`；删后 GET 404、列表不再出现；**软删后同 hash 可重建**（201，新 id）；重复删除 → 404；删别人的题 → 404。
+
+**本机没有 PG，这些用例在本机 `npm test` 里是 skip 的**（128→134 skipped）。用 PGlite（真实 Postgres WASM）跑真实测试文件（只替换一行 import 指向适配器）→ **12/12 pass**（含 m17431 / m21780 的 6 条旧用例）。适配器要点：`pg` 的 simple query 允许多语句而 PGlite 的 `query()` 走 prepared statement 会报 `42601 cannot insert multiple commands into a prepared statement`，所以「无参数且 SQL 里含 `;`」时改走 `db.exec(text)`。
+
+### 43.4 前端：`question_edit_page.dart`（新建，约 720 行）
+
+三个设计决定（写在文件头，避免以后被「优化」掉）：
+
+1. **建题与编辑共用一页**。字段完全一样，差别只有提交是 POST 还是 PATCH。拆两页意味着同一套表单要维护两遍，迟早出现「建题页能填的字段编辑页不能填」的漂移。
+2. **选项逐条编辑，不塞进一个 TextField**。后端 `questions.options` 是 jsonb 且统一 `[{key,text}]`，标号 A/B/C 由前端给出（`_OptionDraft` 持有 key + 一个 `TextEditingController`），这样从导入和手动录入两条路进来的题形状一致。
+3. **乐观锁**。编辑与删除都带 `version`；409 时提示「这道题在你编辑期间被改过（版本冲突）。请关闭本页重新打开，以免覆盖别人的修改。」，**不静默覆盖**。
+
+公开常量：`kQuestionTypeOptions`（9 种：choice/multi/judge/fill/calculation/short_answer/subjective/essay/material，与后端 `QUESTION_TYPES` 同口径）、`kQuestionTypeLabels`、`kQuestionDifficultyOptions`（easy/medium/hard）、`kQuestionDifficultyLabels`、`kTypesWithOptions`（只有 choice/multi/judge/calculation 显示选项编辑区）。
+
+错误映射（`_applyError`）：MISSING_QUESTION_STEM → 题干下方红字；INVALID_QUESTION_TYPE → 题型行；INVALID_DIFFICULTY → 难度行；INVALID_OPTIONS → 选项区；DUPLICATE_QUESTION → 题干下方「题库里已有同样的题干（同一科目下不重复建题）」；INVALID_BASE_VERSION / conflict / unauthorized → 顶部条；default → 显示后端 message。
+
+UI 复用 `lib/widgets/form_field.dart` 的 `FormScaffold` / `FormFieldGroup` / `FormTextField` / `FormChipGroup` / `FormErrorBanner` / `FormSubmitButton` / `FormEmptyHint`，与既有表单页同形。
+
+### 43.5 前端：`question_bank_page.dart` 接入口（377 → 666 行）
+
+- 导航栏 trailing 由单个「导入」改为 **「建题」+「导入」** 两个按钮。
+- 点卡片 → **先 `fetchQuestion(q.id)` 拉详情** → push `QuestionEditPage(existing: detail)`。列表口径的 `BankQuestion` 不带 `answer` / `analysis` / `version`，直接拿列表数据编辑会丢答案。
+- 卡片右上「⋯」→ `CupertinoActionSheet`「题目操作」→ 编辑 / 删除（isDestructiveAction）。
+- 删除流程：先确认弹窗（红色标题「删除这道题？」）→ **再 `fetchQuestion` 拿 version** → `deleteQuestion(id, version)`。列表里没有 version，拿旧 version 会误判 409。
+- 错误分派：`not_found` → 「只能删除自己建的题。公共题和别人的题不能删。」；`conflict` → 「这道题在你打开期间被改过，请刷新列表后再试。」
+
+### 43.6 前端：导入页三态进度 + 大文件预检 + 超时文案（871 → 915 行）
+
+- `enum ImportStage { encoding, processing, done }` —— 后端没有 job id，所以客户端只分「本地读文件并 base64」与「服务端解析入库」两段，不编假百分比。
+- `_ImportProgress` 组件：encoding → 「正在读取并编码文件…」+「这一步在手机本地做，base64 会让体积多约三成。」；processing → 「服务端正在解析与入库…」+「解析、切题、判重、入库都在后端完成，大文件可能要等一会儿。」
+- 大文件预检：`kLargeImportBytes = 2MB`，超过则显示 `_ImportNotice`（橙色警示图标）「这个文件 X，属于大文件。导入会明显变慢（base64 上传体积约多三成），建议先按题号拆成几份再导。」
+- 超时文案（`_friendlyError`）：「这次导入超时了（60s 没等到服务端回应）。**但服务端可能已经写入了部分或全部题目，请先到题库页确认，确认后再决定要不要重传。**」—— 这条是基于 m17431 的真实教训：50 题首次导入在 Neon 上实测 **20.3s**，超过前端 15s 超时，客户端超时后用户重试，第二次因为题已入库于是显示「判重 50」，看起来像「云端一条都没有」。超时不等于失败。
+
+### 43.7 本轮自己制造的编译错误（记录下来省得再犯）
+
+| 现象 | 根因 | 修法 |
+| --- | --- | --- |
+| `error - Expected an identifier` | Dart 普通字符串里 `'$\\frac{a}{b}'` 的 `\f` 被当转义 | 用 raw string `r'...$\frac{a}{b}$'` |
+| `warning - The name ApiClient is shown, but isn't used` | `import ... show ApiClient, ApiException;` 里 ApiClient 没用到 | 改成 `show ApiException` |
+| `unchecked_use_of_nullable_value` + `undefined_operator` | `e.body` 是 `Object?`，不能直接 `e.body['error']` | 沿用既有写法 `final Object? body = e.body; final String code = body is Map && body['error'] != null ? '${body['error']}' : '';` |
+| `State.build` 缺失 + 一大批 `_xxx` undefined | 我用 edit 改方法时多留/少留了一层 `}`，把后面的方法吞进了前一个 | 直接 read 整个 class 定位收尾括号，别继续叠加小 edit |
+
+### 43.8 验证数字
+
+- `flutter analyze --no-fatal-infos` → **74 issues，0 error / 0 warning**（FE-02 +18，全是 info：`use_null_aware_elements` / `unnecessary_import` / `await_only_futures` / 既有 `deprecated_member_use`）。
+- `flutter test` → **All tests passed! (106 tests)**。
+- `npm test` → **tests 328 / pass 194 / fail 0 / skipped 134**。
+- PGlite 真库跑真实测试文件 → **12/12 pass**。
+- `tillroad_app/lib/` → **68 个 dart 文件**（`pages/` 23 → 24）。
+
+### 43.9 遗留
+
+1. **拍照 OCR**：需先补 BYOK 服务端密钥管理 + vision adapter + 图像存储 + 置信度阈值，本轮未做。
+2. **AI 生成题入口**：`questions.source` 已有 `ai_generated` 枚举值、`ai_generation_jobs` 表也在，但题库里没有「用 AI 出题」的入口。
+3. **删除的物理抹除**：`DELETE /questions/:id` 是软删（`deleted_at`），数据仍在库里可恢复；合规意义上的「彻底抹除」需要物理删除 + 保留期策略。
+4. **标签筛选**：手动建题可以打标签了（`tags` 字段），但题库列表还没有「按标签筛选」——筛选器本来就没有标签维度（§42.8 遗留第 2 条），等有了标签入口才值得加。
+5. **练习模式**：选题 → 刷题 → 记录，本轮仍未做（§42.8 遗留第 1 条）。
+
+### 43.10 真机验证（Android 17 模拟器 + Neon 真库）
+
+本轮真机用**本地起的后端**（`.tmp-dev-ws.mjs`：`@neondatabase/serverless` 的 websocket Pool 适配成 `pg.Pool` 形状，进程内 `process.loadEnvFile('.env')` 读 Neon 凭据，`createApp({pool: adapter})` 起在 `0.0.0.0:3000`），App 用 `--dart-define=API_BASE_URL=http://10.0.2.2:3000` 连模拟器宿主。**这样后端代码是本轮改动的真身，而不是线上的旧版本。**
+
+**踩坑：模拟器网络**。新起的模拟器里 `10.0.2.2`（宿主）不可达（`Network is unreachable, errno = 101`），App 全程报 `无法连接后端`，首次填充直接失败。`ip route` 只剩两条直连路由（`10.0.2.0/24 dev eth0` / `dev wlan0`），**没有 default 路由**。设备内 `ip route add default via 10.0.2.2 dev eth0` 报 `Cannot talk to rtnetlink: Permission denied`，但 `ping 10.0.2.2` 随后就通了（0% packet loss）——路由实际由宿主侧的模拟器 NAT 提供，设备内那条命令失败不影响连通性。**教训：模拟器连不上宿主时先 `ping 10.0.2.2` 判定是「路由缺失」还是「服务没起」，别一上来就怀疑 app。**
+
+验证结果（App 日志在设备上：`adb shell "su 0 cat /data/data/com.tillroad.tillroad_app/code_cache/tillroad/logs/app-YYYY-MM-DD.log"`）：
+
+| 步骤 | 结果 |
+| --- | --- |
+| 首次填充 | `[FILL] 首次填充完成：档案 1 / 科目 2 / 考点 8 / 缺陷单 15 / 动作 14 / 验证 16 / 模考 7 / 复盘 3，耗时 8811ms`；随后 `[LOCAL] 本地与云端状态分布一致（{ACTION_DONE: 1, ANALYZED: 6, CLOSED: 3, DRAFT: 1, REOPENED: 1, V2: 2, V3: 1}）` |
+| 手动建题 | `POST /questions 201 OK 1137ms` → 列表出现「未分科 / 1 题 / FE02-manual-stem-test-001」，来源标签「手动」 |
+| 编辑 | `PATCH /questions/4e3d**** 200 OK 3935ms` → 列表题干变成 `FE02-manual-stem-test-001-v2` |
+| 动作表 | 「⋯」→ `CupertinoActionSheet`「题目操作」/ 编辑 / 删除 / 取消 |
+| 删除确认 | 红色标题「删除这道题？」+「删除后题库里就看不到它了。」→ `DELETE /questions/4e3d**** 200 OK 385ms` |
+| 导入（首次） | 选 `fe02-sample.md`（538 B）→ 选科目 → `导入完成 / 新增题目 2 / 已存在（判重）0 / 解析失败 0` |
+| 导入（重复同一文件） | `没有新题入库 / 新增题目 0 / 已存在（判重）2 / 解析失败 0`，并列出两条已存在的题干 —— **这正是 m17431 那个「看起来云端一条都没有」的误会的反面证据：题确实入库了，第二次必然判重** |
+
+截图 9 张（`tillroad_app/screenshots/fe02-*.png`）：`fe02-create-page.png`（手动建题首屏，9 个题型 chip + 右侧「保存」）、`fe02-create-form.png`（难度 chip / 主观题开关 / 所属科目 chip / 「创建题目」按钮）、`fe02-bank-list.png`（题库列表：右上「建题」「导入」、手动题在「未分科」分组下）、`fe02-edit-page.png`（编辑题目，题干已回填）、`fe02-delete-confirm.png`（删除确认弹窗）、`fe02-import-page.png`（导入页三段式 + 「选不到文件？用「所有文件」打开」）、`fe02-import-progress.png`（上传/处理中进度）、`fe02-import-result.png`（导入完成 2/0/0）、`fe02-import-dedupe.png`（重复导入 0/2/0 + 已存在题干列表）。
+
+### 43.11 真机抓到的一个标签 bug（已修）
+
+手动建的题在列表里被标成 **「我导入的」** —— 因为 `_QuestionCard` 里的标签是按 `question.isMine` 决定的，而 `isMine` 的含义是「owner 是当前用户」，手动建的题当然也满足，于是和「导入」来的题混标同一个绿标签。
+
+修法（`lib/pages/question_bank_page.dart`）：标签改成按来源区分 —— `question.source == 'manual' ? '我建的' : '我导入的'`。**「自己建的」和「自己导入的」是两件事**，标签应该说清楚。
+
+### 43.12 收尾校验
+
+- `flutter analyze --no-fatal-infos` → **74 issues，0 error / 0 warning**。
+- `flutter test` → **All tests passed! (106 tests)**。
+- `npm test` → **tests 328 / pass 194 / fail 0 / skipped 134**。
+- 临时文件与临时依赖已清：`.tmp-dev-ws.mjs`、`.tmp-*.png/.xml/.cjs/.mjs/.md`、`.tmp-backend.log/.err` 全部删除；`@neondatabase/serverless` 是 `--no-save` 装的，已 `npm prune` 移除（package.json 从未写入）。
+- `git status` = 7 M + 10 ??（1 个新页面 + 9 张截图）。
