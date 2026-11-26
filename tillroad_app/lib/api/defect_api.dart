@@ -436,6 +436,12 @@ const List<String> kErrorLayerOptions = <String>[
   '策略取舍',
   '稳定迁移',
 ];
+/// 练习模式 R2：自动建缺陷单时用的默认错因层级。
+///
+/// 从「行测六层」里挑最接近「练习中没掌握」的一层 —— 其实是**识别**层：
+/// 练习没做对，多半是「当时就没想起来/没认出来」，而不是执行算错了。
+/// 后端 `error_layer` 是自由文本，这里只是给个合理默认值。
+const String kPracticeDefaultErrorLayer = '识别';
 
 /// 禁用语（与 `core/index.mjs:29-31` 的 `FORBIDDEN_PHRASES` 逐字一致）。
 /// 前端做**内联预校验**，减少一次往返；后端仍是最终权威。

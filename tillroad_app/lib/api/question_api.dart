@@ -31,6 +31,7 @@ class BankQuestion {
     this.difficulty,
     this.isSubjective = false,
     this.isMine = false,
+    this.mastered,
     this.createdAt,
     this.options = const <String>[],
   });
@@ -46,6 +47,15 @@ class BankQuestion {
 
   /// true = 这是「我」导入的题（owner_user_id == 当前用户）；false = 公共题。
   final bool isMine;
+
+  /// 掌握度三态（练习 R2）：
+  ///   * `true`  = 已掌握（用户标记过）
+  ///   * `false` = 未掌握（用户标记过）
+  ///   * `null`  = 未标记（从来没有标记过）
+  ///
+  /// 后端在列表里逐项回 `mastered`；「没有这一行」与「标记为 false」
+  /// 是两回事，所以这里必须是可空布尔而不是普通 bool。
+  final bool? mastered;
 
   /// 入题时间（列表按它倒序）。题库页的「最近 7 天 / 30 天」筛选要用，
   /// 后端 `created_at` 缺失或不可解析时为 null（筛选时按「不在时间窗内」处理）。
@@ -115,6 +125,9 @@ class BankQuestion {
       difficulty: _strOrNull(json['difficulty']),
       isSubjective: json['is_subjective'] == true,
       isMine: owner.isNotEmpty && owner == currentUserId,
+      mastered: json['mastered'] == null
+          ? null
+          : (json['mastered'] == true),
       createdAt: _dateOrNull(json['created_at']),
       options: _stringList(json['options']),
     );
@@ -281,6 +294,7 @@ class QuestionApi {
     String? q,
     int limit = 50,
     int offset = 0,
+    bool? mastered,
     String? currentUserId,
   }) async {
     final Object? raw = await _client.get(
@@ -292,6 +306,9 @@ class QuestionApi {
         // m21780：题干关键字由后端 ILIKE 过滤（已做 LIKE 元字符转义），
         // 空白串不当参数传，免得白白走一次 `ILIKE '%%'`。
         if (q != null && q.trim().isNotEmpty) 'q': q.trim(),
+        // 练习 R2：掌握度过滤。后端只认字符串 'true'/'false'，
+        // 所以这里传字符串而不是 bool（null = 不筛选）。
+        if (mastered != null) 'mastered': mastered ? 'true' : 'false',
         'limit': '$limit',
         'offset': '$offset',
       },
@@ -410,6 +427,21 @@ class QuestionApi {
     final Object? raw = await _client.patch('/questions/$id', body: body);
     if (raw is! Map) throw ApiException('改题响应不是 JSON 对象', body: raw);
     return QuestionDetail.fromJson(raw.cast<String, Object?>());
+  }
+
+  /// 删除题目：`DELETE /questions/:id`（软删，version 必填）。
+  /// 标记题目掌握度：`PATCH /questions/:id/mastery`。
+  ///
+  /// 后端按 token 决定归属，**只能标记自己的题**：
+  /// 公共题或别人的私有题一律 403 `FORBIDDEN_MASTERY`。
+  ///
+  /// 语义：`mastered=true` 记「已掌握」；`false` 记「未掌握」；
+  /// 从没标记过的题在列表里是第三态（null），所以「未掌握」和「未标记」不同。
+  Future<void> setMastery({required String id, required bool mastered}) async {
+    await _client.patch(
+      '/questions/$id/mastery',
+      body: <String, Object?>{'mastered': mastered},
+    );
   }
 
   /// 删除题目：`DELETE /questions/:id`（软删，version 必填）。

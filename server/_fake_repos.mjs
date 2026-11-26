@@ -499,18 +499,60 @@ export function createFakeRepos() {
       return questionPool.map((r) => ({ ...r }));
     },
     // ★ m17431：与真实仓储 listVisible 同口径（公共题 + 自己的题）。
-    async listVisible(_client, { limit = 50, offset = 0, ownerUserId = null, subjectId = null } = {}) {
+    async listVisible(_client, { limit = 50, offset = 0, ownerUserId = null, subjectId = null, mastered } = {}) {
       const rows = questionPool.filter((q) => {
         if (q.deleted_at) return false;
         if (subjectId && q.subject_id !== subjectId) return false;
         if (ownerUserId && q.owner_user_id != null && q.owner_user_id !== ownerUserId) {
           return false;
         }
+        // m25316：掌握状态过滤（与真实仓储同口径）。
+        if (typeof mastered === 'boolean' && ownerUserId) {
+          const m = masteryRows.get(`${ownerUserId}:${q.id}`);
+          if (!m || m.mastered !== mastered) return false;
+        }
         return true;
       });
       return rows.slice(offset, offset + limit).map((r) => ({ ...r }));
     },
   };
+
+  // m25316：掌握度 fake（key = `${userId}:${questionId}`）。
+  const masteryRows = new Map();
+
+  const questionMastery = {
+    seedRows(rows) {
+      for (const r of rows) {
+        masteryRows.set(`${r.user_id}:${r.question_id}`, { ...r });
+      }
+      return masteryRows.size;
+    },
+    rows() {
+      return [...masteryRows.values()].map((r) => ({ ...r }));
+    },
+    async upsertMastery(_client, { userId, questionId, mastered }) {
+      const key = `${userId}:${questionId}`;
+      const row = {
+        id: newId('qm'),
+        user_id: userId,
+        question_id: questionId,
+        mastered: Boolean(mastered),
+        updated_at: new Date().toISOString(),
+      };
+      masteryRows.set(key, row);
+      return { ...row };
+    },
+    async listMasteryMap(_client, { userId, questionIds }) {
+      const map = new Map();
+      if (!userId || !Array.isArray(questionIds)) return map;
+      for (const qid of questionIds) {
+        const row = masteryRows.get(`${userId}:${qid}`);
+        if (row) map.set(qid, Boolean(row.mastered));
+      }
+      return map;
+    },
+  };
+
 
   const attempts = {
     async create(_client, input = {}) {
@@ -917,5 +959,5 @@ export function createFakeRepos() {
       .toUpperCase();
   }
 
-  return { client: null, defectTickets, actions, verifications, mockExams, attempts, questions, reviewCycles };
+  return { client: null, defectTickets, actions, verifications, mockExams, attempts, questions, questionMastery, reviewCycles };
 }

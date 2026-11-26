@@ -2445,3 +2445,149 @@ ORDER BY random() LIMIT $M
 4. 公共题自评的对错**只存在练习记录里**，不回流题库（题目没有「掌握度」字段可写）。
 5. 练习记录**没有删除入口**（`practice_sessions` 有 `deleted_at` 字段但没做端点）。
 6. `duration_ms` 已经在收，但结果页与历史页**还没展示每题用时**。
+
+## 45. 练习模式 R2 归档（掌握度标记 + 未掌握进缺陷单）
+
+### 45.1 范围与硬约束
+
+R1 已交付（抽题 / 答题 / 客户端判分 / 错题去归因），用户用了一周后反馈「对题想标记掌握状态」。本轮只补掌握度，并把「没掌握」自动接进缺陷单闭环。
+
+| 约束 | 落实情况 |
+|---|---|
+| 不改 `migrations/0003_practice.sql`、不改 `schema.sql` | 新建独立的 `migrations/0004_question_mastery.sql`（+ down 脚本），`schema.sql` 与 0003 一字未动 |
+| 不改 core 状态机 | `core/` 零改动 |
+| 公共题不能标记掌握度（403） | 后端 `setQuestionMastery` 显式 403；前端对公共题**根本不渲染**按钮 |
+| 不引新依赖 | 运行时依赖表不变（`cupertino_icons` / `http` / `shared_preferences` / `share_plus` / `sqflite` / `path` / `file_picker`） |
+| `flutter analyze` 0 error / 0 warning | 84 issues，**0 error / 0 warning** |
+| 集成测试 CI 真跑 | 新增 `server/routes/question_mastery.integration.test.mjs`（6 条），已入 `package.json` 的 `test:integration` |
+| 不夹带删题（R3） | 删题未做，列入遗留 |
+
+### 45.2 迁移 0004（up / down）
+
+```sql
+-- migrations/0004_question_mastery.sql
+CREATE TABLE IF NOT EXISTS question_mastery (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id),
+  question_id uuid NOT NULL REFERENCES questions(id),
+  mastered boolean NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT question_mastery_user_question_key UNIQUE (user_id, question_id)
+);
+CREATE INDEX IF NOT EXISTS idx_qm_user ON question_mastery(user_id);
+CREATE INDEX IF NOT EXISTS idx_qm_question ON question_mastery(question_id);
+```
+
+```sql
+-- migrations/0004_question_mastery_down.sql
+DROP INDEX IF EXISTS idx_qm_question;
+DROP INDEX IF EXISTS idx_qm_user;
+DROP TABLE IF EXISTS question_mastery;
+```
+
+**三态语义（重要）**：表里**没有这一行** = 从没标记过（未标记），与 `mastered = false`（明确标为未掌握）**不是一回事**。所以：
+
+- API 返回的 `mastered` 是**可空布尔**（`true` / `false` / `null`）；
+- `GET /questions?mastered=false` 只回显真正标过「未掌握」的题，**未标记的题两边都不出现**。
+
+`scripts/migrate.mjs` 的 `UP_MIGRATIONS` 追加 0004，`DOWN_MIGRATIONS` 把 0004 的 down 放在 0003 之前（回滚顺序与建表相反，否则外键依赖会挡）；`server/db/test_schema.mjs` 的 `MIGRATION_FILES` 同步追加 0004。
+
+### 45.3 掌握度端点与 SQL
+
+**仓储层**（`server/repositories/question_mastery.mjs`）：
+
+```js
+export async function upsertMastery(client, { userId, questionId, mastered }) {
+  return queryOne(client, `
+    INSERT INTO question_mastery (user_id, question_id, mastered, updated_at)
+    VALUES ($1, $2, $3, now())
+    ON CONFLICT (user_id, question_id)
+    DO UPDATE SET mastered = EXCLUDED.mastered, updated_at = now()
+    RETURNING *
+  `, [userId, questionId, mastered]);
+}
+```
+
+```js
+// 过滤用 EXISTS 而不是 JOIN —— JOIN 会让一张题对多个标记时出现重复行
+export function masteryFilterClause({ userId, mastered, tableAlias = 'questions', paramIndex = 1 }) {
+  return {
+    clause: `EXISTS (SELECT 1 FROM question_mastery qm
+              WHERE qm.question_id = ${tableAlias}.id
+                AND qm.user_id = $${paramIndex}
+                AND qm.mastered = ${mastered ? 'true' : 'false'})`,
+    params: [userId],
+  };
+}
+```
+
+**路由层**（`server/routes/questions.mjs`）：
+
+| 方法 & 路径 | 行为 |
+|---|---|
+| `PATCH /questions/:id/mastery` | body `{mastered}` → upsert。**无 Token → 401**；`mastered` 非布尔 → **400 `INVALID_MASTERY`**；题不存在 → **404**；`row.owner_user_id !== ctx.authUserId` → **403 `FORBIDDEN_MASTERY`**（公共题与别人的题都 403 —— 这里刻意不同于 `requireOwnQuestion` 的 404，因为前端需要明确告诉用户「公共题不能标记」，404 那条是为了避免枚举 id）；成功 → `ok({question_id, mastered, updated_at})` |
+| `GET /questions?mastered=true\|false` | 走 `masteryFilterClause` 的 EXISTS 子句；**只有字符串 `'true'` / `'false'` 才生效**，其它值一律当没传 |
+
+`match()` 里新分支 `seg.length === 3 && seg[2] === 'mastery'` 必须排在 `seg.length === 2` 分支之前，否则 `PATCH /questions/:id/mastery` 会被 `:id` 分支抢走。
+
+列表响应里每项附带 `mastered`（`true` / `false` / `null`），由 `listMasteryMap` 一次批量查回，避免 N+1。
+
+### 45.4 集成测试（6 条，CI 真跑）
+
+`server/routes/question_mastery.integration.test.mjs`：
+
+1. 自己的题 upsert 成功且**幂等**（DB 核对只有 1 行）。
+2. 公共题 → **403 `FORBIDDEN_MASTERY`**。
+3. 标别人的私有题 → 403；无 Token → 401；`mastered` 非布尔 → 400 `INVALID_MASTERY`。
+4. `GET /questions?mastered=true|false` 过滤正确（**未标记的题两边都不出现**）。
+5. 列表每项 `mastered` 三态 `true` / `false` / `null`。
+6. 多用户隔离：B 标记不影响 A 的过滤。
+
+**PGlite 真库验证**（本机无 PG）：新测试 **6/6 pass / skipped 0**；回归 `questions.integration.test.mjs` **12/12**、`practice.integration.test.mjs` **8/8**。
+
+### 45.5 结果页对题处理（`practice_result_page.dart`）
+
+- 对题卡从「只有题干」改成 Column（题干 + 掌握度按钮行），**按钮仅在 `q.isMine` 时渲染**（公共题不显示 —— 后端会 403）。
+- `_markMastered(a)` → PATCH `mastered=true` → 立刻变绿「✓ 已掌握」。
+- `_markUnmastered(a)` → 先弹确认「将创建一条缺陷单，并标记该题未掌握」→ 确认后 PATCH `mastered=false` + `_createDefectForUnmastered(q)` → 变橙「待复习」。
+- `_createDefectForUnmastered(q)` → `createDefectTicket(userId: kDemoUserId, examProfileId:!, qType: q.stem, errorCause: '练习中未掌握，需复习', errorLayer: kPracticeDefaultErrorLayer /* '识别' */, questionId: q.id, priority: 'P1')`。
+- 顶部「全部标记已掌握」批量按钮（`_markAllMastered()`）。
+- `_masteryErrorText(e)` 把 `FORBIDDEN_MASTERY` 翻成「公共题不能标记掌握度 —— 这道题是别人上传的，标记只会影响你自己。」，403 翻成「这道题不属于你，不能标记掌握度。」。
+
+### 45.6 题库页筛选与徽标（`question_bank_page.dart`）
+
+- 新增 `enum _MasteryFilter { all / mastered / unmastered }`，三颗 chip（全部 / 已掌握 / 未掌握），切换后重新拉列表（过滤**走后端**）。
+- 卡片右上角徽标：已掌握绿（`AppColors.normal`）/ 未掌握橙（`AppColors.dueSoon`）；**未标记不显示徽标**。
+
+### 45.7 本轮抓到并修掉的 2 个真 bug
+
+| # | 现象 | 根因 | 修法 |
+|---|---|---|---|
+| 1 | 点「全部标记已掌握」后，**已标「未掌握」的题被改回 true** | 过滤条件写成 `_mastery[id] != true`（把 `false` 也当成「未标记」） | 改为 `_mastery[id] == null && _questionOf(id).isMine`，只处理**从未标记**的题；真机复验 DB：`masteredTrue=11 masteredFalse=2`，未掌握的两题未被覆盖 |
+| 2 | `node scripts/migrate.mjs` 连续 5 次 `ECONNRESET` | 本机 pg 直连 Neon pooler 通道被拒 | 改用 Neon serverless 的 **WebSocket** 通道（`@neondatabase/serverless` 的 `new Pool({..., ws:true})`），`执行完成，用时 1802 ms`，三张新表都在 |
+
+### 45.8 真机验证（Android 17 模拟器 + Neon 真库）
+
+| 项 | 结果 |
+|---|---|
+| D1 | 练习 10 题 → 8 答对 2 答错 → 80.0%；两题点「未掌握」→ 确认 → 均变「待复习」；DB 实证 `question_mastery` 7 行（5 true / 2 false）+ **自动建出 2 条缺陷单**（`error_layer=识别`、`error_cause=练习中未掌握，需复习`、`status=ANALYZED`） |
+| D2 | 题库页「已掌握」筛选 → 11 题，每卡绿徽标；「未掌握」→ 1 题橙徽标；API 侧 `mastered=true` → 11、`mastered=false` → 2 |
+| D3 | 公共题答题页显示「该题不提供答案，请自评」；结果页展开对题**只有题干、无掌握度按钮**（符合约束） |
+
+截图 7 张（`tillroad_app/screenshots/`）：`r2-practice-mastery-buttons.png`、`r2-practice-unmastered-toreview.png`、`r2-practice-unmastered-confirm.png`、`r2-practice-created-defect.png`、`r2-bank-mastered-filter.png`、`r2-bank-unmastered-filter.png`、`r2-bank-all.png`。
+
+### 45.9 收尾校验
+
+- `flutter analyze --no-fatal-infos` → **84 issues，0 error / 0 warning**。
+- `flutter test` → **All tests passed! (106 tests)**。
+- `npm test` → **tests 342 / pass 194 / fail 0 / skipped 148**。
+- Neon 真库：0004 迁移执行成功，`question_mastery` / `practice_sessions` / `practice_answers` 三表都在。
+
+### 45.10 遗留
+
+1. **删题**未做（题目只有软删，没有给用户的手动删题入口）—— R3。
+2. 练习记录**没有删除入口**（`practice_sessions` 有 `deleted_at` 但没做端点）。
+3. `duration_ms` 已经在收，但结果页与历史页**还没展示每题用时**。
+4. 掌握度只支持「掌握 / 未掌握」两态，没有「半掌握」或掌握度衰减。
+5. 掌握度**不参与抽题权重**（抽题仍是纯随机，不优先抽未掌握的题）。
+6. 公共题自评的对错仍**只存在练习记录里**，不回流题库（公共题本身也不能标记）。

@@ -21,6 +21,7 @@ import {
   updateWithVersion,
 } from './_common.mjs';
 import { normalizeQuestionText } from '../../core/index.mjs';
+import { masteryFilterClause } from './question_mastery.mjs';
 
 export const TABLE = 'questions';
 
@@ -216,7 +217,7 @@ export async function listByKnowledgeNode(
  */
 export async function listVisible(
   client,
-  { limit, offset, ownerUserId, subjectId, knowledgeNodeId, q, orderBy } = {},
+  { limit, offset, ownerUserId, subjectId, knowledgeNodeId, q, mastered, orderBy } = {},
 ) {
   const p = pageParams({ limit, offset });
   const where = ['deleted_at IS NULL'];
@@ -241,6 +242,21 @@ export async function listVisible(
     params.push(ownerUserId);
     where.push(`(owner_user_id IS NULL OR owner_user_id = $${params.length})`);
   }
+  // m25316：掌握状态过滤（练习模式 R2）。
+  //   mastered=true  → 有标记且标为已掌握；mastered=false → 有标记且标为未掌握。
+  //   「从没标记过」的题两个值都不匹配（未标记是第三种状态，单独筛暂不做）。
+  // 用 EXISTS 子查询（不是 JOIN），避免同一题因多行标记产生重复行。
+  if (typeof mastered === 'boolean' && ownerUserId) {
+    const mFilter = masteryFilterClause({
+      userId: ownerUserId,
+      mastered,
+      tableAlias: 'questions',
+      paramIndex: params.length + 1,
+    });
+    params.push(...mFilter.params);
+    where.push(mFilter.clause);
+  }
+
   // 题库列表默认「最新导入的排最前」—— 用户刚导入完要能立刻在第一屏看到自己导入的题。
   // 其余调用方（目前只有题库端点）可传 orderBy 覆盖。
   return listRows(client, TABLE, where, params, { ...p, orderBy: orderBy || 'created_at DESC, id DESC' });

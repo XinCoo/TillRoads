@@ -2,11 +2,12 @@
 // 题路 TillRoad · m17431：题库列表读取端点（纯读）
 //
 // 端点：
-//   GET    /questions?subject_id=&knowledge_node_id=&q=&limit=&offset=   题库列表
+//   GET    /questions?subject_id=&knowledge_node_id=&q=&mastered=&limit=&offset=   题库列表
 //   GET    /questions/:id                单题详情（编辑页回填用）
 //   POST   /questions                    手动建题（m23700 FE-02）
 //   PATCH  /questions/:id                编辑（base_version 必填，m23700）
 //   DELETE /questions/:id                软删（base_version 必填，m23700）
+//   PATCH  /questions/:id/mastery        标记掌握度（m25316 练习模式 R2）
 //
 // 为什么需要它：BE-02 只做了「导入」端点（POST /questions/import），
 // 前端从来没有「读题库」的入口 —— 测试人员装完 APK 只能看到预置的 9 条缺陷单，
@@ -21,9 +22,9 @@
 // 答案与解析在真正做这题时才需要（避免在列表页泄露答案）。
 
 import * as qRepo from '../repositories/questions.mjs';
+import * as masteryRepo from '../repositories/question_mastery.mjs';
 import { withTransaction } from '../repositories/base.mjs';
 import { ok, fail, pagination, readBaseVersion } from './_http.mjs';
-
 /** 依赖注入缝：与其它路由同形（ctx.repos 可注入 fake）。 */
 function resolve(ctx) {
   if (ctx.repos && ctx.repos.questions) {
@@ -40,6 +41,10 @@ async function listQuestions(ctx) {
   const rawQ = ctx.searchParams.get('q');
   const q = rawQ && rawQ.trim().length > 0 ? rawQ.trim() : null;
 
+  // m25316：掌握状态筛选。'true'/'false' 才是有效值；其它值（如 '1'、'yes'、空串）一律当作没传。
+  const rawMastered = ctx.searchParams.get('mastered');
+  const mastered = rawMastered === 'true' ? true : rawMastered === 'false' ? false : undefined;
+
   // limit/offset 复用 pagination（字符串→数字），非法值由仓储层 pageParams 兜底。
   const page = pagination(ctx.searchParams);
 
@@ -51,7 +56,19 @@ async function listQuestions(ctx) {
     subjectId: subjectId || null,
     knowledgeNodeId: knowledgeNodeId || null,
     q,
+    mastered,
+
   });
+
+  // m25316：题库列表带掌握度。批量查一次本批题的掌握度 Map（题库页要挂徽标）。
+  // 「没有标记记录」不在 Map 里 → 前端显示灰色「未标记」。
+  // client 为 null 说明走的是 fake 仓储注入（单元测试），此时没有真实表可查，跳过。
+  const masteryMap = client
+    ? await masteryRepo.listMasteryMap(client, {
+        userId: ctx.authUserId ?? null,
+        questionIds: rows.map((r) => r.id),
+      })
+    : new Map();
 
   const items = rows.map((r) => ({
     id: r.id,
@@ -70,6 +87,9 @@ async function listQuestions(ctx) {
     created_at: r.created_at,
     updated_at: r.updated_at,
     version: r.version,
+    // m25316：掌握度三态：true=已掌握 / false=未掌握 / null=未标记。
+    mastered: masteryMap.has(r.id) ? masteryMap.get(r.id) : null,
+
   }));
 
   return ok({
@@ -332,6 +352,50 @@ async function deleteQuestion(ctx, id) {
 }
 
 /**
+ * PATCH /questions/:id/mastery —— 标记题目的掌握状态（m25316 练习模式 R2）。
+ *
+ * 规则：
+ *   * 只能标记**自己**的题。公共题（owner_user_id IS NULL）与别人的题一律 403，
+ *     与 requireOwnQuestion（编辑/删除用 404）刻意不同：
+ *     这里的前端要明确告诉用户「公共题不能标记」，403 是必要的语义；
+ *     而编辑/删除的 404 是为了避免枚举题库 id（存在性泄露）。
+ *   * body 形如 { "mastered": true }；缺字段或不是布尔 → 400。
+ *   * 幂等 upsert：同一对 (user_id, question_id) 永远只有一行。
+ */
+async function setQuestionMastery(ctx, id) {
+  if (!ctx.authUserId) {
+    return fail('unauthorized', 401, { message: '标记掌握度需要有效的 Bearer Token' });
+  }
+  const body = ctx.body ?? {};
+  if (typeof body.mastered !== 'boolean') {
+    return fail('INVALID_MASTERY', 400, { message: 'mastered 必须是布尔值（true / false）' });
+  }
+  const { repo, client } = resolve(ctx);
+  const mastery = (ctx.repos && ctx.repos.questionMastery) ? ctx.repos.questionMastery : masteryRepo;
+  const row = await repo.getById(client, id);
+  if (!row) {
+    return fail('not_found', 404, { resource: 'questions', id });
+  }
+  if (row.owner_user_id !== ctx.authUserId) {
+    // 公共题与别人的题都不允许标记（公共题不是自己的，标记会污染他人内容）。
+    return fail('FORBIDDEN_MASTERY', 403, {
+      message: '只能标记自己导入或自己创建的题目',
+    });
+  }
+  // 单条 upsert，只需要一条语句 —— 不必开事务（也不必担心 client 为 null 的 fake 注入）。
+  const saved = await mastery.upsertMastery(client, {
+    userId: ctx.authUserId,
+    questionId: id,
+    mastered: body.mastered,
+  });
+  return ok({
+    question_id: id,
+    mastered: Boolean(saved.mastered),
+    updated_at: saved.updated_at,
+  });
+}
+
+/**
  * 路由分发。
  *
  * ★ m23700：本模块从「纯读」扩到「读 + 写」后，match 不能再一刀切 `if (method !== 'GET') return null`
@@ -350,7 +414,14 @@ export async function match(method, seg, ctx) {
     return listQuestions(ctx);
   }
 
+  // PATCH /questions/:id/mastery（m25316）—— 必须在 seg.length===2 分支**之前**，
+  // 否则 /questions/:id/mastery 会被当成 /questions/:id 抢走（seg.length 是 3，这里不会）。
+  if (method === 'PATCH' && seg.length === 3 && seg[0] === 'questions' && seg[2] === 'mastery') {
+    return setQuestionMastery(ctx, seg[1]);
+  }
+
   if (seg[0] === 'questions' && seg.length === 2) {
+
     const id = seg[1];
     if (method === 'GET') return getQuestion(ctx, id);
     if (method === 'PATCH') return updateQuestion(ctx, id);

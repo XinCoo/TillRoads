@@ -10,10 +10,15 @@
 //    并把 question_id 与「练习中未掌握」预填进去 —— 用户不用再选一次题、
 //    也不用重写错因。这一步是练习模式与缺陷单闭环的接口。
 // 3) **对题折叠**：对题没有错因要写，默认折叠，只给一个「已答对 N 道」的
-//    概要。掌握度标记（R2）还没做，这里刻意不做。
+//    概要。练习 R2 在展开后的每道对题上加了「已掌握 / 未掌握」标记按钮 ——
+//    用户答对之后最想做的事就是「记住了」，让这一步立刻落地。
 import 'package:flutter/cupertino.dart';
 
+import '../api/api_client.dart' show ApiException;
+import '../api/defect_api.dart';
 import '../api/practice_api.dart';
+import '../api/question_api.dart';
+import '../config/api_config.dart';
 import '../theme/app_theme.dart';
 import '../widgets/form_field.dart';
 import 'defect_create_page.dart';
@@ -48,6 +53,25 @@ class PracticeResultPage extends StatefulWidget {
 
 class _PracticeResultPageState extends State<PracticeResultPage> {
   bool _showRight = false;
+
+  /// 掌握度标记（练习 R2）：question_id → true(已掌握) / false(未掌握)。
+  ///
+  /// 初始为空 —— 页面刚进来时并不预取掌握度（那要多发一次列表请求），
+  /// 用户点按钮时才知道真值。标记成功的题会写进这里，按钮状态立刻变。
+  final Map<String, bool> _mastery = <String, bool>{};
+
+  /// 正在标记中的题（防止重复点）。
+  final Set<String> _marking = <String>{};
+
+  final QuestionApi _questionApi = QuestionApi();
+  final DefectApi _defectApi = DefectApi();
+
+  @override
+  void dispose() {
+    _questionApi.close();
+    _defectApi.close();
+    super.dispose();
+  }
 
   PracticeQuestion _questionOf(String questionId) {
     for (final PracticeQuestion q in widget.questions) {
@@ -100,6 +124,147 @@ class _PracticeResultPageState extends State<PracticeResultPage> {
         ),
       ),
     );
+  }
+
+  /// 「标记已掌握」（练习 R2）：PATCH mastery(true)。
+  ///
+  /// 后端只允许标记自己的题；公共题会 403 —— 那时提示用户
+  /// 「公共题不能标记」，而不是静默失败。
+  Future<void> _markMastered(PracticeLocalAnswer a) async {
+    if (_marking.contains(a.questionId)) return;
+    setState(() => _marking.add(a.questionId));
+    try {
+      await _questionApi.setMastery(id: a.questionId, mastered: true);
+      if (!mounted) return;
+      setState(() => _mastery[a.questionId] = true);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      _showMessage('标记失败', _masteryErrorText(e));
+    } finally {
+      if (mounted) setState(() => _marking.remove(a.questionId));
+    }
+  }
+
+  /// 「标记未掌握」（练习 R2）：确认后 PATCH mastery(false) + 自动建缺陷单。
+  ///
+  /// 为什么自动建单：用户点「未掌握」的意思就是「这道题我没掌握」，
+  /// 而缺陷单就是「未掌握的题」的载体。让这一步顺手完成，比让用户
+  /// 自己去缺陷单页再选一次题省事得多。
+  Future<void> _markUnmastered(PracticeLocalAnswer a) async {
+    if (_marking.contains(a.questionId)) return;
+    final PracticeQuestion q = _questionOf(a.questionId);
+    final bool ok = await _confirm(
+      '将创建一条缺陷单，并标记该题未掌握',
+      '这道题会进入你的「未掌握」列表，并自动建一条缺陷单。\n'
+      '之后可以在缺陷单里补充具体错因。',
+    );
+    if (!ok || !mounted) return;
+
+    setState(() => _marking.add(a.questionId));
+    try {
+      await _questionApi.setMastery(id: a.questionId, mastered: false);
+      await _createDefectForUnmastered(q);
+      if (!mounted) return;
+      setState(() => _mastery[a.questionId] = false);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      _showMessage('操作失败', _masteryErrorText(e));
+    } finally {
+      if (mounted) setState(() => _marking.remove(a.questionId));
+    }
+  }
+
+  /// 给未掌握的题自动建一条缺陷单（question_id 带上，错因预填）。
+  Future<void> _createDefectForUnmastered(PracticeQuestion q) async {
+    if (widget.examProfileId == null ||
+        widget.subjectId == null ||
+        widget.subjectName == null) {
+      _showMessage(
+        '未标记',
+        '这道题已标为未掌握，但没能建缺陷单：'
+        '这次练习没有关联科目。先在「考试配置」里给科目建好考点，再来归因。',
+      );
+      return;
+    }
+    await _defectApi.createDefectTicket(
+      userId: kDemoUserId,
+      examProfileId: widget.examProfileId!,
+      qType: q.stem.isEmpty ? '练习题' : q.stem,
+      errorCause: '练习中未掌握，需复习',
+      errorLayer: kPracticeDefaultErrorLayer,
+      questionId: q.id,
+      priority: 'P1',
+    );
+  }
+
+  /// 「全部标记已掌握」（练习 R2）：把展开后的对题批量标为已掌握。
+  Future<void> _markAllMastered() async {
+    final List<PracticeLocalAnswer> pending = _right
+        .where((PracticeLocalAnswer a) =>
+            _mastery[a.questionId] == null &&
+            _questionOf(a.questionId).isMine)
+        .toList(growable: false);
+    if (pending.isEmpty) {
+      _showMessage('无需标记', '本次答对的题都已经标为「已掌握」了。');
+      return;
+    }
+    int ok = 0;
+    int failed = 0;
+    for (final PracticeLocalAnswer a in pending) {
+      try {
+        await _questionApi.setMastery(id: a.questionId, mastered: true);
+        _mastery[a.questionId] = true;
+        ok += 1;
+      } on ApiException {
+        failed += 1;
+      }
+    }
+    if (!mounted) return;
+    setState(() {});
+    if (failed == 0) {
+      _showMessage('已标记', '已把 $ok 道答对的题标为「已掌握」。');
+    } else {
+      _showMessage('部分成功', '$ok 道已标记，$failed 道没成功（可能是公共题）。');
+    }
+  }
+
+  /// 掌握度相关的错误文案。
+  String _masteryErrorText(ApiException e) {
+    final Object? body = e.body;
+    final String code =
+        body is Map && body['error'] != null ? '${body['error']}' : '';
+    if (code == 'FORBIDDEN_MASTERY') {
+      return '公共题不能标记掌握度 —— 这道题是别人上传的，标记只会影响你自己。\n'
+          '（实际后端仍会拒绝，所以这里如实告诉你不行。）';
+    }
+    if (e.statusCode == 403) return '这道题不属于你，不能标记掌握度。';
+    return e.message;
+  }
+
+  /// 确认弹窗（返回 true 表示用户点了确认）。
+  Future<bool> _confirm(String title, String message) async {
+    final bool? result = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => CupertinoAlertDialog(
+        title: Text(title, style: const TextStyle(fontFamily: kFontFamily)),
+        content: Text(
+          message,
+          style: const TextStyle(fontFamily: kFontFamily, fontSize: 14),
+        ),
+        actions: <Widget>[
+          CupertinoDialogAction(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text('取消', style: TextStyle(fontFamily: kFontFamily)),
+          ),
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text('确定', style: TextStyle(fontFamily: kFontFamily)),
+          ),
+        ],
+      ),
+    );
+    return result ?? false;
   }
 
   Future<void> _retry() async {
@@ -168,6 +333,11 @@ class _PracticeResultPageState extends State<PracticeResultPage> {
             _buildSectionTitle('答对的题（${_right.length}）'),
             const SizedBox(height: 8),
             _buildRightCard(),
+            if (_right.isNotEmpty) ...<Widget>[
+              const SizedBox(height: 10),
+              _buildBatchMasteryButton(),
+              const SizedBox(height: 12),
+            ],
             const SizedBox(height: 28),
             _buildBottomButtons(),
           ],
@@ -436,18 +606,151 @@ class _PracticeResultPageState extends State<PracticeResultPage> {
                     top: BorderSide(color: AppColors.separator, width: 0.5),
                   ),
                 ),
-                child: Text(
-                  q.stem,
-                  style: const TextStyle(
-                    fontFamily: kFontFamily,
-                    fontSize: 13,
-                    height: 1.5,
-                    color: AppColors.label,
-                  ),
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: <Widget>[
+                    Text(
+                      q.stem,
+                      style: const TextStyle(
+                        fontFamily: kFontFamily,
+                        fontSize: 13,
+                        height: 1.5,
+                        color: AppColors.label,
+                      ),
+                    ),
+                    // 掌握度标记只对自己的题开放（公共题是别人上传的，
+                    // 后端会 403，所以干脆不显示按钮）。
+                    if (q.isMine) ...<Widget>[
+                      const SizedBox(height: 8),
+                      _buildMasteryRow(a),
+                    ],
+                  ],
                 ),
               );
             }),
         ],
+      ),
+    );
+  }
+  /// 单题掌握度标记行：「已掌握 / 未掌握」两个按钮。
+  Widget _buildMasteryRow(PracticeLocalAnswer a) {
+    final bool? marked = _mastery[a.questionId];
+    final bool busy = _marking.contains(a.questionId);
+    if (busy) {
+      return Row(
+        children: <Widget>[
+          const CupertinoActivityIndicator(radius: 7),
+          const SizedBox(width: 8),
+          const Text(
+            '标记中…',
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 12,
+              color: AppColors.secondaryLabel,
+            ),
+          ),
+        ],
+      );
+    }
+    if (marked == true) {
+      return Row(
+        children: <Widget>[
+          const Icon(
+            CupertinoIcons.checkmark_seal_fill,
+            size: 16,
+            color: AppColors.normal,
+          ),
+          const SizedBox(width: 6),
+          const Text(
+            '✓ 已掌握',
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: AppColors.normal,
+            ),
+          ),
+        ],
+      );
+    }
+    if (marked == false) {
+      return Row(
+        children: <Widget>[
+          const Icon(
+            CupertinoIcons.clock,
+            size: 16,
+            color: AppColors.dueSoon,
+          ),
+          const SizedBox(width: 6),
+          const Text(
+            '待复习',
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: AppColors.dueSoon,
+            ),
+          ),
+        ],
+      );
+    }
+    return Row(
+      children: <Widget>[
+        _masteryButton(
+          label: '已掌握',
+          color: AppColors.normal,
+          onPressed: () => _markMastered(a),
+        ),
+        const SizedBox(width: 8),
+        _masteryButton(
+          label: '未掌握',
+          color: AppColors.dueSoon,
+          onPressed: () => _markUnmastered(a),
+        ),
+      ],
+    );
+  }
+
+  Widget _masteryButton({
+    required String label,
+    required Color color,
+    required VoidCallback onPressed,
+  }) {
+    return CupertinoButton(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      color: color.withValues(alpha: 0.12),
+      borderRadius: BorderRadius.circular(AppRadii.chip),
+      onPressed: onPressed,
+      child: Text(
+        label,
+        style: TextStyle(
+          fontFamily: kFontFamily,
+          fontSize: 13,
+          fontWeight: FontWeight.w600,
+          color: color,
+        ),
+      ),
+    );
+  }
+
+  /// 「全部标记已掌握」批量按钮。
+  Widget _buildBatchMasteryButton() {
+    return SizedBox(
+      width: double.infinity,
+      child: CupertinoButton(
+        padding: const EdgeInsets.symmetric(vertical: 11),
+        color: AppColors.normal.withValues(alpha: 0.12),
+        borderRadius: BorderRadius.circular(AppRadii.chip + 4),
+        onPressed: _markAllMastered,
+        child: const Text(
+          '全部标记已掌握',
+          style: TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 15,
+            fontWeight: FontWeight.w600,
+            color: AppColors.normal,
+          ),
+        ),
       ),
     );
   }

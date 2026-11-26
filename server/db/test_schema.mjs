@@ -31,6 +31,7 @@ export const SCHEMA_SQL = readFileSync(join(ROOT, 'schema.sql'), 'utf8');
 export const MIGRATION_FILES = Object.freeze([
   'migrations/0002_questions_owner.sql',
   'migrations/0003_practice.sql',
+  'migrations/0004_question_mastery.sql',
 ]);
 
 const MIGRATION_SQL = MIGRATION_FILES.map((f) => ({

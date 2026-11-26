@@ -50,6 +50,15 @@ class _QuestionBankPageState extends State<QuestionBankPage> {
   /// 科目 id → 科目名（用于分组标题）。
   Map<String, String> _subjectNames = const <String, String>{};
 
+  /// 掌握状态筛选（练习 R2）。
+  ///
+  /// 三档：全部 / 已掌握 / 未掌握。
+  /// 注意「未掌握」是**标记过的**（mastered=false），
+  /// 跟「从没标记过」（mastered=null）不是一回事 ——
+  /// 后端 `mastered=false` 的过滤只回显真正标过「未掌握」的题。
+  _MasteryFilter _masteryFilter = _MasteryFilter.all;
+
+
   @override
   void initState() {
     super.initState();
@@ -64,6 +73,7 @@ class _QuestionBankPageState extends State<QuestionBankPage> {
     try {
       final List<BankQuestion> list = await _api.fetchQuestions(
         limit: 50,
+        mastered: _masteryFilter.masteredParam,
         currentUserId: kDemoUserId,
       );
       final Map<String, String> names = await _loadSubjectNames();
@@ -478,6 +488,12 @@ class _QuestionBankPageState extends State<QuestionBankPage> {
     }
 
     final List<Widget> slivers = <Widget>[];
+    slivers.add(
+      SliverPadding(
+        padding: const EdgeInsets.fromLTRB(16, 10, 16, 2),
+        sliver: SliverToBoxAdapter(child: _buildMasteryFilterRow()),
+      ),
+    );
     for (final MapEntry<String, List<BankQuestion>> entry in groups.entries) {
       final String title = entry.key.isEmpty
           ? '未分科'
@@ -525,6 +541,59 @@ class _QuestionBankPageState extends State<QuestionBankPage> {
     );
     return slivers;
   }
+  /// 掌握状态筛选行（练习 R2）：三颗 chip，点一下就重新拉列表。
+  Widget _buildMasteryFilterRow() {
+    return Row(
+      children: <Widget>[
+        for (final _MasteryFilter f in _MasteryFilter.values) ...<Widget>[
+          _MasteryChip(
+            label: f.label,
+            selected: f == _masteryFilter,
+            onTap: () {
+              if (f == _masteryFilter) return;
+              setState(() => _masteryFilter = f);
+              _load();
+            },
+          ),
+          const SizedBox(width: 8),
+        ],
+      ],
+    );
+  }
+}
+
+/// 一颗筛选 chip。
+class _MasteryChip extends StatelessWidget {
+  const _MasteryChip({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoButton(
+      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 7),
+      color: selected
+          ? AppColors.accent.withValues(alpha: 0.14)
+          : AppColors.card,
+      borderRadius: BorderRadius.circular(AppRadii.chip),
+      onPressed: onTap,
+      child: Text(
+        label,
+        style: TextStyle(
+          fontFamily: kFontFamily,
+          fontSize: 13,
+          fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+          color: selected ? AppColors.accent : AppColors.secondaryLabel,
+        ),
+      ),
+    );
+  }
 }
 
 /// 一道题的卡片：题干前两行 + 题型徽标 + 来源徽标 + 「我的」标记。
@@ -562,10 +631,17 @@ class _QuestionCard extends StatelessWidget {
             _Tag(text: question.sourceLabel, color: AppColors.secondaryLabel),
             if (question.isMine) ...<Widget>[
               const SizedBox(width: 6),
-              // 手动建题（FE-02）不是「导入」来的，别混用同一个标签。
               _Tag(
                 text: question.source == 'manual' ? '我建的' : '我导入的',
                 color: AppColors.normal,
+              ),
+            ],
+            // 掌握度徽标（练习 R2）：已掌握绿 / 未掌握橙 / 未标记不显示。
+            if (question.mastered != null) ...<Widget>[
+              const SizedBox(width: 6),
+              _Tag(
+                text: question.mastered! ? '已掌握' : '未掌握',
+                color: question.mastered! ? AppColors.normal : AppColors.dueSoon,
               ),
             ],
           ],
@@ -644,6 +720,21 @@ class _Tag extends StatelessWidget {
       ),
     );
   }
+}
+
+/// 掌握状态筛选（练习 R2）。
+enum _MasteryFilter {
+  all('全部', null),
+  mastered('已掌握', true),
+  unmastered('未掌握', false);
+
+  const _MasteryFilter(this.label, this.masteredParam);
+
+  /// 展示名。
+  final String label;
+
+  /// 传给后端的 `mastered` 参数（null = 不筛选）。
+  final bool? masteredParam;
 }
 
 /// 错误态：可重试。
