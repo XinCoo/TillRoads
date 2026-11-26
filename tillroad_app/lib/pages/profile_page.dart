@@ -174,6 +174,9 @@ class _ProfilePageState extends State<ProfilePage> {
       await _loadFromLocal();
       await refreshLocalFromCloud();
       await _loadFromLocal();
+      // 昵称不在本地库里（唯一真源是云端 users.nickname），所以必须单独重拉：
+      // 否则「另一端改了名，这台下拉刷新」看不到变化，就不是真·多端同步。
+      await _loadUser();
       if (mounted) setState(() => _loading = false);
       return;
     }
@@ -369,6 +372,106 @@ class _ProfilePageState extends State<ProfilePage> {
     // 账户卡片高亮闪烁 600ms：让用户看到「切换真的生效了」。
     _flashHighlight();
     showAppToast(context, '已切换至 ${result.displayName}');
+  }
+
+  /// 修改用户名（m28943）。
+  ///
+  /// 需求：入口就在用户名旁边（不新增独立页面），点击弹框修改；并且必须
+  /// 「多端同步」。所以这里**不写任何本地缓存**，成功后直接用后端返回的
+  /// 最新资料覆盖 `_user`。`users.nickname` 是唯一真源，其他端下次
+  /// `GET /me` 自然读到新值（下拉刷新 / 切 Token 都会重拉）。
+  ///
+  /// 失败必须报错，不得静默失败（与 A3 同一条要求）。
+  Future<void> _renameNickname() async {
+    final String? name = await showCupertinoDialog<String>(
+      context: context,
+      builder: (BuildContext ctx) =>
+          _RenameNicknameDialog(initialName: _user?.nickname ?? ''),
+    );
+    // 弹框已出栈；null = 用户取消。
+    if (name == null || name.isEmpty) return;
+    if (!mounted) return;
+    try {
+      final UserProfile profile = await _userApi.updateNickname(name);
+      if (!mounted) return;
+      setState(() {
+        _user = profile;
+        _userError = null;
+      });
+      // 与切换 Token 同一套反馈：高亮闪一下 + 顶部 toast。
+      _flashHighlight();
+      showAppToast(context, '用户名已更新');
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      await _showRenameError(_renameErrorText(e));
+    } catch (e) {
+      if (!mounted) return;
+      await _showRenameError('$e');
+    }
+  }
+
+  /// 把 `PATCH /me` 的错误翻成能直接给人看的一句话。
+  ///
+  /// 后端 400 的 `message` 就是面向用户的（与前端本地校验同一套规则），
+  /// 优先用它；拿不到 message 时才退回通用文案。
+  static String _renameErrorText(ApiException e) {
+    final Object? body = e.body;
+    if (body is Map) {
+      final Object? code = body['error'];
+      final Object? message = body['message'];
+      if (code == 'INVALID_NICKNAME' &&
+          message is String &&
+          message.isNotEmpty) {
+        return message;
+      }
+      if (code == 'MISSING_NICKNAME') return '没有收到新的用户名，请重试。';
+      if (code == 'not_found') return '这个账号已不存在，请重新输入 Token。';
+    }
+    if (e.statusCode == 401) return '当前 Token 已失效，请重新输入 Token。';
+    return e.message;
+  }
+
+  /// 修改用户名失败时的报错弹窗（与 `_showSwitchError` 同形，只是文案不同）。
+  Future<void> _showRenameError(String reason) async {
+    if (!mounted) return;
+    await showCupertinoDialog<void>(
+      context: context,
+      builder: (BuildContext ctx) => CupertinoAlertDialog(
+        title: const Text(
+          '修改失败',
+          style: TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+            color: AppColors.overdue,
+          ),
+        ),
+        content: Text(
+          '$reason\n\n用户名没有改动，请重试。',
+          style: const TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 13,
+            height: 1.35,
+            color: AppColors.label,
+          ),
+        ),
+        actions: <Widget>[
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text(
+              '知道了',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 17,
+                fontWeight: FontWeight.w600,
+                color: AppColors.accent,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
   }
 
   /// 退出：清掉本机 token，回到 token 输入页。
@@ -781,6 +884,27 @@ class _ProfilePageState extends State<ProfilePage> {
                               ),
                             ),
                           ),
+                          // 修改用户名入口（m28943）：紧挨昵称，不新增独立入口。
+                          // 只在拿到后端资料后出现 —— 昵称还没加载出来时改名
+                          // 会把「未命名用户」当成初值，容易误存。
+                          if (!_userLoading && _user != null) ...<Widget>[
+                            const SizedBox(width: 6),
+                            Semantics(
+                              button: true,
+                              label: '修改用户名',
+                              child: CupertinoButton(
+                                padding: EdgeInsets.zero,
+                                minimumSize: Size.zero,
+                                pressedOpacity: 0.4,
+                                onPressed: _renameNickname,
+                                child: const Icon(
+                                  CupertinoIcons.pencil,
+                                  size: 15,
+                                  color: AppColors.accent,
+                                ),
+                              ),
+                            ),
+                          ],
                           if (_userLoading) ...<Widget>[
                             const SizedBox(width: 8),
                             const CupertinoActivityIndicator(radius: 7),
@@ -994,6 +1118,152 @@ class _ProfilePageState extends State<ProfilePage> {
           ],
         ],
       ),
+    );
+  }
+}
+
+/// 「修改用户名」弹窗（m28943）。
+///
+/// 单独做成 StatefulWidget 只为一件事：`TextEditingController` 必须有人
+/// dispose —— 与设置页 `_TokenDialog` 同样的理由，放在 `_ProfilePageState`
+/// 里会因为弹窗反复开关而泄漏。
+///
+/// 校验做两层，规则必须一致：
+///   1. 这里本地先校验一遍，用户输错立刻看到红字，不必等一次网络往返；
+///   2. 后端 `PATCH /me` 仍会再校验一次并返回 400 `INVALID_NICKNAME`
+///      （规则在 `core/validators.mjs` 的 V15）——本地校验只是体验，
+///      不能当成防线。
+class _RenameNicknameDialog extends StatefulWidget {
+  const _RenameNicknameDialog({this.initialName});
+
+  /// 当前昵称，作为输入框初值（用户多半只想改一两个字）。
+  final String? initialName;
+
+  @override
+  State<_RenameNicknameDialog> createState() => _RenameNicknameDialogState();
+}
+
+class _RenameNicknameDialogState extends State<_RenameNicknameDialog> {
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.initialName ?? '');
+
+  /// 本地校验错误；null 表示当前输入没问题。
+  String? _error;
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  /// 与后端 V15 逐条对齐：trim → 非空 → 只允许中文基本区 / 英文 / 数字
+  /// → 长度 2–20（按 code point 计，与 JS 的 `Array.from().length` 同口径）。
+  static String? _validate(String raw) {
+    final String name = raw.trim();
+    if (name.isEmpty) return '用户名不能为空';
+    if (!RegExp(r'^[\u4e00-\u9fa5A-Za-z0-9]+$').hasMatch(name)) {
+      return '用户名只能包含中文、英文、数字，不能有空格或符号';
+    }
+    final int length = name.runes.length;
+    if (length < 2) return '用户名至少 2 个字符';
+    if (length > 20) return '用户名不能超过 20 个字符';
+    return null;
+  }
+
+  void _submit() {
+    final String name = _controller.text.trim();
+    final String? problem = _validate(name);
+    if (problem != null) {
+      setState(() => _error = problem);
+      return;
+    }
+    Navigator.of(context).pop(name);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoAlertDialog(
+      title: const Text(
+        '修改用户名',
+        style: TextStyle(
+          fontFamily: kFontFamily,
+          fontSize: 17,
+          fontWeight: FontWeight.w600,
+          color: AppColors.label,
+        ),
+      ),
+      content: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: <Widget>[
+          const Text(
+            '只能用中文、英文、数字，2–20 个字。修改后会同步到所有端。',
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 13,
+              height: 1.35,
+              color: AppColors.secondaryLabel,
+            ),
+          ),
+          const SizedBox(height: 12),
+          CupertinoTextField(
+            controller: _controller,
+            autofocus: true,
+            maxLength: 20,
+            placeholder: '输入新的用户名',
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            style: const TextStyle(fontFamily: kFontFamily, fontSize: 15),
+            placeholderStyle: const TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 15,
+              color: AppColors.tertiaryLabel,
+            ),
+            onChanged: (_) {
+              // 用户开始改就撕掉上一次的红字，避免「已经改对了还报错」。
+              if (_error != null) setState(() => _error = null);
+            },
+            onSubmitted: (_) => _submit(),
+          ),
+          if (_error != null) ...<Widget>[
+            const SizedBox(height: 8),
+            Text(
+              _error!,
+              style: const TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 12,
+                height: 1.3,
+                color: AppColors.overdue,
+              ),
+            ),
+          ],
+        ],
+      ),
+      actions: <Widget>[
+        CupertinoDialogAction(
+          onPressed: () => Navigator.of(context).pop(),
+          child: const Text(
+            '取消',
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 17,
+              color: AppColors.accent,
+            ),
+          ),
+        ),
+        CupertinoDialogAction(
+          isDefaultAction: true,
+          onPressed: _submit,
+          child: const Text(
+            '保存',
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 17,
+              fontWeight: FontWeight.w600,
+              color: AppColors.accent,
+            ),
+          ),
+        ),
+      ],
     );
   }
 }

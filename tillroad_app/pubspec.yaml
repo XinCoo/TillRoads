@@ -93,13 +93,17 @@ flutter:
     - family: LXGWNeoZhiSong
       fonts:
         - asset: "assets/fonts/霞鹜新致宋字体.ttf"
-
-hooks:
-  # sqlite3 包在构建时要从 GitHub Releases 下载预编译的原生库
-  # （libsqlite3.<abi>.so）。直连 github.com 在本机网络下超时，
-  # 而 ghproxy 转发可用，故用它取同一个 Release 资产。
-  # 文件内容与官方完全一致 —— 下载后仍按官方 SHA-256 校验（sqlite3 包自带 hash 表），
-  # 校验不过会直接构建失败，所以这里不会引入“来路不明”的二进制。
-  user_defines:
-    sqlite3:
-      url_pattern: https://ghproxy.net/https://github.com/simolus3/sqlite3.dart/releases/download/$RELEASE_TAG/$FILENAME
+# 关于 sqlite3 原生库的下载地址（踩坑记录，勿删）：
+# sqlite3 包在构建时要从 GitHub Releases 下载预编译的 libsqlite3.<abi>.so。
+# 本机曾因直连 github.com 超时，在此加过 hooks.user_defines.sqlite3.url_pattern
+# 指向 ghproxy.net 转发；后来该镜像不可达（errno = 101），构建再次失败。
+# 现恢复官方默认地址（不加 hooks 段），github.com 直连可用。
+# 若以后 github.com 又不可达，临时加回下面这段即可，构建完再删掉：
+#   hooks:
+#     user_defines:
+#       sqlite3:
+#         url_pattern: https://gh-proxy.com/https://github.com/simolus3/sqlite3.dart/releases/download/$RELEASE_TAG/$FILENAME
+# 说明：镜像只转发同一个 Release 资产，下载后仍按 sqlite3 包内置的
+# SHA-256 校验，校验不过直接构建失败，不会引入来路不明的二进制。
+# 不建议把镜像长期留在仓库里：CI 的 runner 直连 GitHub 正常，
+# 而第三方镜像的可用性不受我们控制（这次就是镜像挂了导致的构建失败）。

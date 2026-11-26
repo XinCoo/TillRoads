@@ -160,6 +160,11 @@ Future<void> saveApiToken(String token) async {
     await preferences.setString('api_token', normalized);
     _apiToken = normalized;
   }
+  // 必须在**内存里**也立刻生效：`kApiToken` 是 getter，每次请求都重算。
+  // 少了这一行，用户切换/保存 token 后本次运行仍会一直用构建期的
+  // `--dart-define=API_TOKEN=...`，表现为「点了没反应、数据还是上个账号」——
+  // 只有杀掉进程重启（initializeApiToken 读 prefs 时才置位）才生效。
+  _tokenOverriddenByUser = true;
 }
 
 /// 单次请求超时。

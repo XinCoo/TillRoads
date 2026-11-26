@@ -2834,3 +2834,90 @@ application-label:'题路'
 - **没有动 Railway 面板、没有直连 Neon 执行 SQL**（除只读查询与幂等的 seed 脚本外）；TOKENS 与 Redeploy 由用户在面板上操作。
 - **iOS Bundle Identifier 未改**（需要 Mac + Xcode 验证）。
 - **后端零改动**：token 格式变了不需要改代码 —— `server/auth.mjs` 的 `parseTokens()` 按 `token:user_uuid` 逗号分隔解析，对 token 前缀无假设。唯一需要注意的是**脱敏正则**（Flutter 侧），已处理。
+
+---
+
+## 48. 用户信息与修改用户名归档（m28943：`GET /me` / `PATCH /me`）
+
+需求原文：「我的页面加一个用户名修改功能，用户名旁边加一个修改按钮，不需要单独做入口，点击后弹出对话框修改。该功能需要多端同步，用户名中不能有非法字符，应该为中文、英文、数字的组合。」
+
+### 48.1 前置侦察（改动前的真实状态）
+
+- **后端没有「当前用户」端点**：`server/` 生产代码里 `nickname` 零命中、`SELECT ... FROM users` 零命中；只有 `GET /users/:id/exam-profiles` 等按 id 取业务数据的端点。`users.nickname` 在 `schema.sql:82`（`text`，可空，无长度约束）。
+- **前端 ID 是硬编码的**：`tillroad_app/lib/config/api_config.dart:23` 的 `kDemoUserId = '11111111-1111-4111-8111-111111111111'`，「我的」页把它脱敏成 `1111****`。所以所有账号都显示同一个 ID —— 这正是用户说的「多个账号 ID 都是 1111****」的根因，与 token 无关。
+- **昵称是硬编码字符串**：`profile_page.dart` 里 `'未命名用户'` 直接写在 `Text` 里，没有任何来源。
+
+### 48.2 后端（2 个端点）
+
+`server/routes/users.mjs`（155 → 约 210 行）：
+
+- `GET /me` → `{id, nickname, display_name, masked_id}`；无 token 401；用户软删 404。
+- `PATCH /me` body `{nickname}` → 与 `GET /me` 同形。缺字段 400 `MISSING_NICKNAME`；校验失败 400 `INVALID_NICKNAME`（透传中文原因）；软删用户 404。
+- `maskUuid(id)`（去连字符取前 4 位 + `****`）与前端 `app_logger.dart` 的 `maskUuid` 同口径；`displayName(nickname, id)` 昵称优先，否则 `用户_<id 末 4 位>`。
+- **为什么不是 `/users/me`**：`server/index.mjs:101-108` 会把 `/users/<第 2 段>` 无条件改写成 `authUserId`，`me` 会被当 uuid → 必然 404。两个端点因此放在根路径。
+- **为什么不加 `base_version`**：昵称是单值覆盖语义（「我叫什么」），没有字段级冲突；两端同时改名时后到覆盖先到符合预期。`version` 仍由 `users` 表的 `set_updated()` 触发器自增（集成测试里断言改名后 `version >= 2`）。
+
+### 48.3 校验（`core/validators.mjs` V15 `validateNickname`）
+
+规则：必须 `string`；`trim()` 后非空；正则 `^[\u4e00-\u9fa5A-Za-z0-9]+$`（中文基本区 + 英文 + 数字，不允许空格/符号）；长度按 `Array.from(...).length`（code point）2–20。错误码统一 `INVALID_NICKNAME`，`message` 是可直接展示给用户的中文。
+
+- 汉字只放行基本区 U+4E00–U+9FA5（扩展区生僻字暂不放行，避免与字体覆盖不一致）。
+- DB 列是 `text` 无长度约束，所以上限只能在应用层做。
+- 前端 `_RenameNicknameDialog._validate()` 与 V15 **逐条对齐**，做「即时反馈」；后端仍必须兜底（前端可被绕过）。
+
+### 48.4 前端（不新增独立入口）
+
+`tillroad_app/lib/pages/profile_page.dart`（1208 → 约 1480 行）：
+
+- 用户名右侧一个铅笔图标（`CupertinoIcons.pencil`，15px，accent 色），`Semantics(button: true, label: '修改用户名')`；**只在 `!_userLoading && _user != null` 时出现** —— 昵称没加载出来时改名会把「未命名用户」当初值误存。
+- 点击弹 `_RenameNicknameDialog`（独立 `StatefulWidget`，持有 `TextEditingController` 并在 `dispose` 里释放）。**不能把 controller 放在页面 State 里**：弹窗退场动画还会再跑一帧，会踩 `A TextEditingController was used after being disposed`。`settings_page.dart` 的 `_TokenDialog` 是同一处理。
+- 本地校验不通过 → 只 `setState(_error)`，**不关弹窗、不发请求**；通过才 `Navigator.pop(name)`。
+- `_renameNickname()` → `_userApi.updateNickname(name)` → 成功 `setState(_user = profile)` + `_flashHighlight()`（600ms）+ `showAppToast('用户名已更新')`；`ApiException` → `_renameErrorText(e)` 映射成人话 → `_showRenameError()` 弹「修改失败」。**不得静默失败**（与 A3 同一条要求）。
+- **不写任何本地昵称缓存**：`users.nickname` 是唯一真源。
+
+### 48.5 多端同步的口径与一个真缺口
+
+- 本机改完：直接用后端返回值覆盖 `_user`。
+- 其他端：下拉刷新 / 切 Token / 冷启动时重拉 `/me`。
+- **发现并修掉的缺口**：`profile_page._refresh()` 在「本地优先」分支里只做 `_loadFromLocal → refreshLocalFromCloud → _loadFromLocal`，**从不重拉 `/me`**；而昵称不在本地 SQLite 里，于是「另一端改了名，这台下拉刷新」看不到变化 —— 不满足「多端同步」。修法是该分支里补一次 `await _loadUser()`。
+
+### 48.6 ★ 顺带修掉的真 bug：切换 Token 后本轮不生效
+
+真机复测「切换 Token」时发现：`shared_prefs` 里 `flutter.api_token` 已变成新 token，但 `flutter.current_user_id` 仍是旧 id、本地库 18 行旧账号数据一条没清、界面昵称与统计全是旧账号。后端 `/me` 用 node fetch 直打两个 token 都正常，排除服务端问题。
+
+根因在 `tillroad_app/lib/config/api_config.dart`：`kApiToken` getter 原本是「构建期 `--dart-define=API_TOKEN` 优先」，而本轮 APK 正是带 `--dart-define=API_TOKEN=tltest001` 构建的。`initializeApiToken()` 里虽然置了 `_tokenOverriddenByUser = true`，但 `saveApiToken()` **没有置**。于是用户保存新 token 后：prefs 更新了、`_apiToken` 也更新了，但 getter 仍走 `kApiTokenFromDefine` → **本次运行所有请求继续带旧 token**；随后 `_loadUser()` 用旧 token 调 `/me` 拿到旧用户，又把 `current_user_id` 写回旧 id。表现为「点了没反应、数据还是上个账号」，只有杀进程重启才生效。
+
+修法：`saveApiToken()` 末尾补 `_tokenOverriddenByUser = true;`（清空分支同样置位），并写注释说明「kApiToken 是 getter，每次请求重算；少了这行就是 A3 明令禁止的静默失败」。
+
+### 48.7 测试
+
+- `core/validators.test.mjs` 新增 V15 用例：合法（`张三` / `Tom` / `abc123` / `张三Tom2026` / `张三A1`）、trim（`'  李四  '`）、边界（2 字、20 字）、超长（21 字）、非法（`张 三` / `zhang_san` / `zhang-san` / `张三!` / `张三🙂` / `a` / 空串 / 全空白）、非字符串（`null` / `123` / `undefined`）、失败形状 `Object.isFrozen`。`node --test core/validators.test.mjs` → **16/16**。
+  - 踩坑：首版把 `'　　张三'`（全角空格在前导）断言为非法 → 失败，因为 `String.prototype.trim()` 会连 U+3000 一起去掉。正确口径是「中间全角空格非法、首尾全角空格 trim 后合法」。
+- `server/routes/users.integration.test.mjs`（241 → 356 行，6 → 13 用例）：新增 7 条 PATCH 用例 —— 改名 200 并回显 + `GET /me` 立即可读（多端同步证据）+ 直查库断言 `nickname` 与 `version >= 2`；首尾空白被 trim；无 token 401；缺 nickname 400 `MISSING_NICKNAME`；非法字符/空格/emoji/a 一律 400 `INVALID_NICKNAME` **且断言库里的昵称未被改动**（失败不写库）；超长 400；软删用户 404。
+- **PGlite 真库**：`server/routes/.tmp-users.pglite.test.mjs`（临时复制 + 只替换 pool import）→ **13/13 pass**，含 6 条 GET 与 7 条 PATCH。
+  - 适配器要点：`createPool()` 必须**同步**返回 `{query, connect, end, on}`；`query` 里「无参数且 `/;\s*\S/` 命中」走 `db.exec(text)`（多语句简单查询协议），否则 `db.query(text, params)`；`rowCount` 取 `rows.length > 0 ? rows.length : res.affectedRows`。
+- `flutter test` → **108/108**；`flutter analyze --no-fatal-infos` → **90 issues，0 error / 0 warning**（90 全是既有 `deprecated_member_use` info）。
+
+### 48.8 真机验收（Android 17 模拟器 + 本地 ws 后端连 Neon）
+
+1. 「我的」页 dump：账户卡 `content-desc="联调演示用户&#10;修改用户名"`；内部子节点 `Button bounds=[581,480][620,519]` 即铅笔按钮（60×60 命中区）。
+2. 点铅笔 → 弹窗：「修改用户名 / 只能用中文、英文、数字，2–20 个字。修改后会同步到所有端。/ EditText / 取消 / 保存」。
+3. 输入 `Tom2026` → 保存 → 账户卡变 `Tom2026`。截图 `screenshots/iter-nickname-profile.png`。
+4. 输入 `abc_def` → 保存 → **弹窗不关**，内联红字「用户名只能包含中文、英文、数字，不能有空格或符号」。截图 `screenshots/iter-nickname-invalid.png`。
+5. 切 Token `tltest002` → 昵称变「测试用户B」、ID 变 `cbd8****`、数据概览变 3 单 / 0% / 进行中 1；`shared_prefs` 的 `flutter.current_user_id` 变 `cbd8eb64-…`；本地库重填为 B 的 3 行。**（这是 48.6 修复后的结果；修复前此步完全无效。）**
+6. 切回 `tltest001` → 昵称仍是服务端已保存的 `Tom2026`（不是本机缓存）→ 多端同步成立。
+7. 另用脚本从「另一台设备」`PATCH /me` 改成「另一端改的名」→ 本机下拉刷新 → 昵称变「另一端改的名」→ **下拉刷新这条路径也验证了 48.5 的补丁**。
+
+### 48.9 环境与操作事实（本轮新增）
+
+- 本机 `github.com` 直连已恢复，而 `ghproxy.net` 已不可达 → `pubspec.yaml` 里那段 `hooks.user_defines.sqlite3.url_pattern` 镜像**已删除**，回落官方默认地址（`https://github.com/simolus3/sqlite3.dart/releases/download/$RELEASE_TAG/$FILENAME`），并保留 14 行注释记录「直连超时→加镜像→镜像挂了→回落默认」的经过与一份临时可用片段。删段后必须 `flutter pub get` 且删掉 `.dart_tool/hooks_runner`（坏缓存会一直失败）。
+- `adb shell input text` 对中文与空格不可靠（`%s` 是 adb 的空格转义）；清空输入框要 `keyevent 123`(END) + 多次 `keyevent 67`(DEL)。
+- `adb pull` 会因 stderr 让 PowerShell 报 `NativeCommandError`，文件其实拉下来了，属噪声。
+- PowerShell 的 `Invoke-RestMethod -Method Patch` 打 `PATCH /me` + 中文 body 会失败（400），**同样的请求用 node `fetch` 返回 200** —— 是 PS 的用法/编码问题，不是接口 bug。验接口一律用 node `fetch`。
+- 读 uiautomator dump 必须 `[System.IO.File]::ReadAllText(path, UTF8)`（PowerShell 默认编码会乱码）。
+
+### 48.10 遗留
+
+- 昵称长度上限只在应用层（`text` 列无约束）；如果将来要数据库级兜底，需要加 `CHECK (char_length(nickname) BETWEEN 2 AND 20)` 的迁移。
+- 昵称无唯一性要求（允许重名）；如需唯一，得另加唯一索引并处理冲突文案。
+- 没有修改历史（谁在什么时候改过），也不做敏感词过滤。
