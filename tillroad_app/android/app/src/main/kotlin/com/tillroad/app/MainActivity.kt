@@ -1,4 +1,4 @@
-package com.tillroad.tillroad_app
+package com.tillroad.app
 
 import io.flutter.embedding.android.FlutterActivity
 

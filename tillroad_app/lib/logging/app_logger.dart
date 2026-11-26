@@ -95,10 +95,14 @@ final RegExp _bearerRe = RegExp(
   caseSensitive: false,
 );
 
-/// `tk_test_001` 一类的固定 token → `***`。
+/// 固定 token 前缀 → `***`。
+///
+/// 覆盖两种历史格式：
+///   - `tk_test_001` —— 本地/旧 Railway 的调试 token（已失效）；
+///   - `tltest001`  —— 分发前重置后的正式测试 token（Railway TOKENS 现用这个）。
 ///
 /// 前置 `\b`：避免把 `task_x`、`risk_abc` 这类正常单词误伤成 `***`。
-final RegExp _tkTokenRe = RegExp(r'\btk_[A-Za-z0-9_]+');
+final RegExp _apiTokenRe = RegExp(r'\b(?:tk_|tltest)[A-Za-z0-9_]+');
 
 /// UUID（用户 ID、缺陷单 ID、复盘 ID 都是这个格式）。
 final RegExp _uuidRe = RegExp(
@@ -127,7 +131,7 @@ String maskUuid(String uuid) {
 /// 对任意日志文本执行脱敏。**在进入缓冲区之前调用**（见 `AppLogger._write`）。
 ///
 /// 顺序有讲究：先替 UUID 再替 query secret，最后替 Bearer / tk_ token。
-/// 实际上三种规则互不重叠（UUID 是十六进制带连字符、tk_ 有前缀、Bearer 有前缀），
+/// 顺序有讲究：先替 UUID 再替 query secret，最后替 Bearer / 固定前缀 token。
 /// 顺序不影响结果，这里按「最长匹配优先」的习惯排列。
 String sanitizeLogText(String text) {
   String s = text;
@@ -137,7 +141,7 @@ String sanitizeLogText(String text) {
     (Match m) => '${m.group(1)}=***',
   );
   s = s.replaceAllMapped(_bearerRe, (Match m) => 'Bearer ***');
-  s = s.replaceAllMapped(_tkTokenRe, (Match m) => '***');
+  s = s.replaceAllMapped(_apiTokenRe, (Match m) => '***');
   return s;
 }
 

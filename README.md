@@ -818,7 +818,7 @@ R2 的掌握度标记只能「标」，不能「不看」——用户一周下�
 
 
 ## 5.5 应用界面与字体（`tillroad_app/`）
-## 5.5 应用界面与字体（`tillroad_app/`）
+
 
 ### 字体
 
@@ -1098,7 +1098,7 @@ App 给外部测试用户后拿不到 adb logcat，所以自带一份「可导�
 
 **本地派生量与云端同口径**：urgency 用同一套 7/14/21 窗口公式本地复算（验证页的筛选因此从「走后端」改为本地过滤，不再产生网络往返）；缺陷分布 / 验证摘要 / 缺陷单展示名全部在本地 JOIN 或聚合出与云端**形状完全相同**的结果，页面只有一条渲染路径。
 
-**数据库文件位置**：`getDatabasesPath()/tillroad_local.db`。Android 上即 `/data/data/com.tillroad.tillroad_app/databases/tillroad_local.db`（与其他 sqflite 应用一致，root 设备或 `adb shell run-as` 可见）。
+**数据库文件位置**：`getDatabasesPath()/tillroad_local.db`。Android 上即 `/data/data/com.tillroad.app/databases/tillroad_local.db`（与其他 sqflite 应用一致，root 设备或 `adb shell run-as` 可见；包名在 v1.1.0 已从 `com.tillroad.tillroad_app` 改为 `com.tillroad.app`）。
 
 **Windows 不支持**：`sqflite` 的桌面实现要额外的 `sqflite_common_ffi` + `sqlite3_flutter_libs`，本轮按拍板第 5 条不做，桌面端 `kLocalFirstEnabled` 保持 `false`、继续直连云端。测试能跑是因为 `sqflite_common_ffi` 只进了 `dev_dependencies`（`test/local_db_test.dart` 里通过 `LocalDb.debugFactoryOverride` 注入）。
 **分页终止只能看 `items.length < limit`**：后端 `defect-tickets` 响应里没有 `total`，`mock-exams` / `review-cycles` 的 `total` 就是 `items.length`（假 total）。所以首次填充与后台刷新都用 `items.length < 200` 判断结束，且 **200 必须与服务端 `pageParams` 的上限一致**——写成 300 会被服务端夹回 50，每页都「不满」而立刻终止，数据静默缺失。
@@ -1138,15 +1138,15 @@ App 给外部测试用户后拿不到 adb logcat，所以自带一份「可导�
 | `TOKENS` | `tk_test_001:<user-1-uuid>,tk_test_002:<user-2-uuid>` | 固定邀请 Token 与 userId 映射 |
 | `PORT` | Railway 自动注入 | 不手动设置 |
 
-当前联调映射为：`tk_test_001` → `11111111-1111-4111-8111-111111111111`，`tk_test_002` → `cbd8eb64-73d9-44c3-9898-aa2e701e8d84`。Token 只通过 `Authorization: Bearer <token>` 发送，后端不会记录 Token。`/health` 和 CORS `OPTIONS` 预检公开，其余请求在配置 `TOKENS` 后必须鉴权。移动端没有浏览器 `Origin`，因此 MVP 保留 `Access-Control-Allow-Origin: *` 与 `Access-Control-Allow-Credentials: false`。
+分发前的四个测试 token 映射为：`tltest001` → `11111111-1111-4111-8111-111111111111`，`tltest002` → `cbd8eb64-73d9-44c3-9898-aa2e701e8d84`，`tltest003` → `939705ec-7dd1-4b2e-bba4-e18e57175b08`，`tltest004` → `50bf600c-b648-4722-9378-160d6711acdf`。**旧的 `tk_test_001` / `tk_test_002` 已失效**（分发前重置），拿旧 token 请求会得到 401。Token 只通过 `Authorization: Bearer <token>` 发送，后端不会记录 Token。`/health` 和 CORS `OPTIONS` 预检公开，其余请求在配置 `TOKENS` 后必须鉴权。移动端没有浏览器 `Origin`，因此 MVP 保留 `Access-Control-Allow-Origin: *` 与 `Access-Control-Allow-Credentials: false`。
 
 ### 验证与发布 APK
 
 ```bash
 curl -i https://tillroads-production.up.railway.app/health
-curl -i -H "Authorization: Bearer tk_test_001" https://tillroads-production.up.railway.app/users/11111111-1111-4111-8111-111111111111/exam-profiles
+curl -i -H "Authorization: Bearer tltest001" https://tillroads-production.up.railway.app/users/11111111-1111-4111-8111-111111111111/exam-profiles
 curl -i https://tillroads-production.up.railway.app/users/11111111-1111-4111-8111-111111111111/exam-profiles
-flutter build apk --release --dart-define=API_BASE_URL=https://tillroads-production.up.railway.app --dart-define=API_TOKEN=tk_test_001
+flutter build apk --release --dart-define=API_BASE_URL=https://tillroads-production.up.railway.app --dart-define=API_TOKEN=tltest001
 ```
 
 不提供 `API_TOKEN` 时，App 首次启动会显示 Token 输入页，并使用 `shared_preferences` 保存在本机；编译期 Token 优先于本地保存值。APK 输出路径为 `tillroad_app/build/app/outputs/flutter-apk/app-release.apk`。部署完成后应确认 `/health` 返回 200、无 Token 返回 401、正确 Token 返回自己的数据，另一个 Token 可以返回其用户的空列表。
@@ -1175,7 +1175,7 @@ keytool -genkeypair -keystore tillroad_app/android/tillroad-release.jks -storety
 然后构建并校验签名：
 
 ```powershell
-flutter build apk --release --dart-define=API_BASE_URL=https://tillroads-production.up.railway.app --dart-define=API_TOKEN=tk_test_001
+flutter build apk --release --dart-define=API_BASE_URL=https://tillroads-production.up.railway.app --dart-define=API_TOKEN=tltest001
 apksigner verify --print-certs tillroad_app/build/app/outputs/flutter-apk/app-release.apk
 # 应看到 certificate DN: CN=TillRoad, ...
 ```
@@ -1210,6 +1210,52 @@ Select-String -Path tillroad_app\build\app\intermediates\merged_manifest\release
 去尾部所有斜杠、校验协议与 host。URL 拼接用 `buildApiUri`（`lib/api/api_client.dart`）折叠重复斜杠，
 但**保留** base 自带路径（如 `https://h/api` → `https://h/api/users`），所以将来把后端挂到子路径也不会静默走错。
 
+
+### 分发前检查清单
+
+> 面向「把 APK 发给几个测试同学」这个场景。每一步都做完再发包。
+
+- [ ] **Neon `users` 表里有 4 个用户**，UUID 与 Railway `TOKENS` 一一对应：
+      `tltest001` → `11111111-1111-4111-8111-111111111111`；
+      `tltest002` → `cbd8eb64-73d9-44c3-9898-aa2e701e8d84`；
+      `tltest003` → `939705ec-7dd1-4b2e-bba4-e18e57175b08`；
+      `tltest004` → `50bf600c-b648-4722-9378-160d6711acdf`。
+      新建用户用 `node --env-file=.env --dns-result-order=ipv4first scripts/seed-users.mjs`（按 nickname 幂等，重跑安全）。
+- [ ] **Railway Variables 的 `TOKENS` 已改为四个新 token**（逗号分隔的 `token:user_uuid` 列表），旧的 `tk_test_001` / `tk_test_002` 已删除。
+- [ ] **Railway 已点 Redeploy / Restart** —— 只保存变量不重启，服务不会加载新 `TOKENS`（这是最容易漏的一步）。
+- [ ] **curl 验证**：
+      ```bash
+      curl -i https://tillroads-production.up.railway.app/health                                  # 200
+      curl -i -H "Authorization: Bearer tltest001" https://tillroads-production.up.railway.app/users/11111111-1111-4111-8111-111111111111/exam-profiles   # 200 + 自己的数据
+      curl -i -H "Authorization: Bearer tk_test_001" https://tillroads-production.up.railway.app/users/11111111-1111-4111-8111-111111111111/exam-profiles # 401（旧 token 已失效）
+      ```
+- [ ] **版本号已改**：`tillroad_app/pubspec.yaml` 的 `version: 1.1.0+2`，且 `lib/config/app_info.dart` 的 `kAppVersion` 同步为 `'1.1.0+2'`（两者必须逐字一致）。
+- [ ] **包名已改**：`com.tillroad.tillroad_app` → `com.tillroad.app`（`android/app/build.gradle.kts` 的 namespace 与 applicationId、`MainActivity.kt` 的 package 声明与目录）。
+      ⚠️ **旧版 App 无法覆盖安装**（包名变了就是另一个 App），测试同学必须**先卸载旧版再装新版**，否则会看到两个「题路」。
+- [ ] **构建**：
+      ```powershell
+      cd tillroad_app
+      flutter clean
+      flutter pub get
+      flutter build apk --release --dart-define=API_BASE_URL=https://tillroads-production.up.railway.app
+      # 不带 --dart-define=API_TOKEN：让每位用户在 App 首次启动时自己输入 token，
+      # 这样同一个 APK 可以发给所有人，互不串号。
+      ```
+      APK 路径：`tillroad_app/build/app/outputs/flutter-apk/app-release.apk`。
+      ⚠️ 用了 `key.properties` / 正式 keystore 才能对外分发；没有则回落到 debug 签名（仅本机自测）。
+- [ ] **上传 GitHub Release**（或直接传 APK 给测试同学），附上「首次启动要输入 token」的说明。
+- [ ] **分配 token 给每位测试用户**（一人一个，别共用）：
+      | token | 对应 Neon 用户 | 备注 |
+      | --- | --- | --- |
+      | `tltest001` | 联调演示用户（`1111****`） | 主测试号 |
+      | `tltest002` | `cbd8****` | 第二位测试者 |
+      | `tltest003` | 测试用户C（`9397****`） | 第三位测试者 |
+      | `tltest004` | 测试用户D（`50bf****`） | 第四位测试者 |
+      每人独立账号 → 各自的缺陷单、题库、练习记录互不可见。
+- [ ] **提醒测试者**：旧 token 已失效、旧 APK 不能再用；换 token 要在 App 的「我的 → 设置 → 切换 Token」里改。
+
+> 备注：本机 pg 直连 Neon pooler 可能报 `ECONNRESET`（冷启动/网络路径问题）。遇到时改用 Neon 的 WebSocket 通道：
+> `npm install --no-save @neondatabase/serverless`，用 `new Pool({..., ws: true})` 建连接即可（`server/db/pool.mjs` 不用改）。
 
 ## 6. 当前里程碑与后续
 - ✅ 文档评审 + 4 项 P0 / 4 项 P1 修订（详见 [REVIEW-NOTES.md](<REVIEW-NOTES.md>)）
@@ -1251,6 +1297,7 @@ Select-String -Path tillroad_app\build\app\intermediates\merged_manifest\release
 - ✅ **练习模式 R1（抽题 → 答题 → 客户端判分 → 错题去归因）**：新增独立迁移 `migrations/0003_practice.sql`(+down，**不改 `schema.sql`**，Neon 真库已执行 1860ms)——`practice_sessions` / `practice_answers` 两表 + `idx_ps_user(user_id, created_at DESC)` / `idx_pa_session(session_id)`；后端新增 `server/routes/practice.mjs` 与 `server/repositories/practice_sessions.mjs`（**练习模块必须排在 questions 模块之前**，否则 `GET /questions/practice` 会被当成 `GET /questions/:id` 读 id='practice'）：`GET /questions/practice`（source=mine/public/all，`count` 默认 10 上限 50，**题量不足不报错**而是返回 `available`）、`POST /practice-sessions`（返回 total/correct/wrong/unjudged/accuracy）、`GET /practice-sessions`（只返回 token 映射的 userId 自己的）、`GET /practice-sessions/:id`（**别人的会话 → 404**，不用 403 避免枚举 id）。**答案安全底线做在仓储层**：抽题 SQL 答案列写成 `CASE WHEN owner_user_id = $n THEN answer ELSE NULL END`，公共题的 answer/analysis 永远为 null，客户端据此显示「该题不提供答案，请自评」+ 对/错两按钮。前端新建 `api/practice_api.dart` 与四个页面（`practice_config_page` / `practice_answering_page` / `practice_result_page` / `practice_history_page`）；入口接三处（首页快捷入口「开始练习」、题库页导航栏「练习」、「我的 → 练习记录」）；错题「去归因」→ 建单页并预填错因「练习中未掌握」+ question_id（`DefectCreatePage` 新增三个可选参数，`DefectApi.createDefectTicket` 与 `WriteQueue.enqueueCreateDefect` 均补传 `question_id`）。修掉一个真机/真库才暴露的后端 bug：`pickQuestions` 一开始就 `params = [userId]`，public 分支 where 不引用 userId → count 查询多带一个参数 → PG 报 `bind message supplies 1 parameters, but prepared statement requires 0` → 被 `httpError` 吞成 500；改为按需追加参数 + 动态编号占位符。PGlite 真库 **8/8** 通过，`flutter analyze` 0 error / 84 info、`flutter test` **106/106**、`npm test` **336 tests / 194 pass / 0 fail / 142 skipped**
 - ✅ **练习模式 R2（掌握度标记 + 未掌握进缺陷单）**：新增独立迁移 `migrations/0004_question_mastery.sql`(+down，**不改 `schema.sql`**，Neon 真库已执行 1802ms)——`question_mastery` 表（`user_id` / `question_id` / `mastered` boolean NOT NULL / `UNIQUE(user_id, question_id)`）+ 索引 `idx_qm_user` / `idx_qm_question`；**三态语义**：表里没这一行 = 未标记（与 `mastered=false` 不同），所以 API 的 `mastered` 是可空布尔。后端新增 `server/repositories/question_mastery.mjs`（`upsertMastery` 用 `ON CONFLICT DO UPDATE`；过滤用 `EXISTS` 子句而非 JOIN，避免重复行）与 `PATCH /questions/:id/mastery`（upsert；**只能标记自己的题**，公共题/别人的题 → `403 FORBIDDEN_MASTERY`，无 Token 401，`mastered` 非布尔 400 `INVALID_MASTERY`）、`GET /questions?mastered=true|false`（过滤走后端）；前端结果页对题加「已掌握 / 未掌握」按钮（**仅自己的题显示**）+ 顶部「全部标记已掌握」批量按钮，标「未掌握」时弹确认后**自动建一条缺陷单**（`question_id`=当前题、`error_layer=识别`、`error_cause=练习中未掌握，需复习`）；题库页新增「全部 / 已掌握 / 未掌握」筛选 chip + 卡片右上角徽标（已掌握绿 / 未掌握橙，未标记不显示）。修掉一个真机才暴露的 bug：批量「全部标记已掌握」的过滤条件写成 `_mastery[id] != true`，会把已标「未掌握」的题改回 true → 改为只处理 `_mastery[id] == null` 的题（真机复验 DB `masteredTrue=11 masteredFalse=2`，未掌握两题未被覆盖）；本机 pg 直连 Neon 连续 `ECONNRESET` → 改走 Neon serverless 的 WebSocket 通道。PGlite 真库新测试 **6/6** 通过（回归 questions 12/12、practice 8/8），`flutter analyze` 0 error / 84 info、`flutter test` **106/106**、`npm test` **342 tests / 194 pass / 0 fail / 148 skipped**，Android 17 真机 D1/D2/D3 全过 + 7 张截图
 - ✅ **练习模式 R3（已掌握题移除 + 恢复 + 题库管理页）**：新增独立迁移 `migrations/0005_question_hidden.sql`(+down，**不改 `schema.sql`**，Neon 真库已执行 2041ms)——`question_hidden` 表（`user_id` / `question_id` / `hidden_at` / `UNIQUE(user_id, question_id)`）+ 索引 `idx_qh_user` / `idx_qh_question`。**三个拍板**：Q1 移除 = **软删**（连模考组卷都抽不到）而不是隐藏；Q2 公共题**不能软删**（→ `403 FORBIDDEN_DELETE`），只能「只对我隐藏」；Q3 已掌握但未移除的题**模考照抽**（掌握度是主观标记，模考要覆盖真实范围）。后端新增 `server/repositories/question_hidden.mjs`（`hideQuestion` / `unhideQuestion` / `hiddenFilterClause`，过滤用 `NOT EXISTS` 子句）+ `server/repositories/questions.mjs` 的 `restore` / `archiveBatch` / `restoreBatch` / `listDeleted` / `getByIdIncludingDeleted`；端点 `DELETE /questions/:id`（软删）、`PATCH /questions/:id/restore`（**刻意不要 base_version**）、`DELETE /questions/batch`、`PATCH /questions/batch/restore`（回 `{deleted|restored, requested, skipped}`，公共题/别人的题静默跳过）、`PATCH /questions/:id/hide`、`GET /questions/deleted`。前端新建 `lib/pages/question_manage_page.dart`（约 700 行）：「我的 → 题库管理」入口改指新页（原题库列表页降为管理页右上角「浏览」），四个筛选（全部/已掌握/未掌握/已删除）+ 多选批量移除/恢复 + 单题移除/恢复，批量结果**如实展示 skipped**。修掉三个真 bug：①`restoreQuestion` 用 `qRepo.getById`（`requireRow` 只看未软删行）→ 恢复永远 404，新增 `getByIdIncludingDeleted`；②`PATCH /questions/batch/restore` 被 `PATCH /questions/:id/restore` 分支抢走（`seg[2]==='restore'` 撞车）→ 把 `'batch'` 当 uuid 查 → PG `22P02` → 被 `httpError` 吞成 `{error:'internal'}`，**分支顺序上移**；③练习抽题的 `pickQuestions` 有自己的 SQL 不走 `listVisible` → 隐藏的公共题仍被抽到，补 `hiddenFilterClause`。PGlite 真库新测试 **6/6** 通过（回归 questions 12/12、mastery 6/6、practice 8/8，共 26/26），`flutter analyze` 0 error / 86 info、`flutter test` **106/106**、`npm test` **348 tests / 194 pass / 0 fail / 154 skipped**，Android 17 真机 D1/D2/D3 全过 + 3 张截图
+- ✅ **分发前配置收尾（包名迁移 + 版本 1.1.0+2 + 脱敏正则覆盖新 token + 分发清单）**：Android 包名 `com.tillroad.tillroad_app` → `com.tillroad.app`（`build.gradle.kts` 的 namespace / applicationId 双改 + `MainActivity.kt` 移包并改 package 声明；`AndroidManifest.xml` 用相对名 `.MainActivity`，无需改）——**旧版无法覆盖安装，测试者必须先卸载旧版**。版本号 `1.0.0+1` → `1.1.0+2`（`pubspec.yaml` + `app_info.dart` 的 `kAppVersion` 逐字同步；`versionCode` / `versionName` 本就取自 pubspec；无 `locale.properties` 可清）。脱敏正则从只匹配 `tk_` 前缀改为交替组，同时覆盖 `tk_` 与 `tltest` 两种格式——**新 token `tltest001` 原先不会被脱敏**（等于把可用凭证写进导出的日志文件），新增 2 条单测（tltest 裸写 / Bearer / 新旧混合三条断言 + `task_x`、`risk_abc` 不误伤），`flutter test` **108/108**。新增 `scripts/seed-users.mjs`（按 nickname 幂等：已存在复用其 UUID、不存在则 `INSERT ... RETURNING`，末行直接打印可粘贴的 TOKENS 片段；本机实测两个用户已存在并打印出 UUID）。README 新增「分发前检查清单」10 项（Neon 四用户 UUID 对照表 / Railway TOKENS / **必须 Redeploy** / curl 三连验证 / 版本号 / 包名 / **不带 API_TOKEN** 的构建 / GitHub Release / 四个 token 的分配表），旧 token 引用全部替换。构建验证：`flutter analyze` 86 issues **0 error / 0 warning**、`flutter test` **108/108**、release APK **52.6MB**；`aapt2 dump badging` 复核 `com.tillroad.app versionCode=2 versionName=1.1.0`。⚠️ 本机无 `android/key.properties` → 该 APK 是 **debug 签名，不可对外分发**，须先按 README「打包分发」一节生成正式 keystore 再构建。
 - ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两个节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）；⑥本地优先 R3 的增量对账尚未实现（后端需加 `updated_since` 或变更日志）；⑦R4a 的冲突只做「丢弃本地 + 以云端为准」，字段级自动仲裁与写队列的删除操作未做；⑧R4b 未做 dead 队列的 UI 管理入口（死信行只能在数据库里看），也未做删除操作的入队；⑨题库的 **AI 生成题入口**未做（手动建题与编辑删除本轮 FE-02 已做；题目本地缓存待 R5 拍板）；⑩「删除我的所有数据」只软删不物理删（数据仍在库里可恢复，合规的「彻底抹除」需物理删除与保留期策略）；⑪题目选择器的**考点筛选未做进 UI**（后端 `knowledge_node_id` 已可用且有集成测试，但页面没有该 chip）、**中文关键字未真机验证**（`adb shell input text` 对非 ASCII 直接 NPE）；⑫FE-02 未做**拍照 OCR**（需先补 BYOK 服务端密钥管理与 vision adapter）；⑬练习模式**删题已做（R3）**，但**按题目选择器组练习**、**练习记录删除入口**（`practice_sessions.deleted_at` 无端点）、**每题用时展示**（`duration_ms` 已在收但未显示）仍未做，且公共题自评的对错只存在练习记录里、不回流题库；⑭题库管理页的**物理抹除**未做（题只软删，可恢复）、**隐藏的公共题没有 UI 入口**（后端 `PATCH /questions/:id/hide` 已就绪，但管理页只有「移除/恢复」）
 ---
 

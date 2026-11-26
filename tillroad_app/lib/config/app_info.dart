@@ -9,5 +9,5 @@
 //    反过来污染线上排查（这正是本功能存在的意义）。
 const String kAppName = '题路 TillRoad';
 
-/// 与 `pubspec.yaml` 的 `version:` 保持一致（`1.0.0+1` = 版本名 + 构建号）。
-const String kAppVersion = '1.0.0+1';
+/// 与 `pubspec.yaml` 的 `version:` 保持一致（`1.1.0+2` = 版本名 + 构建号）。
+const String kAppVersion = '1.1.0+2';

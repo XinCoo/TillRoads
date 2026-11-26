@@ -1,4 +1,4 @@
-﻿# 题路 TillRoad · 文档评审与修订记录（进入开发阶段前）
+# 题路 TillRoad · 文档评审与修订记录（进入开发阶段前）
 
 > 评审日期：2026-11-14 ｜ 评审对象：工作文件夹全部文档/DDL ｜ 结论：**可以进入 App 开发阶段，但不宜照原文档直接开工**
 > 本文件是审查结论与「评审→修订」对照表，供后续 BE-00 / FE / QA 派工与回归时查阅。
@@ -2727,3 +2727,110 @@ if (includeHidden !== true && ownerUserId) {
 4. 物理抹除未做 —— 题只软删，可恢复；合规的「彻底删除」需要物理删除与保留期策略。
 5. 隐藏的公共题**没有 UI 入口** —— 后端 `PATCH /questions/:id/hide` 已就绪，但管理页只有「移除 / 恢复」。
 6. 掌握度仍只有「掌握 / 未掌握」两态，且不参与抽题权重。
+
+---
+
+## 47. 分发前配置收尾（包名迁移 + 版本号 + 脱敏正则 + 新增用户脚本）
+
+对应用户任务书 m26912：在「发给测试同学」之前，把四个分发前的坑一次性收掉。
+
+### 47.1 包名迁移 `com.tillroad.tillroad_app` → `com.tillroad.app`
+
+趁还没正式分发，现在改成本最低 —— 一旦上架，包名就改不了了（Google Play 的 applicationId 终身绑定）。
+
+改动文件：
+
+| 文件 | 改动 |
+| --- | --- |
+| `tillroad_app/android/app/build.gradle.kts` | `namespace` 与 `defaultConfig.applicationId` 双改 |
+| `tillroad_app/android/app/src/main/kotlin/com/tillroad/app/MainActivity.kt` | 从 `com/tillroad/tillroad_app/` 移过来，`package` 声明改为 `com.tillroad.app` |
+| `tillroad_app/android/app/src/main/kotlin/com/tillroad/tillroad_app/` | 旧目录删除 |
+
+**为什么 `build.gradle.kts` 要改两处**：`namespace` 决定 R 类与 Kotlin 源包的默认位置，`applicationId` 才是真正装到手机上的 id。Gradle 8+ 里两者已解耦，但仍需一致，否则 `android:name=".MainActivity"` 这种相对写法会解析到错误的类。
+
+`AndroidManifest.xml` 不用改：新模板没有 `<manifest package="...">` 属性，activity 用的是相对名 `.MainActivity`，由 `namespace` 解析。iOS 的 Bundle Identifier 本轮**不改**（`com.tillroad.tillroadApp`）——改 iOS 需要 Mac + Xcode 验证签名，留待后续。
+
+⚠️ **包名变了就是另一个 App**：旧版无法覆盖安装，测试同学必须先卸载旧版再装新版，否则会看到两个「题路」。
+
+### 47.2 版本号 1.0.0+1 → 1.1.0+2
+
+- `tillroad_app/pubspec.yaml` 的 `version:` → `1.1.0+2`（版本名 1.1.0，构建号 2）。
+- `tillroad_app/lib/config/app_info.dart` 的 `kAppVersion` → `'1.1.0+2'`（**硬编码，与 pubspec 手工同步**；该文件注释里本来就写了「发版铁律：必须与 pubspec 逐字一致」，本轮照办）。
+- `android/app/build.gradle.kts` 的 `versionCode = flutter.versionCode` / `versionName = flutter.versionName` **本来就是模板默认**（从 pubspec 读），没有被人硬编码过 → 不用改。
+- `android/locale.properties` **不存在**（该目录只有 `gradle.properties` / `local.properties` / `gradle-wrapper.properties`），无需清理。
+
+### 47.3 脱敏正则覆盖新 token 格式
+
+改动前后：
+
+```dart
+// 旧
+final RegExp _tkTokenRe = RegExp(r'\btk_[A-Za-z0-9_]+');
+// 新
+final RegExp _apiTokenRe = RegExp(r'\b(?:tk_|tltest)[A-Za-z0-9_]+');
+```
+
+只匹配 `tk_` 前缀的话，新的 `tltest001` 不会被脱敏 —— 而新 token 才是分发后真正在用的那批，漏掉就等于把可用凭证写进导出的日志文件。改成一个交替组同时覆盖两种历史格式，`\b` 前缀保留（避免 `task_x` / `risk_abc` 这类正常单词被误伤）。`Bearer\s+[A-Za-z0-9_\-.=+/]+` → `Bearer ***` 的规则原样保留。
+
+新增单测（`test/logging_test.dart`）：
+
+1. `分发用的 tltest token 也被替换（新旧两种格式）` —— 裸 `tltest001`、`Bearer tltest002`、以及 `tltest003 tk_test_004` 混合串，三条断言原文都不残留。
+2. `正常单词不被误伤（task_x / risk_abc）` —— 钉住 `\b` 的行为，防止以后有人把正则简化成「任何带前缀的串」。
+
+`flutter test` → **108/108 passed**（本轮从 106 增至 108）。
+
+### 47.4 新增用户脚本 `scripts/seed-users.mjs`
+
+Railway 的 `TOKENS` 变量格式是 `token:user_uuid`，用户 UUID 必须真实存在于 Neon 的 `users` 表里，否则后端拿到 token 查不到用户 → 全端点 401/404。
+
+脚本行为：按 `nickname` 查（幂等键），已存在就复用它的 UUID、不重复插入也不改任何字段；不存在则 `INSERT ... RETURNING id, nickname`。脚本开头注释写明用法与前置条件：
+
+```bash
+node --env-file=.env --dns-result-order=ipv4first scripts/seed-users.mjs
+```
+
+**实测（本机直连 Neon 成功）**：
+
+```
+[seed-users] 已存在 测试用户C → 939705ec-7dd1-4b2e-bba4-e18e57175b08
+[seed-users] 已存在 测试用户D → 50bf600c-b648-4722-9378-160d6711acdf
+
+[seed-users] —— 请把下面这行填进 Railway 变量 TOKENS（与已有 token 逗号分隔）——
+tltest003:939705ec-7dd1-4b2e-bba4-e18e57175b08,tltest004:50bf600c-b648-4722-9378-160d6711acdf
+```
+
+（这两个用户在 Neon 里已由用户手动建好，所以脚本走的是「已存在 → 复用」分支；新建分支的 INSERT 语句同样落盘待用。）
+
+### 47.5 README 分发清单
+
+README 新增「### 分发前检查清单」小节（勾选式，10 项）：Neon 四个用户 UUID 对照表、Railway `TOKENS` 已更新、**Railway 必须点 Redeploy/Restart**（只保存变量不重启不生效）、curl 三连验证（新 token 200 / 旧 token 401）、版本号、包名（附「旧版无法覆盖安装」提醒）、`flutter clean && flutter pub get && flutter build apk --release`（**不带 `API_TOKEN`**，让每位用户首次启动自己输 token，一个 APK 发给所有人）、上传 GitHub Release、四个 token 的分配表。
+
+同时把 README 里残留的旧 token 引用全部换成 `tltest001`（部署章节的 curl 示例、build 命令两处），并把 `§5.5` 重复的标题行删掉一份。
+
+### 47.6 构建验证（本机实跑）
+
+```
+flutter clean                → OK
+flutter pub get              → Got dependencies!
+flutter analyze --no-fatal-infos → 86 issues / 0 error / 0 warning
+flutter test                 → 108/108 All tests passed
+flutter build apk --release --dart-define=API_BASE_URL=https://tillroads-production.up.railway.app
+                             → √ Built build\app\outputs\flutter-apk\app-release.apk (52.6MB)
+```
+
+用 `aapt2 dump badging` 复核产物：
+
+```
+package: name='com.tillroad.app' versionCode='2' versionName='1.1.0'
+application-label:'题路'
+```
+
+合并后的清单里 activity 已是 `com.tillroad.app.MainActivity`，`android.permission.INTERNET` 仍在（v1.0.0 那次踩过的坑）。
+
+⚠️ **签名是 debug 密钥**：本机没有 `tillroad_app/android/key.properties`，`build.gradle.kts` 的条件式签名回落到 debug —— 这个 APK **不可对外分发**，必须先按 README「打包分发」一节生成正式 keystore 再构建。
+
+### 47.7 本轮没做的事（如实记录）
+
+- **没有动 Railway 面板、没有直连 Neon 执行 SQL**（除只读查询与幂等的 seed 脚本外）；TOKENS 与 Redeploy 由用户在面板上操作。
+- **iOS Bundle Identifier 未改**（需要 Mac + Xcode 验证）。
+- **后端零改动**：token 格式变了不需要改代码 —— `server/auth.mjs` 的 `parseTokens()` 按 `token:user_uuid` 逗号分隔解析，对 token 前缀无假设。唯一需要注意的是**脱敏正则**（Flutter 侧），已处理。

@@ -28,6 +28,26 @@ void main() {
       expect(sanitizeLogText('token=tk_abcdef123 开始'), isNot(contains('tk_abcdef123')));
     });
 
+    test('分发用的 tltest token 也被替换（新旧两种格式）', () {
+      // 裸 tltest 前缀
+      final String bare = sanitizeLogText('token=tltest001 开始练习');
+      expect(bare, isNot(contains('tltest001')));
+      expect(bare, contains('token=***'));
+
+      // Bearer tltest 前缀
+      final String bearer = sanitizeLogText('Authorization: Bearer tltest002 请求 /users');
+      expect(bearer, isNot(contains('tltest002')));
+      expect(bearer.toLowerCase(), contains('bearer ***'));
+
+      // 旧格式 tk_ 仍然有效（历史日志不能因为改了正则就漏出去）
+      expect(sanitizeLogText('tltest003 tk_test_004'), isNot(contains('tltest003')));
+      expect(sanitizeLogText('tltest003 tk_test_004'), isNot(contains('tk_test_004')));
+    });
+
+    test('正常单词不被误伤（task_x / risk_abc）', () {
+      expect(sanitizeLogText('task_x risk_abc'), 'task_x risk_abc');
+    });
+
     test('UUID 只保留前 4 位', () {
       const String uuid = '11111111-1111-4111-8111-111111111111';
       final String out = sanitizeLogText('GET /users/$uuid/defect-tickets');
