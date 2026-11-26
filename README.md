@@ -787,10 +787,37 @@ R1 的「对题只折叠展示」不够用：用户一周下来反馈「对题�
 - **结果页对题**：展开「答对的题」后，每道**自己的**题右侧有「已掌握 / 未掌握」两个按钮（公共题不显示 —— 后端会 403）。点「已掌握」→ 立即变绿「✓ 已掌握」；点「未掌握」→ 先弹确认「将创建一条缺陷单，并标记该题未掌握」→ 确认后 PATCH 标记 + 自动建一条缺陷单（`question_id` = 当前题，`error_layer` 取六层里最接近的「识别」，`error_cause` 预填「练习中未掌握，需复习」）→ 按钮变橙「待复习」。顶部还有「全部标记已掌握」批量按钮。
 - **题库页**：列表顶部新增「全部 / 已掌握 / 未掌握」筛选 chip（走后端过滤）；每张卡片右上角显示掌握度徽标（已掌握绿 / 未掌握橙，未标记不显示）。
 
+### 练习模式 R3（已掌握题移除 + 恢复 + 题库管理页）
+
+R2 的掌握度标记只能「标」，不能「不看」——用户一周下来反馈「题库里已掌握的题我不想再看到」。R3 补上移除与恢复。
+
+**Q1「移除」是软删还是隐藏？→ 软删（`deleted_at`）+ 管理页可恢复。** 软删让模考组卷也抽不到（组卷 SQL 恒带 `deleted_at IS NULL`），隐藏只影响列表，两者语义不同。
+**Q2 公共题能不能被移除？→ 不能，只能隐藏。** 公共题不属于任何用户，删它等于删别人的东西；所以删公共题返回 `403 FORBIDDEN_DELETE`，另开「只对我隐藏」。
+**Q3 已掌握但未移除的题，模考组卷还抽不抽？→ 抽。** 掌握度是主观标记，模考需要覆盖真实范围。
+
+**迁移**（`migrations/0005_question_hidden.sql` + `0005_question_hidden_down.sql`，**不改 `schema.sql`**）：`question_hidden`（id / `user_id` FK users / `question_id` FK questions / `hidden_at` / `UNIQUE(user_id, question_id)`）+ 索引 `idx_qh_user`、`idx_qh_question`。与 `question_mastery` 分工独立：标记已掌握不隐藏，隐藏不改掌握度。
+
+**后端端点**：
+
+| 方法 & 路径 | 说明 |
+|---|---|
+| `DELETE /questions/:id` | 软删自己的题（`base_version` 必填）。公共题 → `403 FORBIDDEN_DELETE`；别人的私有题 → 404（避免枚举 id） |
+| `PATCH /questions/:id/restore` | 恢复软删的题。**刻意不要求 `base_version`** —— 恢复不冲突，带基线号反而让人困惑；题本来就没被移除 → 400 `not_deleted` |
+| `DELETE /questions/batch` | body `{ids[]}` → `{deleted, requested, skipped}`。**公共题 / 别人的题被静默跳过**（SQL 的 `owner_user_id` 条件），前端必须把 `skipped` 告诉用户 |
+| `PATCH /questions/batch/restore` | body `{ids[]}` → `{restored, requested, skipped}` |
+| `PATCH /questions/:id/hide` | body `{hidden}` → upsert 到 `question_hidden`。公共题与自己的题都能隐藏 |
+| `GET /questions/deleted` | 列**自己**的软删题（`owner_user_id = 当前用户`），可恢复 |
+
+**路由匹配顺序（有坑）**：`PATCH /questions/batch/restore` 必须**排在** `PATCH /questions/:id/restore` 之前判定，否则 `seg[2] === 'restore'` 会把 `'batch'` 当 uuid 查 → PG `22P02` → 被 `httpError` 吞成 `{error:'internal'}`。
+
+**隐藏的生效面**：隐藏过滤写在 `questions.listVisible` 与 `practice_sessions.pickQuestions` **两处**（练习抽题有自己的 SQL，不走 `listVisible`）。所以被隐藏的公共题既不在题库列表里，也不会被练习抽到。
+
+**前端**：`tillroad_app/lib/pages/question_manage_page.dart`（约 700 行）——「我的 → 题库管理」进入，四个筛选（全部 / 已掌握 / 未掌握 / 已删除），多选后批量移除 / 批量恢复，单题也能单独移除 / 恢复。批量操作的结果**如实展示 `skipped`**（「其中 N 道没移除（公共题或别人的题不属于你）」）。原题库列表页（导入 / 建题 / 练习入口）在管理页右上角「浏览」。
+
 ---
 
-## 5.5 应用界面与字体（`tillroad_app/`）
 
+## 5.5 应用界面与字体（`tillroad_app/`）
 ## 5.5 应用界面与字体（`tillroad_app/`）
 
 ### 字体
@@ -816,11 +843,11 @@ R1 的「对题只折叠展示」不够用：用户一周下来反馈「对题�
 
 ### 目录与依赖
 
-- `tillroad_app/lib/` 73 个 dart 文件：`main.dart` / `theme/` 1 / `config/` 3（`api_config`、`app_info`、`local_config`）/ `mock/` 2（`home_mock`、`defects_mock`）/ `api/` 7 / `logging/` 4 / `local/` 16（其中 `local/dao/` 5）/ `pages/` 28 / `widgets/` 11。
+- `tillroad_app/lib/` 74 个 dart 文件：`main.dart` / `theme/` 1 / `config/` 3（`api_config`、`app_info`、`local_config`）/ `mock/` 2（`home_mock`、`defects_mock`）/ `api/` 7 / `logging/` 4 / `local/` 16（其中 `local/dao/` 5）/ `pages/` 29 / `widgets/` 11。
 - 运行时依赖 `cupertino_icons` + `http` + `shared_preferences` + `share_plus` + `sqflite` + `path` + `file_picker`（后两个是本地优先 R1 引入、`file_picker` 是题库导入入口引入，见下节）；dev 依赖 `flutter_lints` + `flutter_launcher_icons` + `sqflite_common_ffi`（**仅测试用**，不进产物）。**无状态管理库、无路由库、无图表库、无 ORM、无 build_runner**。
 - ⚠️ `file_picker` 版本必须是 **^13.4.1**（不是 8.x）：8.x 依赖 `win32 ^5`，与 `share_plus 13.x`（`win32 ^6`）冲突，pub 解析不出来。13.x 的 API 也变了——`FilePicker.pickFiles(...)` 是**静态方法**直接返回 `List<PlatformFile>`（没有 `.platform`、没有 `FilePickerResult`），文件大小用 `await file.length()` 取、内容用 `await file.readAsBytes()` 取（没有 `size`/`bytes` 字段）。
 - 兼容平台：`android` / `ios` / `windows`（Windows 仅为本机开发期验证用，交付目标是移动端；**Windows 上不启用本地库**，见下节）。
-- 已知 `flutter analyze` 输出：**0 error / 0 warning / 84 info**（R1 前是 30 info；R1 +2、R2 +5、R4a +14、R4b +3、题库导入 +3、m18680 +11、§41 修完 13 条 warning 后为 55、题目选择器 +1、FE-02 +18、练习 R1 +10）。全部 info 都是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「纯 Cupertino」的约束冲突。
+- 已知 `flutter analyze` 输出：**0 error / 0 warning / 86 info**（R1 前是 30 info；R1 +2、R2 +5、R4a +14、R4b +3、题库导入 +3、m18680 +11、§41 修完 13 条 warning 后为 55、题目选择器 +1、FE-02 +18、练习 R1 +10、练习 R3 +2）。全部 info 都是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「纯 Cupertino」的约束冲突。
 - **判断 analyze 结果时不要写死行的格式**：本机是 `warning - …`，CI 的机器可读格式是 `warning • …`。写死分隔符会漏判（这坑踩过，见 REVIEW-NOTES §41）。CI 的判据用 `grep -Eq '^[[:space:]]*(error|warning)[[:space:]]'`。
 
 ### 缺陷单界面（FE-03）
@@ -1223,7 +1250,8 @@ Select-String -Path tillroad_app\build\app\intermediates\merged_manifest\release
 - ✅ **建题 / 编辑 / 删除题目（FE-02）**：题库从「只读的导入产物」变成「可手写、可改、可删」。后端新增 `POST /questions`（手动建题，`source` 固定 `manual`、归属只认 token、选项三种写法归一成 `[{key,text}]`）、`GET /questions/:id`（含 answer/analysis/version，别人的私有题回 404）、`PATCH /questions/:id`（改题干自动重算 hash 并重新查重）、`DELETE /questions/:id`（软删）；**仓储层的 create/update/archive 早就写好了，本轮只补路由与归属校验，不改 schema**。前端新建 `question_edit_page.dart`（建题与编辑共用一页，9 种题型 chip + 逐条选项编辑 + 难度/标签/主观题开关 + 科目/考点选择）、`question_api.dart` 补四个写方法与 `QuestionDetail` 模型、题库页接「建题」按钮 + 点卡片进编辑 + 「⋯」动作表（编辑/删除，删除前先拉详情拿 version）。导入页加**三态进度**（本地编码 / 服务端处理 / 完成）、**大文件预检**（>2MB 提示拆分）、**超时文案**（提醒先去题库页确认，别盲目重试）。**本轮不做拍照 OCR**（后端无 provider/密钥基建，真 OCR 需先做 BYOK 服务端密钥管理 + vision adapter + 图像存储 + 置信度阈值），**不建 import_jobs 表**（后端是一次性同步接口，没有 job id 可查）。后端 6 条新集成用例（PGlite 真库 **12/12** 通过），`flutter analyze` 0 error / 74 info、`flutter test` **106/106**、`npm test` **328 tests / 194 pass / 0 fail / 134 skipped**
 - ✅ **练习模式 R1（抽题 → 答题 → 客户端判分 → 错题去归因）**：新增独立迁移 `migrations/0003_practice.sql`(+down，**不改 `schema.sql`**，Neon 真库已执行 1860ms)——`practice_sessions` / `practice_answers` 两表 + `idx_ps_user(user_id, created_at DESC)` / `idx_pa_session(session_id)`；后端新增 `server/routes/practice.mjs` 与 `server/repositories/practice_sessions.mjs`（**练习模块必须排在 questions 模块之前**，否则 `GET /questions/practice` 会被当成 `GET /questions/:id` 读 id='practice'）：`GET /questions/practice`（source=mine/public/all，`count` 默认 10 上限 50，**题量不足不报错**而是返回 `available`）、`POST /practice-sessions`（返回 total/correct/wrong/unjudged/accuracy）、`GET /practice-sessions`（只返回 token 映射的 userId 自己的）、`GET /practice-sessions/:id`（**别人的会话 → 404**，不用 403 避免枚举 id）。**答案安全底线做在仓储层**：抽题 SQL 答案列写成 `CASE WHEN owner_user_id = $n THEN answer ELSE NULL END`，公共题的 answer/analysis 永远为 null，客户端据此显示「该题不提供答案，请自评」+ 对/错两按钮。前端新建 `api/practice_api.dart` 与四个页面（`practice_config_page` / `practice_answering_page` / `practice_result_page` / `practice_history_page`）；入口接三处（首页快捷入口「开始练习」、题库页导航栏「练习」、「我的 → 练习记录」）；错题「去归因」→ 建单页并预填错因「练习中未掌握」+ question_id（`DefectCreatePage` 新增三个可选参数，`DefectApi.createDefectTicket` 与 `WriteQueue.enqueueCreateDefect` 均补传 `question_id`）。修掉一个真机/真库才暴露的后端 bug：`pickQuestions` 一开始就 `params = [userId]`，public 分支 where 不引用 userId → count 查询多带一个参数 → PG 报 `bind message supplies 1 parameters, but prepared statement requires 0` → 被 `httpError` 吞成 500；改为按需追加参数 + 动态编号占位符。PGlite 真库 **8/8** 通过，`flutter analyze` 0 error / 84 info、`flutter test` **106/106**、`npm test` **336 tests / 194 pass / 0 fail / 142 skipped**
 - ✅ **练习模式 R2（掌握度标记 + 未掌握进缺陷单）**：新增独立迁移 `migrations/0004_question_mastery.sql`(+down，**不改 `schema.sql`**，Neon 真库已执行 1802ms)——`question_mastery` 表（`user_id` / `question_id` / `mastered` boolean NOT NULL / `UNIQUE(user_id, question_id)`）+ 索引 `idx_qm_user` / `idx_qm_question`；**三态语义**：表里没这一行 = 未标记（与 `mastered=false` 不同），所以 API 的 `mastered` 是可空布尔。后端新增 `server/repositories/question_mastery.mjs`（`upsertMastery` 用 `ON CONFLICT DO UPDATE`；过滤用 `EXISTS` 子句而非 JOIN，避免重复行）与 `PATCH /questions/:id/mastery`（upsert；**只能标记自己的题**，公共题/别人的题 → `403 FORBIDDEN_MASTERY`，无 Token 401，`mastered` 非布尔 400 `INVALID_MASTERY`）、`GET /questions?mastered=true|false`（过滤走后端）；前端结果页对题加「已掌握 / 未掌握」按钮（**仅自己的题显示**）+ 顶部「全部标记已掌握」批量按钮，标「未掌握」时弹确认后**自动建一条缺陷单**（`question_id`=当前题、`error_layer=识别`、`error_cause=练习中未掌握，需复习`）；题库页新增「全部 / 已掌握 / 未掌握」筛选 chip + 卡片右上角徽标（已掌握绿 / 未掌握橙，未标记不显示）。修掉一个真机才暴露的 bug：批量「全部标记已掌握」的过滤条件写成 `_mastery[id] != true`，会把已标「未掌握」的题改回 true → 改为只处理 `_mastery[id] == null` 的题（真机复验 DB `masteredTrue=11 masteredFalse=2`，未掌握两题未被覆盖）；本机 pg 直连 Neon 连续 `ECONNRESET` → 改走 Neon serverless 的 WebSocket 通道。PGlite 真库新测试 **6/6** 通过（回归 questions 12/12、practice 8/8），`flutter analyze` 0 error / 84 info、`flutter test` **106/106**、`npm test` **342 tests / 194 pass / 0 fail / 148 skipped**，Android 17 真机 D1/D2/D3 全过 + 7 张截图
-- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两个节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）；⑥本地优先 R3 的增量对账尚未实现（后端需加 `updated_since` 或变更日志）；⑦R4a 的冲突只做「丢弃本地 + 以云端为准」，字段级自动仲裁与写队列的删除操作未做；⑧R4b 未做 dead 队列的 UI 管理入口（死信行只能在数据库里看），也未做删除操作的入队；⑨题库的 **AI 生成题入口**未做（手动建题与编辑删除本轮 FE-02 已做；题目本地缓存待 R5 拍板）；⑩「删除我的所有数据」只软删不物理删（数据仍在库里可恢复，合规的「彻底抹除」需物理删除与保留期策略）；⑪题目选择器的**考点筛选未做进 UI**（后端 `knowledge_node_id` 已可用且有集成测试，但页面没有该 chip）、**中文关键字未真机验证**（`adb shell input text` 对非 ASCII 直接 NPE）；⑫FE-02 未做**拍照 OCR**（需先补 BYOK 服务端密钥管理与 vision adapter）；⑬练习模式未做**删题**（R3）、**按题目选择器组练习**、**练习记录删除入口**（`practice_sessions.deleted_at` 无端点）、**每题用时展示**（`duration_ms` 已在收但未显示），且公共题自评的对错只存在练习记录里、不回流题库
+- ✅ **练习模式 R3（已掌握题移除 + 恢复 + 题库管理页）**：新增独立迁移 `migrations/0005_question_hidden.sql`(+down，**不改 `schema.sql`**，Neon 真库已执行 2041ms)——`question_hidden` 表（`user_id` / `question_id` / `hidden_at` / `UNIQUE(user_id, question_id)`）+ 索引 `idx_qh_user` / `idx_qh_question`。**三个拍板**：Q1 移除 = **软删**（连模考组卷都抽不到）而不是隐藏；Q2 公共题**不能软删**（→ `403 FORBIDDEN_DELETE`），只能「只对我隐藏」；Q3 已掌握但未移除的题**模考照抽**（掌握度是主观标记，模考要覆盖真实范围）。后端新增 `server/repositories/question_hidden.mjs`（`hideQuestion` / `unhideQuestion` / `hiddenFilterClause`，过滤用 `NOT EXISTS` 子句）+ `server/repositories/questions.mjs` 的 `restore` / `archiveBatch` / `restoreBatch` / `listDeleted` / `getByIdIncludingDeleted`；端点 `DELETE /questions/:id`（软删）、`PATCH /questions/:id/restore`（**刻意不要 base_version**）、`DELETE /questions/batch`、`PATCH /questions/batch/restore`（回 `{deleted|restored, requested, skipped}`，公共题/别人的题静默跳过）、`PATCH /questions/:id/hide`、`GET /questions/deleted`。前端新建 `lib/pages/question_manage_page.dart`（约 700 行）：「我的 → 题库管理」入口改指新页（原题库列表页降为管理页右上角「浏览」），四个筛选（全部/已掌握/未掌握/已删除）+ 多选批量移除/恢复 + 单题移除/恢复，批量结果**如实展示 skipped**。修掉三个真 bug：①`restoreQuestion` 用 `qRepo.getById`（`requireRow` 只看未软删行）→ 恢复永远 404，新增 `getByIdIncludingDeleted`；②`PATCH /questions/batch/restore` 被 `PATCH /questions/:id/restore` 分支抢走（`seg[2]==='restore'` 撞车）→ 把 `'batch'` 当 uuid 查 → PG `22P02` → 被 `httpError` 吞成 `{error:'internal'}`，**分支顺序上移**；③练习抽题的 `pickQuestions` 有自己的 SQL 不走 `listVisible` → 隐藏的公共题仍被抽到，补 `hiddenFilterClause`。PGlite 真库新测试 **6/6** 通过（回归 questions 12/12、mastery 6/6、practice 8/8，共 26/26），`flutter analyze` 0 error / 86 info、`flutter test` **106/106**、`npm test` **348 tests / 194 pass / 0 fail / 154 skipped**，Android 17 真机 D1/D2/D3 全过 + 3 张截图
+- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两个节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）；⑥本地优先 R3 的增量对账尚未实现（后端需加 `updated_since` 或变更日志）；⑦R4a 的冲突只做「丢弃本地 + 以云端为准」，字段级自动仲裁与写队列的删除操作未做；⑧R4b 未做 dead 队列的 UI 管理入口（死信行只能在数据库里看），也未做删除操作的入队；⑨题库的 **AI 生成题入口**未做（手动建题与编辑删除本轮 FE-02 已做；题目本地缓存待 R5 拍板）；⑩「删除我的所有数据」只软删不物理删（数据仍在库里可恢复，合规的「彻底抹除」需物理删除与保留期策略）；⑪题目选择器的**考点筛选未做进 UI**（后端 `knowledge_node_id` 已可用且有集成测试，但页面没有该 chip）、**中文关键字未真机验证**（`adb shell input text` 对非 ASCII 直接 NPE）；⑫FE-02 未做**拍照 OCR**（需先补 BYOK 服务端密钥管理与 vision adapter）；⑬练习模式**删题已做（R3）**，但**按题目选择器组练习**、**练习记录删除入口**（`practice_sessions.deleted_at` 无端点）、**每题用时展示**（`duration_ms` 已在收但未显示）仍未做，且公共题自评的对错只存在练习记录里、不回流题库；⑭题库管理页的**物理抹除**未做（题只软删，可恢复）、**隐藏的公共题没有 UI 入口**（后端 `PATCH /questions/:id/hide` 已就绪，但管理页只有「移除/恢复」）
 ---
 
 ## 7. 一键提交（`git acp`）

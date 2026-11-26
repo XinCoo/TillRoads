@@ -46,6 +46,7 @@ import 'exam_config_page.dart';
 import 'mock_page.dart';
 import 'practice_history_page.dart';
 import 'question_bank_page.dart';
+import 'question_manage_page.dart';
 import 'review_page.dart';
 import 'settings_page.dart';
 import 'verify_page.dart';
@@ -432,10 +433,13 @@ class _ProfilePageState extends State<ProfilePage> {
     Navigator.of(context).push<void>(appRoute<void>(context, const ReviewPage()));
   }
 
+  /// 题库管理（R3）：批量移除 / 恢复、掌握度筛选。
+  ///
+  /// 页面右上角的「浏览」才是原来那个题库列表（导入 / 建题 / 练习入口）。
   void _openQuestionBank() {
     Navigator.of(
       context,
-    ).push<void>(appRoute<void>(context, const QuestionBankPage()));
+    ).push<void>(appRoute<void>(context, const QuestionManagePage()));
   }
 
   /// 考试配置：目标 → 科目 → 考点树。

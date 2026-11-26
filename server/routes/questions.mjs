@@ -8,6 +8,10 @@
 //   PATCH  /questions/:id                编辑（base_version 必填，m23700）
 //   DELETE /questions/:id                软删（base_version 必填，m23700）
 //   PATCH  /questions/:id/mastery        标记掌握度（m25316 练习模式 R2）
+//   PATCH  /questions/:id/restore        恢复软删的题（m26090 练习模式 R3）
+//   PATCH  /questions/:id/hide           隐藏/取消隐藏公共题（m26090）
+//   DELETE /questions/batch              批量软删（m26090）
+//   PATCH  /questions/batch/restore      批量恢复（m26090）
 //
 // 为什么需要它：BE-02 只做了「导入」端点（POST /questions/import），
 // 前端从来没有「读题库」的入口 —— 测试人员装完 APK 只能看到预置的 9 条缺陷单，
@@ -23,6 +27,7 @@
 
 import * as qRepo from '../repositories/questions.mjs';
 import * as masteryRepo from '../repositories/question_mastery.mjs';
+import * as hiddenRepo from '../repositories/question_hidden.mjs';
 import { withTransaction } from '../repositories/base.mjs';
 import { ok, fail, pagination, readBaseVersion } from './_http.mjs';
 /** 依赖注入缝：与其它路由同形（ctx.repos 可注入 fake）。 */
@@ -255,14 +260,24 @@ function pickQuestionFields(body, { partial = false } = {}) {
 }
 
 /**
- * 写操作的归属门禁（m23700）。
+ * 写操作的归属门禁（m23700，m26090 扩展）。
  *
- * 规则：只能改/删**自己**的题。公共题（owner_user_id IS NULL）与别人的题一律 404，
- * 不用 403 —— 403 等于告诉对方「这个 id 存在，只是不是你的」，可以拿来枚举题库。
+ * 规则：只能改/删**自己**的题。
+ *
+ * ★ m26090（R3）：公共题（owner_user_id IS NULL）有两种处理，由调用方显式指定：
+ *   * publicError='not_found'（默认，改题 / 编辑等）：公共题 → 404。
+ *     公共题不属于任何人，改它没有意义；回 404 与「不存在」一致，不泄露存在性。
+ *   * publicError='forbidden'（删除）：公共题 → **403 FORBIDDEN_DELETE**。
+ *     软删是把题从**整个公共题库**里拿走，别人也看不到了，公共题不属于
+ *     任何用户，用户无权这么做。403 是必要的语义 —— 前端要明确告诉用户
+ *     「你不能删这道题，只能隐藏」，而不是含糊的「找不到」。
+ *   * 别人的私有题 → 404 not_found（不可见，回 404 避免枚举题库 id）。
+ *   * 隐藏（PATCH /questions/:id/hide）不走这个门禁，它自己判断：
+ *     公共题与自己的题都可隐藏。
  *
  * 未鉴权直接 401：本轮的写端点不开放匿名建题（否则任何人可往公共题库塞题）。
  */
-async function requireOwnQuestion(ctx, id) {
+async function requireOwnQuestion(ctx, id, { publicError = 'not_found' } = {}) {
   if (!ctx.authUserId) {
     const err = new Error('建题/改题/删除需要有效的 Bearer Token');
     err.code = 'UNAUTHORIZED';
@@ -271,14 +286,30 @@ async function requireOwnQuestion(ctx, id) {
     throw err;
   }
   const row = await qRepo.getById(ctx.pool, id);
-  if (row.owner_user_id !== ctx.authUserId) {
+  if (row.owner_user_id === ctx.authUserId) {
+    return row;
+  }
+  // 公共题：归属为空。
+  if (row.owner_user_id === null) {
+    if (publicError === 'forbidden') {
+      const err = new Error('公共题不能删除，只能隐藏');
+      err.code = 'FORBIDDEN_DELETE';
+      err.statusCode = 403;
+      err.body = { error: 'FORBIDDEN_DELETE', message: err.message, id };
+      throw err;
+    }
     const err = new Error('找不到该题目');
     err.code = 'not_found';
     err.statusCode = 404;
     err.body = { error: 'not_found', resource: 'questions', id };
     throw err;
   }
-  return row;
+  // 别人的私有题：不可见 → 404（避免枚举）。
+  const err = new Error('找不到该题目');
+  err.code = 'not_found';
+  err.statusCode = 404;
+  err.body = { error: 'not_found', resource: 'questions', id };
+  throw err;
 }
 
 /** 建/改/删后返回给客户端的题（含 answer/analysis —— 调用方就是出题人）。 */
@@ -343,12 +374,21 @@ async function updateQuestion(ctx, id) {
   return ok(questionPayload(row));
 }
 
-/** DELETE /questions/:id —— 软删（base_version 必填）。 */
+/**
+ * DELETE /questions/:id —— 软删（base_version 必填）。
+ *
+ * ★ m26090（R3）：公共题（owner_user_id IS NULL）不能软删 → 403 FORBIDDEN_DELETE。
+ *   理由：软删是把题从**整个公共题库**里拿走，别人也看不到了。
+ *   公共题不属于任何用户，用户无权这么做。公共题想「不想再看到」请用隐藏
+ *   （PATCH /questions/:id/hide）。
+ *   注意与「删别人的私有题 → 404」的区别：公共题对所有人可见，所以回 403
+ *   不泄露任何存在性；而别人的私有题不可见，回 404 避免枚举。
+ */
 async function deleteQuestion(ctx, id) {
-  await requireOwnQuestion(ctx, id);
+  const row = await requireOwnQuestion(ctx, id, { publicError: 'forbidden' });
   const baseVersion = readBaseVersion(ctx.body ?? {});
-  const row = await withTransaction(ctx.pool, (client) => qRepo.archive(client, id, baseVersion));
-  return ok({ id: row.id, deleted: true, version: row.version });
+  const archived = await withTransaction(ctx.pool, (client) => qRepo.archive(client, id, baseVersion));
+  return ok({ id: archived.id, deleted: true, version: archived.version });
 }
 
 /**
@@ -394,6 +434,150 @@ async function setQuestionMastery(ctx, id) {
     updated_at: saved.updated_at,
   });
 }
+/**
+ * PATCH /questions/:id/restore —— 恢复软删的题（m26090 练习模式 R3）。
+ *
+ * 规则：只能恢复**自己**的题（公共题从来不会被软删，所以不涉及）。
+ * 恢复后 version 由 set_updated() 触发器 +1，客户端拿到的 version 一定是最新的。
+ *
+ * 刻意**不带 base_version**：恢复的语义是「把它搬回来」，不是「基于某个版本改内容」。
+ * 如果带了基线号，用户在管理页停留期间别人改了这道题，恢复就会失败 ——
+ * 但恢复本身并不冲突（它只是把墓碑清掉），失败反而让人困惑。
+ */
+async function restoreQuestion(ctx, id) {
+  if (!ctx.authUserId) {
+    return fail('unauthorized', 401, { message: '恢复题目需要有效的 Bearer Token' });
+  }
+  // ★ m26090：恢复时必须读得到**软删行**（墓碑）——
+  //   getById 把软删行当不存在，所以这里用 getByIdIncludingDeleted，
+  //   否则恢复永远在这一步就 404。
+  const row = await qRepo.getByIdIncludingDeleted(ctx.pool, id);
+  if (!row) {
+    return fail('not_found', 404, { resource: 'questions', id });
+  }
+  if (row.owner_user_id !== ctx.authUserId) {
+    return fail('not_found', 404, { resource: 'questions', id });
+  }
+  const restored = await withTransaction(ctx.pool, (client) => qRepo.restore(client, id));
+  if (!restored) {
+    // 行存在但没被软删 → 已经是不用恢复的状态（幂等）。
+    return fail('not_deleted', 400, { message: '这道题没有被删除，无需恢复' });
+  }
+  return ok({ id: restored.id, deleted: false, version: restored.version });
+}
+
+/**
+ * PATCH /questions/:id/hide —— 隐藏 / 取消隐藏题目（m26090 练习模式 R3）。
+ *
+ * 规则：
+ *   * body 形如 { "hidden": true }；缺字段或不是布尔 → 400 INVALID_HIDDEN。
+ *   * 自己的题：既可以隐藏也可以取消隐藏（隐藏自己的题等价于「从列表里收起」，
+ *     但不动 deleted_at —— 自己的题想真移除请用删除）。
+ *   * 公共题：只能隐藏，不能软删（见 deleteQuestion 的 403 FORBIDDEN_DELETE）。
+ *   * 别人的私有题 → 404（不可见，避免枚举）。
+ */
+async function setQuestionHidden(ctx, id) {
+  if (!ctx.authUserId) {
+    return fail('unauthorized', 401, { message: '隐藏题目需要有效的 Bearer Token' });
+  }
+  const body = ctx.body ?? {};
+  if (typeof body.hidden !== 'boolean') {
+    return fail('INVALID_HIDDEN', 400, { message: 'hidden 必须是布尔值（true / false）' });
+  }
+  const row = await qRepo.getById(ctx.pool, id);
+  if (!row) {
+    return fail('not_found', 404, { resource: 'questions', id });
+  }
+  if (row.owner_user_id !== null && row.owner_user_id !== ctx.authUserId) {
+    return fail('not_found', 404, { resource: 'questions', id });
+  }
+  if (body.hidden) {
+    await withTransaction(ctx.pool, (client) =>
+      hiddenRepo.hideQuestion(client, { userId: ctx.authUserId, questionId: id }),
+    );
+  } else {
+    await withTransaction(ctx.pool, (client) =>
+      hiddenRepo.unhideQuestion(client, { userId: ctx.authUserId, questionId: id }),
+    );
+  }
+  return ok({ question_id: id, hidden: body.hidden });
+}
+
+/**
+ * DELETE /questions/batch —— 批量软删（m26090 练习模式 R3）。
+ *
+ * body: { "ids": ["uuid", ...] }
+ *
+ * 规则：
+ *   * 只能删**自己的**题；公共题与别人的题在 SQL 层就被 owner_user_id 条件排除了
+ *     （archiveBatch 里带 owner_user_id = $2），所以它们会被静默跳过。
+ *   * 不带 version（见仓储层 archiveBatch 的注释：批量操作不做乐观锁）。
+ *   * 响应回 skipped 列表，让前端能告诉用户「其中 N 道是公共题，没删掉」。
+ */
+async function deleteQuestionsBatch(ctx) {
+  if (!ctx.authUserId) {
+    return fail('unauthorized', 401, { message: '批量删除需要有效的 Bearer Token' });
+  }
+  const body = ctx.body ?? {};
+  const ids = Array.isArray(body.ids) ? body.ids.filter((v) => typeof v === 'string' && v !== '') : [];
+  if (ids.length === 0) {
+    return fail('EMPTY_IDS', 400, { message: 'ids 不能为空' });
+  }
+  const deleted = await withTransaction(ctx.pool, (client) =>
+    qRepo.archiveBatch(client, ids, ctx.authUserId),
+  );
+  return ok({ deleted, requested: ids.length, skipped: ids.length - deleted });
+}
+
+/**
+ * PATCH /questions/batch/restore —— 批量恢复（m26090 练习模式 R3）。
+ *
+ * body: { "ids": ["uuid", ...] }
+ */
+async function restoreQuestionsBatch(ctx) {
+  if (!ctx.authUserId) {
+    return fail('unauthorized', 401, { message: '批量恢复需要有效的 Bearer Token' });
+  }
+  const body = ctx.body ?? {};
+  const ids = Array.isArray(body.ids) ? body.ids.filter((v) => typeof v === 'string' && v !== '') : [];
+  if (ids.length === 0) {
+    return fail('EMPTY_IDS', 400, { message: 'ids 不能为空' });
+  }
+  const restored = await withTransaction(ctx.pool, (client) =>
+    qRepo.restoreBatch(client, ids, ctx.authUserId),
+  );
+  return ok({ restored, requested: ids.length, skipped: ids.length - restored });
+}
+
+/**
+ * GET /questions/deleted —— 列某用户已软删的题（m26090 题库管理页「已删除」筛选）。
+ *
+ * 只列自己的题（公共题永远不会被软删）。
+ */
+async function listDeletedQuestions(ctx) {
+  if (!ctx.authUserId) {
+    return fail('unauthorized', 401, { message: '查看已删除题目需要有效的 Bearer Token' });
+  }
+  const page = pagination(ctx.searchParams);
+  const rows = await qRepo.listDeleted(ctx.pool, {
+    ownerUserId: ctx.authUserId,
+    limit: page.limit,
+    offset: page.offset,
+  });
+  const items = rows.map((r) => ({
+    id: r.id,
+    source: r.source,
+    subject_id: r.subject_id,
+    knowledge_node_id: r.knowledge_node_id,
+    type: r.type,
+    stem: r.stem,
+    difficulty: r.difficulty ?? null,
+    owner_user_id: r.owner_user_id ?? null,
+    deleted_at: r.deleted_at,
+    version: r.version,
+  }));
+  return ok({ items, total: items.length, limit: page.limit, offset: page.offset });
+}
 
 /**
  * 路由分发。
@@ -418,6 +602,32 @@ export async function match(method, seg, ctx) {
   // 否则 /questions/:id/mastery 会被当成 /questions/:id 抢走（seg.length 是 3，这里不会）。
   if (method === 'PATCH' && seg.length === 3 && seg[0] === 'questions' && seg[2] === 'mastery') {
     return setQuestionMastery(ctx, seg[1]);
+  }
+  // ★ m26090（R3）：下面几个分支也必须在 seg.length===2 分支之前。
+  //   PATCH /questions/batch/restore —— 批量恢复。
+  //   ★ 必须排在 PATCH /questions/:id/restore **之前**：
+  //     /questions/batch/restore 的 seg = ['questions','batch','restore']，
+  //     seg[2] 同样是 'restore'，若被 :id/restore 抢走就会拿 'batch' 当 uuid 查，
+  //     PG 报 22P02 → 在 httpError 里被吞成 500 internal（极难查）。
+  if (method === 'PATCH' && seg.length === 3 && seg[0] === 'questions' && seg[1] === 'batch' && seg[2] === 'restore') {
+    return restoreQuestionsBatch(ctx);
+  }
+  //   PATCH /questions/:id/restore —— 恢复软删的题
+  if (method === 'PATCH' && seg.length === 3 && seg[0] === 'questions' && seg[2] === 'restore') {
+    return restoreQuestion(ctx, seg[1]);
+  }
+  //   PATCH /questions/:id/hide —— 隐藏/取消隐藏（公共题只能隐藏）
+  if (method === 'PATCH' && seg.length === 3 && seg[0] === 'questions' && seg[2] === 'hide') {
+    return setQuestionHidden(ctx, seg[1]);
+  }
+  //   PATCH /questions/batch/restore —— 批量恢复（见上方：必须先于 :id/restore 判定）
+  //   DELETE /questions/batch —— 批量软删
+  if (method === 'DELETE' && seg.length === 2 && seg[0] === 'questions' && seg[1] === 'batch') {
+    return deleteQuestionsBatch(ctx);
+  }
+  //   GET /questions/deleted —— 列已软删的题
+  if (method === 'GET' && seg.length === 2 && seg[0] === 'questions' && seg[1] === 'deleted') {
+    return listDeletedQuestions(ctx);
   }
 
   if (seg[0] === 'questions' && seg.length === 2) {

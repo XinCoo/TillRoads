@@ -16,6 +16,7 @@
 //    客户端传来的 is_correct 只作为「公共题自评」的输入。
 import { queryMany, queryOne } from './base.mjs';
 import { notFoundError } from './_common.mjs';
+import { hiddenFilterClause } from './question_hidden.mjs';
 
 export const SESSIONS_TABLE = 'practice_sessions';
 export const ANSWERS_TABLE = 'practice_answers';
@@ -62,6 +63,18 @@ export async function pickQuestions(
   if (knowledgeNodeId) {
     params.push(knowledgeNodeId);
     where.push(`knowledge_node_id = $${params.length}`);
+  }
+  // ★ m26090（R3）：隐藏过滤 —— 用户「只对我隐藏」的题既不在题库列表里，
+  //   也不该被练习抽到（隐藏的语义就是「我不想再看到它」）。
+  //   用 NOT EXISTS 子查询（不是 JOIN），避免同一题因多行隐藏记录产生重复行。
+  if (userId) {
+    const hFilter = hiddenFilterClause({
+      userId,
+      tableAlias: 'questions',
+      paramIndex: params.length + 1,
+    });
+    params.push(...hFilter.params);
+    where.push(hFilter.clause);
   }
 
   // 来源分域：mine → 只自己的题；public → 只公共题；all → 公共 + 自己的。

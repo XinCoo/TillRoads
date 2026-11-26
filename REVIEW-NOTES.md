@@ -2591,3 +2591,139 @@ export function masteryFilterClause({ userId, mastered, tableAlias = 'questions'
 4. 掌握度只支持「掌握 / 未掌握」两态，没有「半掌握」或掌握度衰减。
 5. 掌握度**不参与抽题权重**（抽题仍是纯随机，不优先抽未掌握的题）。
 6. 公共题自评的对错仍**只存在练习记录里**，不回流题库（公共题本身也不能标记）。
+
+---
+
+## 46. 练习模式 R3 归档（已掌握题移除 + 恢复 + 题库管理页）
+
+本轮对应用户任务书 m26090：`题库里已掌握的题不想再看到`，所以做了「移除 + 可恢复」。
+
+### 46.1 三个拍板（先定口径，再写代码）
+
+| 问题 | 结论 | 为什么 |
+| --- | --- | --- |
+| Q1「移除」是软删还是隐藏？ | **软删（`deleted_at`）+ 管理页可恢复** | 软删会让模考组卷也抽不到（`mock_exams` 组卷 SQL 恒带 `deleted_at IS NULL`），这才是「我不想再看到它」的完整含义；隐藏只影响列表，模考仍会抽到，用户会觉得「明明移走了还在考试里出现」。 |
+| Q2 公共题能不能被移除？ | **不能软删，只能「只对我隐藏」** | 公共题（`owner_user_id IS NULL`）不属于任何用户，软删会删掉别人的资产。所以删公共题返回 `403 FORBIDDEN_DELETE`，另开 `question_hidden` 表做「只对我隐藏」。 |
+| Q3 已掌握但未移除的题，模考组卷抽不抽？ | **照抽** | 掌握度是主观标记，模考需要覆盖真实范围。若按掌握度降权，等于让用户自己给自己划考试范围。 |
+
+### 46.2 迁移 0005（不改 schema.sql）
+
+`migrations/0005_question_hidden.sql`：
+
+```sql
+CREATE TABLE IF NOT EXISTS question_hidden (
+  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),
+  user_id uuid NOT NULL REFERENCES users(id),
+  question_id uuid NOT NULL REFERENCES questions(id),
+  hidden_at timestamptz NOT NULL DEFAULT now(),
+  CONSTRAINT question_hidden_user_question_key UNIQUE (user_id, question_id)
+);
+CREATE INDEX IF NOT EXISTS idx_qh_user ON question_hidden(user_id);
+CREATE INDEX IF NOT EXISTS idx_qh_question ON question_hidden(question_id);
+```
+
+`migrations/0005_question_hidden_down.sql` 先 `DROP INDEX IF EXISTS idx_qh_question; DROP INDEX IF EXISTS idx_qh_user; DROP TABLE IF EXISTS question_hidden;`。
+
+`scripts/migrate.mjs` 的 `UP_MIGRATIONS` 追加 0005，`DOWN_MIGRATIONS` 把 `0005_question_hidden_down.sql` **放在 0004_down 之前**（回滚顺序与建表相反，否则外键依赖会挡）。`server/db/test_schema.mjs` 的 `MIGRATION_FILES` 同步追加 0005，CI 的集成测试库才带上新表。
+
+### 46.3 后端：仓储 + 六个端点
+
+新文件 `server/repositories/question_hidden.mjs`：
+
+- `hideQuestion(client, { userId, questionId })` —— `INSERT ... ON CONFLICT (user_id, question_id) DO UPDATE SET hidden_at = now() RETURNING *`
+- `unhideQuestion(client, { userId, questionId })` —— `DELETE ... RETURNING *`，无记录返回 `null`（幂等）
+- `listHiddenIds(client, { userId, questionIds })` → `Set<question_id>`
+- `hiddenFilterClause({ userId, tableAlias, paramIndex })` → `{ clause, params: [userId] }`，clause 是 `NOT EXISTS (SELECT 1 FROM question_hidden qh WHERE qh.question_id = <alias>.id AND qh.user_id = $n)`。**用 NOT EXISTS 子句而不是 JOIN**，避免一题多行把结果集放大。
+
+`server/repositories/questions.mjs` 新增 5 个导出：
+
+- `restore(client, id)` —— `UPDATE questions SET deleted_at = NULL WHERE id=$1 AND deleted_at IS NOT NULL RETURNING *`。**刻意不用 `updateWithVersion`**：那个函数恒带 `deleted_at IS NULL`，与「恢复墓碑」的语义正好相反。version 由 `set_updated()` 触发器 +1。
+- `archiveBatch(client, ids, ownerUserId)` —— `UPDATE ... SET deleted_at=now() WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL AND owner_user_id = $2 RETURNING id`，返回行数。**批量刻意不带 version**：批量操作一次动几十道题，要求每题都带对版本号不现实；单条删除仍走 `archiveWithVersion`。
+- `restoreBatch(client, ids, ownerUserId)` —— 同形，`deleted_at IS NOT NULL` → `NULL`。
+- `listDeleted(client, { ownerUserId, limit, offset })` —— `WHERE deleted_at IS NOT NULL AND owner_user_id = $1`，`ORDER BY deleted_at DESC, id DESC`。
+- `getByIdIncludingDeleted(client, id)` —— `selectRow(client, TABLE, id, { includeDeleted: true })`（见 46.6 的第一个 bug）。
+
+`listVisible` 新增 `includeHidden` 参数，默认排除当前用户隐藏的题：
+
+```js
+if (includeHidden !== true && ownerUserId) {
+  const hFilter = hiddenFilterClause({ userId: ownerUserId, tableAlias: 'questions', paramIndex: params.length + 1 });
+  params.push(...hFilter.params);
+  where.push(hFilter.clause);
+}
+```
+
+端点（全部在 `server/routes/questions.mjs`）：
+
+| 端点 | 语义 | 关键错误码 |
+| --- | --- | --- |
+| `DELETE /questions/:id` | 软删自己的题（base_version 必填） | 公共题 `403 FORBIDDEN_DELETE`；别人的私有题 `404 not_found` |
+| `PATCH /questions/:id/restore` | 恢复，**刻意不要 base_version** | 未删除时 `400 not_deleted`；不是自己的 `404` |
+| `DELETE /questions/batch` | body `{ids:[]}`，返回 `{deleted, requested, skipped}` | 空数组 `400 EMPTY_IDS` |
+| `PATCH /questions/batch/restore` | body `{ids:[]}`，返回 `{restored, requested, skipped}` | 同上 |
+| `PATCH /questions/:id/hide` | body `{hidden:bool}`，upsert / delete | 非布尔 `400 INVALID_HIDDEN`；别人的私有题 `404` |
+| `GET /questions/deleted` | 只列自己的已移除题，`{items,total,limit,offset}` | 无 Token `401` |
+
+**403 与 404 的取舍**：删自己的题之外的情形分两种——公共题返回 403（要明确告诉用户「公共题不能删，只能隐藏」，这属于产品规则，用户有权知道）；别人的私有题返回 404（不告诉用户「这个 id 存在但不是你的」，避免枚举题库 id）。`requireOwnQuestion(ctx, id, { publicError })` 用一个参数把两种语义分开：默认 `not_found`（保住 FE-02 既有契约「PATCH 公共题 → 404」，`server/routes/questions.integration.test.mjs:617` 有断言），删除路径传 `forbidden`。
+
+**路由匹配顺序是硬要求**：`PATCH /questions/batch/restore` 必须排在 `PATCH /questions/:id/restore` 之前（见 46.6 的第二个 bug）。
+
+**隐藏的生效面有两处**：题库列表 `questions.listVisible` 与练习抽题 `practice_sessions.pickQuestions`。后者有自己的 SQL、不走 `listVisible`，所以必须单独加 `hiddenFilterClause`（见 46.6 的第三个 bug）。
+
+### 46.4 前端：题库管理页
+
+新建 `tillroad_app/lib/pages/question_manage_page.dart`（约 700 行）：
+
+- `enum _ManageFilter { all('全部'), mastered('已掌握'), unmastered('未掌握'), deleted('已删除') }`，带 `label` / `isDeleted` / `masteredParam`（switch 穷举）。
+- `_load()` 按 `isDeleted` 分流：`fetchDeletedQuestions(limit: 100)` 或 `fetchQuestions(limit: 100, mastered: ...)`。
+- `_batchRemove()` / `_batchRestore()`：先 `_confirm` 弹确认，再调批量端点，**结果如实展示 `skipped`**（「其中 N 道没移除（公共题或别人的题不属于你）」）——后端对公共题/别人的题是 SQL 层静默跳过，前端不把 skipped 藏起来，用户才知道为什么选了 5 道只移除了 3 道。
+- `_removeOne()`：先 `fetchQuestion` 拿 `version` 再 `deleteQuestion`（列表里没有 version，拿旧 version 会被判 409）；错误分派 `FORBIDDEN_DELETE` →「公共题不能移除，只能隐藏」。
+- `_restoreOne()`：`not_deleted` →「这道题没有被移除」。
+- 布局：`CupertinoPageScaffold` + `CupertinoSliverNavigationBar(largeTitle '题库管理', trailing '浏览')` + `CustomScrollView`；四颗 `_FilterChip` 筛选；多选后底部出现批量条（批量移除 / 批量恢复 / 取消选择）；`_ManageCard` = 勾选圈 + 题干 + 题型/掌握度/已移除徽标 + 右侧垃圾桶/还原按钮。
+
+`lib/api/question_api.dart` 新增 `BatchResult{requested, deleted, skipped}`（`deleted` 兼容 `deleted`/`restored` 两种键）与 5 个方法：`restoreQuestion` / `setHidden` / `deleteQuestionsBatch` / `restoreQuestionsBatch` / `fetchDeletedQuestions`。
+
+入口改动：`lib/pages/profile_page.dart` 的「题库管理」从 push `QuestionBankPage` 改成 push `QuestionManagePage`（原题库列表页降级为管理页右上角的「浏览」按钮）。
+
+### 46.5 集成测试（6 条，PGlite 真库 6/6）
+
+新建 `server/routes/question_manage.integration.test.mjs`，仿 `question_mastery.integration.test.mjs` 的范式（`RUN_PG_INTEGRATION=1` 才跑）。覆盖：
+
+1. 软删自己的题 → 列表不再出现 → 已删除列表能看到 → 恢复后重新出现
+2. 公共题 → `403 FORBIDDEN_DELETE`；别人的私有题 → `404`；无 Token → `401`
+3. 批量软删 + 批量恢复（公共题静默跳过计入 `skipped`）+ 空 ids → `400 EMPTY_IDS`
+4. 隐藏公共题 → 列表与**练习抽题**都排除 → 取消隐藏后恢复
+5. 已删除列表只列自己的题；恢复别人的题 → `404`；恢复未删除的题 → `400 not_deleted`
+6. 软删的题模考组卷抽不到
+
+回归：`questions` 12 + `question_mastery` 6 + `practice` 8 = **26/26 pass**。
+
+### 46.6 本轮抓到并修掉的三个真 bug
+
+1. **恢复永远 404** —— `restoreQuestion` 先调 `qRepo.getById`，而 `getById` 用 `requireRow`（`selectRow` 默认 `includeDeleted=false`，SQL 恒带 `deleted_at IS NULL`）→ 软删行被当作不存在，恢复在读那一步就 404，`qRepo.restore` 永远走不到。修法：新增 `getByIdIncludingDeleted`。
+2. **批量恢复 500 internal** —— `PATCH /questions/batch/restore` 的 seg 是 `['questions','batch','restore']`，`seg[2]==='restore'` 与 `PATCH /questions/:id/restore` 的判定**撞车** → 被 `:id/restore` 分支抢走，把 `'batch'` 当 uuid 去查 → PG `22P02 invalid input syntax for type uuid: "batch"` → 被 `httpError` 第②分支（`/^[0-9A-Z]{5}$/`）吞成 `{error:'internal'}`。修法：把 batch 分支上移。**排查教训**：`httpError` 会把 SQLSTATE 吞成 internal，必须绕过 HTTP 层直接看底层错误 —— 用临时脚本 `createApp({pool})` + 真 fetch，并在 pool 适配器的 catch 里打印 `e.code / e.sqlState / e.message` + SQL 文本 + params，才拿到 `22P02` 原文。
+3. **隐藏的题仍被练习抽到** —— `practice_sessions.pickQuestions` 自带 SQL、不走 `questions.listVisible`，隐藏过滤没跟过去。修法：在 `pickQuestions` 里也加 `hiddenFilterClause`，且过滤块要放在 source 分域**之前**（否则 public 分支的 count 查询会带没人用的 `$1`，正是 R1 踩过的坑）。另外该函数里只有 `userId` 没有 `ownerUserId`，用错名字会直接 undefined。
+
+### 46.7 真机验证（Android 17 模拟器 + Neon 真库）
+
+- **D1 批量移除 + 恢复**：「我的 → 题库管理」→ 「已掌握」筛出 11 道 → 勾选 3 道 → 「批量移除（3）」→ 确认（文案：「移除后题库里就看不到它们了，模考组卷也不会再抽到。可以在「已删除」里恢复回来。」）→ 列表变 **8 道**；切「已删除」看到 **57 道被移除的题**；选 1 道批量恢复 → 「已恢复 1 道题」→ 回「已掌握」变 **9 道**。
+  - 踩坑：连点 5 次只选中 3 张 —— 列表滚动后卡片位置变了，后两次 tap 落空。**连续点卡片前要先确认列表没在滚动**。
+- **D2 公共题 403**：直接打真 HTTP，`DELETE /questions/{publicId}` → `403 {"error":"FORBIDDEN_DELETE","message":"公共题不能删除，只能隐藏"}`；`PATCH /questions/:id/hide {hidden:true}` → 200，隐藏后列表不再出现；`{hidden:false}` → 200 复原。
+- **D3 软删的题组卷抽不到**：full 模式组卷 30 次 × 每次 50 题（共抽 1500 题）→ 被移除的题一次都没被抽到（`TARGET_EVER_PICKED false`）。**坑**：module 模式必须给 `knowledge_node_id`（否则 `400 MISSING_KNOWLEDGE_NODE_ID`），而本机自有题都没挂考点，只能用 full 模式验证。
+- 截图 3 张：`tillroad_app/screenshots/r3-manage-page.png`（管理页 + 批量条）、`r3-batch-remove-confirm.png`（批量移除确认弹窗）、`r3-restored-list.png`（恢复后的「已掌握」列表 9 道）。
+
+### 46.8 收尾校验
+
+- `flutter analyze --no-fatal-infos` → **86 issues / 0 error / 0 warning**（全为既有 `deprecated_member_use` 等 info）。
+- `flutter test` → **All tests passed! (106 tests)**。
+- `npm test` → **tests 348 / pass 194 / fail 0 / skipped 154**。
+- Neon 真库：0005 迁移执行成功（2041ms），`question_hidden` / `question_mastery` / `questions` 三表都在。
+
+### 46.9 遗留
+
+1. 练习记录**没有删除入口**（`practice_sessions.deleted_at` 有字段但没做端点）。
+2. `duration_ms` 已经在收，但结果页与历史页**还没展示每题用时**。
+3. 标签系统未做（`tags` 列在，题库页没有标签筛选）。
+4. 物理抹除未做 —— 题只软删，可恢复；合规的「彻底删除」需要物理删除与保留期策略。
+5. 隐藏的公共题**没有 UI 入口** —— 后端 `PATCH /questions/:id/hide` 已就绪，但管理页只有「移除 / 恢复」。
+6. 掌握度仍只有「掌握 / 未掌握」两态，且不参与抽题权重。

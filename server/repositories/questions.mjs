@@ -17,11 +17,15 @@ import {
   insertRow,
   listRows,
   pageParams,
+  queryMany,
+  queryOne,
   requireRow,
+  selectRow,
   updateWithVersion,
 } from './_common.mjs';
 import { normalizeQuestionText } from '../../core/index.mjs';
 import { masteryFilterClause } from './question_mastery.mjs';
+import { hiddenFilterClause } from './question_hidden.mjs';
 
 export const TABLE = 'questions';
 
@@ -170,6 +174,16 @@ export async function getById(client, id) {
   return requireRow(client, TABLE, id);
 }
 
+/**
+ * ★ m26090（R3）：按主键读，**包含软删行**。
+ *
+ * 用途：恢复软删的题时必须先读到那行墓碑，否则「恢复」这一步永远 404。
+ * 只在恢复流程里用；其它读路径仍走 getById（软删 = 不存在）。
+ */
+export async function getByIdIncludingDeleted(client, id) {
+  return selectRow(client, TABLE, id, { includeDeleted: true });
+}
+
 /** 列某科目的题（分页，稳定排序）。 */
 /**
  * 列某科目的题（分页，稳定排序）。
@@ -217,7 +231,17 @@ export async function listByKnowledgeNode(
  */
 export async function listVisible(
   client,
-  { limit, offset, ownerUserId, subjectId, knowledgeNodeId, q, mastered, orderBy } = {},
+  {
+    limit,
+    offset,
+    ownerUserId,
+    subjectId,
+    knowledgeNodeId,
+    q,
+    mastered,
+    includeHidden,
+    orderBy,
+  } = {},
 ) {
   const p = pageParams({ limit, offset });
   const where = ['deleted_at IS NULL'];
@@ -241,6 +265,19 @@ export async function listVisible(
   if (ownerUserId) {
     params.push(ownerUserId);
     where.push(`(owner_user_id IS NULL OR owner_user_id = $${params.length})`);
+  }
+  // m26090：隐藏过滤（练习模式 R3）。
+  //   公共题不能软删（不属于任何用户），用户只能「隐藏」——隐藏后不再出现在
+  //   题库列表与练习抽题里，但题本身仍在公共题库里，别人照常看得到。
+  // 用 NOT EXISTS 子查询（不是 JOIN），避免同一题因多行隐藏记录产生重复行。
+  if (includeHidden !== true && ownerUserId) {
+    const hFilter = hiddenFilterClause({
+      userId: ownerUserId,
+      tableAlias: 'questions',
+      paramIndex: params.length + 1,
+    });
+    params.push(...hFilter.params);
+    where.push(hFilter.clause);
   }
   // m25316：掌握状态过滤（练习模式 R2）。
   //   mastered=true  → 有标记且标为已掌握；mastered=false → 有标记且标为未掌握。
@@ -334,4 +371,74 @@ export async function update(client, id, patch = {}, baseVersion) {
 /** 软删（软删后同 hash 的题可以重新导入 —— 查重只看 deleted_at IS NULL）。 */
 export async function archive(client, id, baseVersion) {
   return archiveWithVersion(client, { table: TABLE, id, baseVersion });
+cvJ
+}
+
+/**
+ * m26090 练习模式 R3：恢复软删的题。
+ *
+ * 语义：把 deleted_at 清回 NULL（题目回到题库列表里）。
+ * version 由 questions 表上的 set_updated() 触发器自动 +1 ——
+ * 所以恢复后拿到的 version 一定比删除时大，客户端的乐观锁基线不会错。
+ *
+ * 为什么不用 updateWithVersion：软删行不在 updateWithVersion 的 WHERE 里
+ * （它恒带 deleted_at IS NULL），恢复是「把行从墓碑状态搬回来」，
+ * 语义相反，用一条专门的 UPDATE 更直白。
+ *
+ * 只能恢复**自己的**题（归属门禁在路由层）。
+ */
+export async function restore(client, id) {
+  const sql = `UPDATE ${TABLE} SET deleted_at = NULL
+    WHERE id = $1 AND deleted_at IS NOT NULL
+    RETURNING *`;
+  return queryOne(client, sql, [id]);
+}
+
+/**
+ * m26090：批量软删（自己的题）。
+ *
+ * 批量接口刻意**不带 version** —— 一次操作几十道题，让用户为每道题提供基线号
+ * 既不现实也不友好。代价是批量操作不受乐观锁保护：极小概率下会覆盖别人
+ * 同时做的修改（题库是个人资产，冲突概率远低于缺陷单）。
+ * 单条删除仍然走 archiveWithVersion（严格乐观锁）。
+ *
+ * @returns {Promise<number>} 实际软删的行数
+ */
+export async function archiveBatch(client, ids, ownerUserId) {
+  if (!Array.isArray(ids) || ids.length === 0) return 0;
+  const sql = `UPDATE ${TABLE} SET deleted_at = now()
+    WHERE id = ANY($1::uuid[]) AND deleted_at IS NULL AND owner_user_id = $2
+    RETURNING id`;
+  const rows = await queryMany(client, sql, [ids, ownerUserId]);
+  return rows.length;
+}
+
+/**
+ * m26090：批量恢复（自己的题）。
+ *
+ * @returns {Promise<number>} 实际恢复的行数
+ */
+export async function restoreBatch(client, ids, ownerUserId) {
+  if (!Array.isArray(ids) || ids.length === 0) return 0;
+  const sql = `UPDATE ${TABLE} SET deleted_at = NULL
+    WHERE id = ANY($1::uuid[]) AND deleted_at IS NOT NULL AND owner_user_id = $2
+    RETURNING id`;
+  const rows = await queryMany(client, sql, [ids, ownerUserId]);
+  return rows.length;
+}
+
+/**
+ * m26090：列某用户**已软删**的题（题库管理页的「已删除」筛选）。
+ *
+ * 只列自己的题：公共题永远不会被软删（公共题不属于任何用户），
+ * 所以这里不按 owner 分域查公共题，只查 owner_user_id = 该用户。
+ */
+export async function listDeleted(client, { ownerUserId, limit, offset } = {}) {
+  const p = pageParams({ limit, offset });
+  const where = ['deleted_at IS NOT NULL', 'owner_user_id = $1'];
+  const params = [ownerUserId];
+  return listRows(client, TABLE, where, params, {
+    ...p,
+    orderBy: 'deleted_at DESC, id DESC',
+  });
 }

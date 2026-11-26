@@ -277,6 +277,31 @@ class QuestionOption {
   @override
   String toString() => '$key. $text';
 }
+/// ★ m26090（R3）：批量操作的结果。
+///
+/// skipped > 0 说明有一部分题没动（公共题 / 别人的题不属于当前 token 用户），
+/// 前端要如实告诉用户「其中 N 道没删掉」，不能当成全成功。
+class BatchResult {
+  const BatchResult({required this.requested, required this.deleted, required this.skipped});
+
+  factory BatchResult.fromJson(Map<String, Object?> json) {
+    final int requested = _int(json['requested'], 0);
+    final int deleted = _int(json['deleted'], _int(json['restored'], 0));
+    return BatchResult(
+      requested: requested,
+      deleted: deleted,
+      skipped: _int(json['skipped'], requested - deleted),
+    );
+  }
+
+  final int requested;
+  final int deleted;
+  final int skipped;
+
+  @override
+  String toString() => 'requested=$requested deleted=$deleted skipped=$skipped';
+}
+
 class QuestionApi {
   QuestionApi({ApiClient? client}) : _client = client ?? ApiClient();
 
@@ -447,6 +472,66 @@ class QuestionApi {
   /// 删除题目：`DELETE /questions/:id`（软删，version 必填）。
   Future<void> deleteQuestion({required String id, required int version}) async {
     await _client.delete('/questions/$id', body: <String, Object?>{'version': version});
+  }
+
+  /// ★ m26090（R3）：恢复软删的题：`PATCH /questions/:id/restore`。
+  ///
+  /// 后端刻意不要求 base_version —— 恢复不是「基于某个版本改内容」，
+  /// 只是把墓碑搬回来。
+  Future<void> restoreQuestion({required String id}) async {
+    await _client.patch('/questions/$id/restore', body: <String, Object?>{});
+  }
+
+  /// ★ m26090（R3）：隐藏 / 取消隐藏题目：`PATCH /questions/:id/hide`。
+  ///
+  /// 公共题不能软删（不属于任何用户），只能「只对我隐藏」。
+  Future<void> setHidden({required String id, required bool hidden}) async {
+    await _client.patch(
+      '/questions/$id/hide',
+      body: <String, Object?>{'hidden': hidden},
+    );
+  }
+
+  /// ★ m26090（R3）：批量软删：`DELETE /questions/batch`。
+  ///
+  /// 返回 `BatchResult{requested, deleted, skipped}` ——
+  /// skipped 是被跳过的数量（公共题 / 别人的题不属于你，删不掉）。
+  Future<BatchResult> deleteQuestionsBatch(List<String> ids) async {
+    final Object? raw = await _client.delete(
+      '/questions/batch',
+      body: <String, Object?>{'ids': ids},
+    );
+    if (raw is! Map) throw ApiException('批量删除响应不是 JSON 对象', body: raw);
+    return BatchResult.fromJson(raw.cast<String, Object?>());
+  }
+
+  /// ★ m26090（R3）：批量恢复：`PATCH /questions/batch/restore`。
+  Future<BatchResult> restoreQuestionsBatch(List<String> ids) async {
+    final Object? raw = await _client.patch(
+      '/questions/batch/restore',
+      body: <String, Object?>{'ids': ids},
+    );
+    if (raw is! Map) throw ApiException('批量恢复响应不是 JSON 对象', body: raw);
+    return BatchResult.fromJson(raw.cast<String, Object?>());
+  }
+
+  /// ★ m26090（R3）：列已软删的题：`GET /questions/deleted`。
+  Future<List<BankQuestion>> fetchDeletedQuestions({
+    int limit = 50,
+    int offset = 0,
+    String? currentUserId,
+  }) async {
+    final Object? raw = await _client.get(
+      '/questions/deleted',
+      query: <String, String>{'limit': '$limit', 'offset': '$offset'},
+    );
+    if (raw is! Map) throw ApiException('已删除题目响应不是 JSON 对象', body: raw);
+    final Object? items = raw.cast<String, Object?>()['items'];
+    if (items is! List) return const <BankQuestion>[];
+    return items
+        .whereType<Map>()
+        .map((Map m) => BankQuestion.fromJson(m.cast<String, Object?>(), currentUserId: currentUserId))
+        .toList(growable: false);
   }
 }
 
