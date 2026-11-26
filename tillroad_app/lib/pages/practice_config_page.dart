@@ -51,7 +51,6 @@ class _PracticeConfigPageState extends State<PracticeConfigPage> {
   final DefectApi _defectApi = DefectApi();
   final PracticeApi _practiceApi = PracticeApi();
 
-  List<Map<String, Object?>> _profiles = const <Map<String, Object?>>[];
   List<Map<String, Object?>> _subjects = const <Map<String, Object?>>[];
   List<Map<String, Object?>> _nodes = const <Map<String, Object?>>[];
 
@@ -90,7 +89,6 @@ class _PracticeConfigPageState extends State<PracticeConfigPage> {
           await _defectApi.fetchExamProfiles(kDemoUserId);
       if (!mounted) return;
       setState(() {
-        _profiles = profiles;
         _profileId = _profileId ??
             (profiles.isEmpty ? null : '${profiles.first['id']}');
         _loadingProfiles = false;
@@ -195,7 +193,6 @@ class _PracticeConfigPageState extends State<PracticeConfigPage> {
       }
 
       // 题量不足 → 先问用户，不擅自缩水。
-      int count = pick.items.length;
       if (pick.insufficient) {
         final bool? go = await _confirmFewQuestions(pick.items.length);
         if (!mounted) return;
@@ -203,7 +200,6 @@ class _PracticeConfigPageState extends State<PracticeConfigPage> {
           setState(() => _busy = false);
           return;
         }
-        count = pick.items.length;
       }
 
       setState(() => _busy = false);

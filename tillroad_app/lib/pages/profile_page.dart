@@ -45,7 +45,6 @@ import 'api_token_page.dart';
 import 'exam_config_page.dart';
 import 'mock_page.dart';
 import 'practice_history_page.dart';
-import 'question_bank_page.dart';
 import 'question_manage_page.dart';
 import 'review_page.dart';
 import 'settings_page.dart';

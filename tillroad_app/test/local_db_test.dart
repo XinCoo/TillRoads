@@ -632,7 +632,7 @@ void main() {
 
       // 重新打开：不应重复建表（version 已是 1，onCreate 不会再跑）
       final Database db2 = await LocalDb.instance.database;
-      expect(await LocalDb.instance.isOpen, isTrue);
+      expect(LocalDb.instance.isOpen, isTrue);
       final Map<String, Object?>? row =
           await LocalDaos.defectTickets.getByPk(db2, 'dt-persist');
       expect(row, isNotNull, reason: '重开后数据必须还在');

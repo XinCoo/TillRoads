@@ -95,7 +95,6 @@ class _PracticeAnsweringPageState extends State<PracticeAnsweringPage> {
   int _index = 0;
   bool _submitting = false;
   String? _bannerError;
-  DateTime _enteredAt = DateTime.now();
 
   @override
   void initState() {

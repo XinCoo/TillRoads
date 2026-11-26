@@ -20,7 +20,6 @@ import '../api/practice_api.dart';
 import '../api/question_api.dart';
 import '../config/api_config.dart';
 import '../theme/app_theme.dart';
-import '../widgets/form_field.dart';
 import 'defect_create_page.dart';
 
 class PracticeResultPage extends StatefulWidget {
