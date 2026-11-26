@@ -21,6 +21,7 @@ import {
   queryOne,
   requireRow,
   selectRow,
+  toJsonbParam,
   updateWithVersion,
 } from './_common.mjs';
 import { normalizeQuestionText } from '../../core/index.mjs';
@@ -441,4 +442,96 @@ export async function listDeleted(client, { ownerUserId, limit, offset } = {}) {
     ...p,
     orderBy: 'deleted_at DESC, id DESC',
   });
+}
+
+/**
+ * ★ m27163：按 source 统计**题型词表**（type -> count）。
+ *
+ * 语义：题型是**全局词表**（不是用户私有），所以不按 owner_user_id 过滤；
+ * 但默认口径只统计 source='import' 的题（已导入题目里出现的题型）。
+ *   * scope='imported'（默认）：source = 'import'
+ *   * scope='other'          ：source <> 'import'
+ *   * scope='all'            ：不限来源
+ * 软删的题不计入（deleted_at IS NULL）。
+ *
+ * q：对 type 做 ILIKE 模糊匹配（转义 % / _，用本文件私有的 escapeLikePattern）。
+ * 排序：count DESC, type ASC。
+ *
+ * @returns {Promise<Array<{type: string, count: number}>>}
+ */
+export async function listTypesBySource(client, { scope = 'imported', q = null, limit = 200 } = {}) {
+  const where = ['deleted_at IS NULL'];
+  const params = [];
+  if (scope === 'imported') {
+    where.push(`source = 'import'`);
+  } else if (scope === 'other') {
+    where.push(`source <> 'import'`);
+  }
+  if (q) {
+    params.push(`%${escapeLikePattern(q)}%`);
+    where.push(`type ILIKE $${params.length} ESCAPE '\\'`);
+  }
+  const capped = Math.min(Math.max(Number(limit) || 200, 1), 200);
+  const sql = `SELECT type, COUNT(*)::int AS count
+    FROM ${TABLE}
+    WHERE ${where.join(' AND ')}
+    GROUP BY type
+    ORDER BY count DESC, type ASC
+    LIMIT ${capped}`;
+  const rows = await queryMany(client, sql, params);
+  return rows.map((r) => ({ type: r.type, count: Number(r.count) }));
+}
+
+/**
+ * ★ m27163：批量编辑标签（replace / add）。
+ *
+ * 只改**自己的**题：SQL 条件 owner_user_id = $2。
+ * 公共题（owner_user_id IS NULL）与别人的题会被静默跳过（updated 少于 requested）。
+ * 批量操作刻意**不带 version**（同 archiveBatch 的理由：题库是个人资产，冲突概率极低）。
+ *
+ * tags 以 jsonb 文本传入（用 toJsonbParam 序列化，遵守本仓库的 jsonb 列惯例）。
+ *   * replace：tags 直接覆盖（空数组 → NULL = 清空标签）
+ *   * add    ：与现有标签求并集（现有顺序在前，新标签追加，去重）
+ *
+ * @returns {Promise<number>} 实际更新的行数
+ */
+export async function updateTagsBatch(client, ids, tags, mode = 'replace', ownerUserId) {
+  if (!Array.isArray(ids) || ids.length === 0) return 0;
+  const list = Array.isArray(tags) ? tags : [];
+  const tagsJsonb = list.length > 0 ? toJsonbParam(list) : null;
+  const sql = `WITH target AS (
+      SELECT q.id, q.tags AS old_tags
+        FROM ${TABLE} q
+       WHERE q.id = ANY($1::uuid[])
+         AND q.deleted_at IS NULL
+         AND q.owner_user_id = $2
+    ), merged AS (
+      SELECT t.id,
+             t.old_tags,
+             CASE
+               WHEN $4::text = 'replace' THEN $3::jsonb
+               ELSE (
+                 SELECT COALESCE(jsonb_agg(s.t ORDER BY s.first_pos), '[]'::jsonb)
+                   FROM (
+                     SELECT u.t, MIN(u.pos) AS first_pos
+                       FROM (
+                         SELECT e.t, e.ord::int AS pos
+                           FROM jsonb_array_elements_text(COALESCE(t.old_tags, '[]'::jsonb)) WITH ORDINALITY AS e(t, ord)
+                         UNION ALL
+                         SELECT n.t, 1000000 + n.ord::int
+                           FROM jsonb_array_elements_text(COALESCE($3::jsonb, '[]'::jsonb)) WITH ORDINALITY AS n(t, ord)
+                       ) u
+                      GROUP BY u.t
+                   ) s
+               )
+             END AS new_tags
+        FROM target t
+    )
+    UPDATE ${TABLE} q
+       SET tags = m.new_tags
+      FROM merged m
+     WHERE q.id = m.id
+    RETURNING q.id`;
+  const rows = await queryMany(client, sql, [ids, ownerUserId, tagsJsonb, mode]);
+  return rows.length;
 }

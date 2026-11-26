@@ -50,6 +50,8 @@ export const WRITABLE_COLUMNS = Object.freeze([
   'exam_profile_id',
   'user_id',
   'reopen_reason',
+  // ★ m27163：自定义错因（可复用短标签，如「计算失误」）；DB 列 varchar(60)，限长在应用层做。
+  'custom_reason',
 ]);
 
 // create 时的列（status 显式给定，由调用方按 DRAFT / ANALYZED 决定；
@@ -65,6 +67,8 @@ const INSERT_COLUMNS = Object.freeze([
   'actions',
   'priority',
   'status',
+  // ★ m27163：自定义错因（建单时透传 input.custom_reason）
+  'custom_reason',
 ]);
 
 /** core 抛出的带 .code Error 原样上抛（httpError 第 3 分支 → 400 {error:code}）。 */
@@ -658,4 +662,128 @@ export async function verificationTimeline(client, id, opts = {}) {
 /** 读该单的动作列表，供 GET 详情回带。 */
 export async function actionList(client, id, opts = {}) {
   return actions.listByDefect(client, id, opts);
+}
+
+/**
+ * ★ m27163：缺陷单 ↔ 题目 一对多关联（defect_questions 表）。
+ *
+ * 表结构（migrations/0006_exam_custom_defect_questions.sql）：
+ *   defect_questions(id uuid PK, defect_ticket_id uuid NOT NULL REFERENCES defect_tickets(id) ON DELETE CASCADE,
+ *                     question_id uuid NOT NULL REFERENCES questions(id), sort int NOT NULL DEFAULT 0, created_at)
+ *   + uk_defect_question(defect_ticket_id, question_id) 唯一索引
+ *   + idx_dq_ticket(defect_ticket_id, sort)
+ *
+ * 这些函数只做 DB 读写；归属校验（缺陷单是否属于当前用户）在路由层做。
+ */
+
+export const LINK_TABLE = 'defect_questions';
+
+const LINK_SELECT = `SELECT dq.id, dq.defect_ticket_id, dq.question_id, dq.sort, dq.created_at
+    FROM ${LINK_TABLE} dq`;
+
+/** 列某缺陷单的全部关联（按 sort ASC, id ASC）。 */
+export async function listQuestionLinks(client, defectTicketId) {
+  return queryMany(
+    client,
+    `${LINK_SELECT} WHERE dq.defect_ticket_id = $1 ORDER BY dq.sort ASC, dq.id ASC`,
+    [defectTicketId],
+  );
+}
+
+/** 列某缺陷单的关联 + 题目展示字段（JOIN questions），返回完整 stem。 */
+export async function listQuestionLinksWithQuestions(client, defectTicketId) {
+  const rows = await queryMany(
+    client,
+    `SELECT dq.id, dq.question_id, dq.sort, dq.created_at,
+            q.stem, q.type, q.source, q.difficulty
+       FROM ${LINK_TABLE} dq
+       JOIN questions q ON q.id = dq.question_id
+      WHERE dq.defect_ticket_id = $1
+      ORDER BY dq.sort ASC, dq.id ASC`,
+    [defectTicketId],
+  );
+  return rows;
+}
+
+/** 当前关联数（新增时的 sort = 该值，追加到末尾）。 */
+export async function countQuestionLinks(client, defectTicketId) {
+  const row = await queryOne(
+    client,
+    `SELECT COUNT(*)::int AS count FROM ${LINK_TABLE} WHERE defect_ticket_id = $1`,
+    [defectTicketId],
+  );
+  return Number(row?.count ?? 0);
+}
+
+/** 是否已关联（用于 409 duplicate_defect_question）。 */
+export async function findQuestionLink(client, defectTicketId, questionId) {
+  return queryOne(
+    client,
+    `${LINK_SELECT} WHERE dq.defect_ticket_id = $1 AND dq.question_id = $2 LIMIT 1`,
+    [defectTicketId, questionId],
+  );
+}
+
+/** 新增一条关联（sort 显式给定）。唯一索引冲突由上层转成 409。 */
+export async function createQuestionLink(client, { defect_ticket_id, question_id, sort }) {
+  return queryOne(
+    client,
+    `INSERT INTO ${LINK_TABLE} (defect_ticket_id, question_id, sort)
+     VALUES ($1, $2, $3)
+     RETURNING id, defect_ticket_id, question_id, sort, created_at`,
+    [defect_ticket_id, question_id, sort],
+  );
+}
+
+/** 解除一条关联（返回被删行；无行 → null，路由层转 404）。 */
+export async function deleteQuestionLink(client, defectTicketId, questionId) {
+  return queryOne(
+    client,
+    `DELETE FROM ${LINK_TABLE}
+      WHERE defect_ticket_id = $1 AND question_id = $2
+      RETURNING id, defect_ticket_id, question_id, sort`,
+    [defectTicketId, questionId],
+  );
+}
+
+/**
+ * 按传入顺序重排（只重排传入的那些，sort 取其在新列表中的下标 +1）。
+ * 返回受影响行。
+ */
+export async function reorderQuestionLinks(client, defectTicketId, questionIds) {
+  const rows = [];
+  for (let i = 0; i < questionIds.length; i += 1) {
+    const row = await queryOne(
+      client,
+      `UPDATE ${LINK_TABLE} SET sort = $3
+        WHERE defect_ticket_id = $1 AND question_id = $2
+        RETURNING id, defect_ticket_id, question_id, sort`,
+      [defectTicketId, questionIds[i], i + 1],
+    );
+    if (row) rows.push(row);
+  }
+  return rows;
+}
+
+/**
+ * ★ m27163：当前用户历史上用过的自定义错因 + 出现次数（错因下拉框的候选来源）。
+ * 可选 exam_profile_id 限定同一考试目标。
+ */
+export async function listCustomReasons(client, userId, { examProfileId = null } = {}) {
+  const params = [userId];
+  let where = `user_id = $1 AND deleted_at IS NULL
+      AND custom_reason IS NOT NULL AND TRIM(custom_reason) <> ''`;
+  if (examProfileId) {
+    params.push(examProfileId);
+    where += ` AND exam_profile_id = $${params.length}`;
+  }
+  return queryMany(
+    client,
+    `SELECT custom_reason, COUNT(*)::int AS count
+       FROM ${TABLE}
+      WHERE ${where}
+      GROUP BY custom_reason
+      ORDER BY count DESC, custom_reason ASC`,
+    params,
+  );
 }

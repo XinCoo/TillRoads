@@ -16,11 +16,62 @@ import 'package:shared_preferences/shared_preferences.dart';
 /// 生产代码路径仍然只读这个值，不写它。
 bool kUseMock = false;
 
-/// 联调用的演示用户 id，与 `scripts/seed-dev.mjs` 里的固定 UUID 一致。
+/// 当前用户 id 的默认值（`scripts/seed-dev.mjs` 里的固定演示 UUID）。
 ///
-/// 真实产品里这个值应来自登录态；本轮没有鉴权体系（见遗留项），
-/// 所以先写死。它只影响「查哪个用户的缺陷单」，不影响任何写操作。
-const String kDemoUserId = '11111111-1111-4111-8111-111111111111';
+/// 只有在「还没拿到真实用户」时才会用到这个值。
+const String kDefaultUserId = '11111111-1111-4111-8111-111111111111';
+
+/// 当前用户 id 在 shared_preferences 里的键名。
+const String kCurrentUserIdPrefsKey = 'current_user_id';
+
+/// 运行时可变的当前用户 id。
+///
+/// ── 为什么从 const 变成 getter ───────────────────────────────────────────
+/// 以前它是写死的常量，于是**所有账号**在「我的」页都显示 `1111****`。
+/// 现在它由 `GET /me` 返回的真实 id 驱动（切换 Token 成功后写入）。
+///
+/// ── 注意：它传给 API 时其实无所谓 ───────────────────────────────────────
+/// 后端会把 `/users/<任意 id>` 的第 2 段改写成 token 对应用户，
+/// 所以调用点传什么 id 都能拿到自己的数据。这个值的实际价值是
+/// **让「我的」页显示真实用户 id**（以及作为「复制完整 ID」的来源）。
+/// 因此把它改成 getter 后，全工程 50+ 处调用点一行都不用动。
+String _currentUserId = kDefaultUserId;
+
+/// 当前用户 id（默认是演示 id，登录后会被真实 id 覆盖）。
+String get kDemoUserId => _currentUserId;
+
+/// 设置当前用户 id（只改内存值；落盘请用 [persistCurrentUserId]）。
+void setCurrentUserId(String id) {
+  final String normalized = id.trim();
+  if (normalized.isEmpty) return;
+  _currentUserId = normalized;
+}
+
+/// 设置并**落盘**当前用户 id（shared_preferences 的 `current_user_id`）。
+///
+/// 切换 Token 成功后调用：这样下次冷启动时「我的」页还能显示同一个用户。
+Future<void> persistCurrentUserId(String id) async {
+  final String normalized = id.trim();
+  if (normalized.isEmpty) return;
+  setCurrentUserId(normalized);
+  final preferences = await SharedPreferences.getInstance();
+  await preferences.setString(kCurrentUserIdPrefsKey, normalized);
+}
+
+/// 启动时恢复上次登录用户的 id。
+///
+/// 没有缓存时保持默认演示 id（不写盘，等真正拿到 `/me` 再更新）。
+Future<void> initializeCurrentUserId() async {
+  try {
+    final preferences = await SharedPreferences.getInstance();
+    final String? cached = preferences.getString(kCurrentUserIdPrefsKey);
+    if (cached != null && cached.trim().isNotEmpty) {
+      _currentUserId = cached.trim();
+    }
+  } catch (e) {
+    // 读失败不影响启动：保持默认 id 即可（只是「我的」页暂时显示演示 id）。
+  }
+}
 
 /// API base URL. Override for deployment with `--dart-define=API_BASE_URL=...`.
 const String kRailwayApiBaseUrl = 'https://tillroads-production.up.railway.app';
@@ -66,17 +117,37 @@ String get kApiBaseUrl => normalizeBaseUrl(kApiBaseUrlRaw) ?? kApiBaseUrlRaw.tri
 const String kApiTokenFromDefine = String.fromEnvironment('API_TOKEN');
 String? _apiToken;
 
-String? get kApiToken =>
-    kApiTokenFromDefine.isNotEmpty ? kApiTokenFromDefine : _apiToken;
+/// 用户是否在 App 里手动保存过 Token。
+///
+/// 为什么要这个标志：`kApiToken` 原本是「构建期 --dart-define 的 token 优先」。
+/// 那是给分发用的（一个 APK 发所有人，构建时不带 token；带 token 的包只给开发者）。
+/// 但如果用户真在「我的 → 切换 Token」里换了 token，就必须**立刻生效**，
+/// 否则会退化成「点了没反应」的静默失败（A3 明确禁止）。
+/// 所以：只要用户手动保存过，就以用户保存的为准，构建期的 define 让位。
+bool _tokenOverriddenByUser = false;
 
-bool get hasApiToken => kApiTokenFromDefine.trim().isNotEmpty || (_apiToken ?? '').trim().isNotEmpty;
+String? get kApiToken {
+  if (_tokenOverriddenByUser) return _apiToken;
+  return kApiTokenFromDefine.isNotEmpty ? kApiTokenFromDefine : _apiToken;
+}
+
+bool get hasApiToken => (kApiToken ?? '').trim().isNotEmpty;
 Future<void> initializeApiToken() async {
-  if (kApiTokenFromDefine.isNotEmpty) {
-    _apiToken = kApiTokenFromDefine;
+  // 顺带恢复上次登录的用户 id —— 这样 main.dart 不需要额外加一行调用
+  // （两者都是「启动时读一次本地缓存」的初始化，放在一起最省事）。
+  await initializeCurrentUserId();
+  final preferences = await SharedPreferences.getInstance();
+  final String? saved = preferences.getString('api_token');
+  if (saved != null && saved.trim().isNotEmpty) {
+    // 本机保存过 token（用户手动输入或切换过）→ 以它为准。
+    _apiToken = saved.trim();
+    _tokenOverriddenByUser = true;
     return;
   }
-  final preferences = await SharedPreferences.getInstance();
-  _apiToken = preferences.getString('api_token');
+  if (kApiTokenFromDefine.isNotEmpty) {
+    // 只是在开发/内部分发包里带了 token，且用户还没自己保存过 → 用构建期的。
+    _apiToken = kApiTokenFromDefine;
+  }
 }
 
 Future<void> saveApiToken(String token) async {

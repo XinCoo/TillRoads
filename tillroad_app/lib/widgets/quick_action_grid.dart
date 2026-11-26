@@ -10,18 +10,25 @@ class QuickAction {
     required this.icon,
     required this.label,
     required this.onTap,
+    this.busy = false,
   });
 
   final IconData icon;
   final String label;
   final VoidCallback onTap;
+
+  /// 该入口正在请求中（B1）。图标位置换成转圈，提示用户「已经点过了，在等」。
+  final bool busy;
 }
 
-/// 快捷入口网格：2×2 四个图标按钮
+/// 快捷入口网格：两列，四个图标按钮
 ///
-/// 时序：建题 → 转缺陷单 → 开始模考 → 复盘，
-/// 与产品主闭环（录入 → 归因 → 限时验证 → 周期复盘）同序，
+/// 时序：建题 → 开始模考 → 复盘 → 开始练习，
+/// 与产品主闭环（录入 → 限时验证 → 周期复盘 → 巩固练习）同序，
 /// 用户从左到右、从上到下扫视即是一条完整流程。
+///
+/// C1（m27163）：原来这里的第二项是「转缺陷单」，与「建题」职责重叠
+/// （两者都是新建缺陷单），已删除。
 ///
 /// 每个格子都用 [PressableCard]（弹簧 + 触感），
 /// 而不是 `CupertinoButton`——后者在网格里会带明显的按下遮罩，
@@ -62,11 +69,13 @@ class QuickActionGrid extends StatelessWidget {
                             color: AppColors.accent.withValues(alpha: 0.10),
                             borderRadius: BorderRadius.circular(10),
                           ),
-                          child: Icon(
-                            action.icon,
-                            size: 19,
-                            color: AppColors.accent,
-                          ),
+                          child: action.busy
+                              ? const CupertinoActivityIndicator(radius: 9)
+                              : Icon(
+                                  action.icon,
+                                  size: 19,
+                                  color: AppColors.accent,
+                                ),
                         ),
                         const SizedBox(width: 10),
                         Expanded(

@@ -33,6 +33,7 @@ export const MIGRATION_FILES = Object.freeze([
   'migrations/0003_practice.sql',
   'migrations/0004_question_mastery.sql',
   'migrations/0005_question_hidden.sql',
+  'migrations/0006_exam_custom_defect_questions.sql',
 ]);
 
 const MIGRATION_SQL = MIGRATION_FILES.map((f) => ({

@@ -33,6 +33,9 @@ export const TABLE = 'exam_profiles';
 //   * 不含 user_id —— 归属不可变，换用户等于换一条记录，不在 update 语义内。
 export const WRITABLE_COLUMNS = Object.freeze([
   'exam_type',
+  // m27163 A1②：自定义考试名称（exam_type='custom' 时由它承载考试叫什么）。
+  // 列是 text 可空；只在 exam_type='custom' 时必填（校验在路由层）。
+  'exam_type_custom',
   'target_label',
   'target_score',
   'subject_target',
@@ -42,7 +45,6 @@ export const WRITABLE_COLUMNS = Object.freeze([
   'baseline',
   'status',
 ]);
-
 const INSERT_COLUMNS = Object.freeze(['user_id', ...WRITABLE_COLUMNS]);
 
 function duplicateLabelError(current, incoming) {
@@ -83,6 +85,8 @@ export async function create(client, input = {}) {
 
   const values = [
     input.exam_type,
+    // m27163 A1②：自定义考试名称（exam_type='custom' 时承载考试叫什么，其余类型为 null）。
+    input.exam_type_custom ?? null,
     input.target_label ?? null,
     input.target_score ?? null,
     input.subject_target ?? null,
@@ -131,6 +135,35 @@ export async function update(client, id, patch = {}, baseVersion) {
   });
 }
 
+/**
+ * 统计还有多少业务数据引用着这个考试目标（m27163 A1①）。
+ * 统计还有多少业务数据引用着这个考试目标（m27163 A1①）。
+ *
+ * 引用方两张表：
+ *   defect_tickets.exam_profile_id —— 缺陷单
+ *   mock_exams.exam_profile_id     —— 模考
+ * （subjects 的 FK 是 ON DELETE CASCADE，那是从属数据，不算「被使用」）
+ *
+ * 只统计未软删的行：已经软删的引用不阻止删除，否则用户删过一个目标后
+ * 就再也删不掉它了。
+ */
+export async function countReferences(client, id) {
+  const res = await client.query(
+    `SELECT
+       (SELECT count(*)::int FROM defect_tickets
+         WHERE exam_profile_id = $1 AND deleted_at IS NULL) AS defect_tickets,
+       (SELECT count(*)::int FROM mock_exams
+         WHERE exam_profile_id = $1 AND deleted_at IS NULL) AS mock_exams`,
+    [id],
+  );
+  const row = res.rows[0] ?? {};
+  return {
+    defect_tickets: row.defect_tickets ?? 0,
+    mock_exams: row.mock_exams ?? 0,
+  };
+}
+
+/**
 /**
  * 软删。
  * 与 status='archived' 的**业务态**不同：archived 是「目标归档但仍可查」，

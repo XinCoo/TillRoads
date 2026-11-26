@@ -23,6 +23,7 @@ import '../mock/defects_mock.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart';
 import '../widgets/defect_badges.dart';
+import '../widgets/defect_question_list.dart';
 import '../widgets/verification_progress.dart';
 import 'defect_analyze_page.dart';
 import 'defect_verify_page.dart';
@@ -55,6 +56,12 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
 
   final DefectApi _api = DefectApi();
   ApiException? _refreshError;
+
+  /// 关联题目（任务 C4）。后端在详情返回体里带 `questions`，
+  /// 也提供 `GET /defect-tickets/:id/questions` 单独拉。
+  List<DefectLinkedQuestion> _questions = const <DefectLinkedQuestion>[];
+  bool _loadingQuestions = false;
+  String? _questionsError;
 
   /// R4a：这张单的写队列里有 409 冲突（推送被服务端版本号挡下）。
   bool _hasConflict = false;
@@ -161,11 +168,145 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
         ticket = detail;
         _refreshError = null;
       });
+      // 详情返回体里新增了 `questions` 字段，但为了兼容后端旧版本，
+      // 这里单独再拉一次关联题目列表（接口更轻，失败不影响详情）。
+      unawaited(_syncQuestionsFromDetail());
     } on ApiException catch (e) {
       if (!mounted) return;
       setState(() => _refreshError = e);
     }
   }
+
+  // ─────────── 关联题目（任务 C4）───────────
+
+  /// 拉取这张单关联的题目（按 sort ASC）。
+  /// 详情返回体里的 `questions` 数组（任务 C4）。
+  ///
+  /// 后端给 `GET /defect-tickets/:id` 加了 `questions` 字段，优先用它；
+  /// 若返回里没有（后端版本较旧），再退回单独的关联题目接口。
+  Future<void> _syncQuestionsFromDetail() async {
+    try {
+      final List<DefectLinkedQuestion> fromDetail =
+          await _api.fetchDetailQuestions(widget.ticket.id);
+      if (!mounted) return;
+      if (fromDetail.isEmpty) {
+        await _refreshQuestions();
+        return;
+      }
+      setState(() {
+        _questions = fromDetail;
+        _loadingQuestions = false;
+        _questionsError = null;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      debugPrint('[detail] 详情里的关联题目读取失败：${e.message}');
+      await _refreshQuestions();
+    }
+  }
+
+  /// 拉取这张单关联的题目（按 sort ASC）。
+  Future<void> _refreshQuestions() async {
+    if (kUseMock) return;
+    if (!mounted) return;
+    setState(() => _loadingQuestions = true);
+    try {
+      final List<DefectLinkedQuestion> list =
+          await _api.fetchLinkedQuestions(widget.ticket.id);
+      if (!mounted) return;
+      setState(() {
+        _questions = list;
+        _loadingQuestions = false;
+        _questionsError = null;
+      });
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _loadingQuestions = false;
+        _questionsError = e.message;
+      });
+    }
+  }
+
+  /// 批量关联题目。后端对重复关联返回 409 `duplicate_defect_question`，
+  /// 这里逐个提交并如实统计「已在列表中」的数量。
+  Future<void> _linkQuestions(List<String> questionIds) async {
+    if (questionIds.isEmpty) return;
+    int added = 0;
+    int skipped = 0;
+    String? failure;
+    for (final String id in questionIds) {
+      try {
+        await _api.linkQuestion(widget.ticket.id, id);
+        added++;
+      } on ApiException catch (e) {
+        final Object? body = e.body;
+        final String code =
+            body is Map && body['error'] != null ? '${body['error']}' : '';
+        if (code == 'duplicate_defect_question') {
+          skipped++;
+          continue;
+        }
+        failure = e.message;
+        break;
+      }
+    }
+    await _refreshQuestions();
+    if (!mounted) return;
+    final List<String> parts = <String>[];
+    if (added > 0) parts.add('已关联 $added 道题');
+    if (skipped > 0) parts.add('$skipped 道已在列表中');
+    if (failure != null) parts.add(failure);
+    _toast(context, parts.isEmpty ? '没有新增关联' : parts.join('，'));
+  }
+
+  /// 移除一道关联题目。
+  Future<void> _unlinkQuestion(String questionId) async {
+    try {
+      await _api.unlinkQuestion(widget.ticket.id, questionId);
+      await _refreshQuestions();
+      if (!mounted) return;
+      _toast(context, '已移除该题关联。');
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      _toast(context, '移除失败：${e.message}');
+    }
+  }
+
+  /// 拖拽排序后提交新顺序（PUT /defect-tickets/:id/questions/sort）。
+  Future<void> _reorderQuestions(List<String> orderedQuestionIds) async {
+    final List<String> previous =
+        _questions.map((DefectLinkedQuestion q) => q.questionId).toList();
+    // 先本地更新，避免等网络返回时列表“弹回去”。
+    setState(() {
+      final Map<String, DefectLinkedQuestion> byId = <String, DefectLinkedQuestion>{
+        for (final DefectLinkedQuestion q in _questions) q.questionId: q,
+      };
+      _questions = orderedQuestionIds
+          .map((String id) => byId[id])
+          .whereType<DefectLinkedQuestion>()
+          .toList(growable: false);
+    });
+    try {
+      await _api.reorderLinkedQuestions(widget.ticket.id, orderedQuestionIds);
+      if (!mounted) return;
+      _toast(context, '顺序已保存。');
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() {
+        final Map<String, DefectLinkedQuestion> byId =
+            <String, DefectLinkedQuestion>{
+          for (final DefectLinkedQuestion q in _questions) q.questionId: q,
+        };
+        _questions = previous
+            .map((String id) => byId[id])
+            .whereType<DefectLinkedQuestion>()
+            .toList(growable: false);
+      });
+      _toast(context, '排序保存失败：${e.message}');
+    }
+  }
+
   // ─────────── 写操作（FE-03 写操作联调）───────────
 
   bool _busy = false;
@@ -646,7 +787,12 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
                                   ],
                                 ),
                               ),
-                              // 6. 动作数（最后一行不留底部间距）
+                              // 6. 关联题目数量（任务 C4）
+                              InfoRow(
+                                label: '关联题目',
+                                value: InfoText('${_questions.length} 道'),
+                              ),
+                              // 7. 动作数（最后一行不留底部间距）
                               Row(
                                 crossAxisAlignment:
                                     CrossAxisAlignment.start,
@@ -675,7 +821,6 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
                           ),
                         ),
 
-                        // ─────────── 处理动作 ───────────
                         const SizedBox(height: 20),
                         SectionHeader(
                           text: '处理动作',
@@ -714,6 +859,7 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
                                 ),
                         ),
 
+
                         // ─────────── 三次验证进度 ───────────
                         const SizedBox(height: 20),
                         const SectionHeader(text: '三次验证'),
@@ -727,6 +873,42 @@ class _DefectDetailPageState extends State<DefectDetailPage> {
                         CardShell(
                           child: StatusTimeline(
                             events: ticket.statusHistory,
+                          ),
+                        ),
+                        // ─────────── 关联题目（任务 C4）───────────
+                        //
+                        // 放在页面末尾而不是「基本信息」旁边：详情页首屏要同时露出
+                        // 基本信息 / 处理动作 / 三次验证 三个区块，插入中间的关联题目
+                        // 列表会把后两者挤到折叠线以下。基本信息卡片里已经有「关联题目
+                        // N 道」这一行给出数量提示。
+                        const SizedBox(height: 20),
+                        const SectionHeader(text: '关联题目'),
+                        CardShell(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: <Widget>[
+                              DefectQuestionList(
+                                questions: _questions,
+                                loading: _loadingQuestions,
+                                questionLoader: () =>
+                                    _api.fetchSelectableQuestions(),
+                                onReorder: _reorderQuestions,
+                                onRemove: _unlinkQuestion,
+                                onLink: _linkQuestions,
+                              ),
+                              if (_questionsError != null)
+                                Padding(
+                                  padding: const EdgeInsets.only(top: 8),
+                                  child: Text(
+                                    '关联题目加载失败：$_questionsError',
+                                    style: const TextStyle(
+                                      fontFamily: kFontFamily,
+                                      fontSize: 12,
+                                      color: AppColors.overdue,
+                                    ),
+                                  ),
+                                ),
+                            ],
                           ),
                         ),
                       ],

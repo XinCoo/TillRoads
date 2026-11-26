@@ -41,14 +41,28 @@ class ApiException implements Exception {
 }
 
 class ApiClient {
-  ApiClient({http.Client? client, String? baseUrl, Duration? timeout})
-    : _client = client ?? http.Client(),
-      _baseUrl = baseUrl ?? kApiBaseUrl,
-      _timeout = timeout ?? kApiTimeout;
+  ApiClient({
+    http.Client? client,
+    String? baseUrl,
+    Duration? timeout,
+    this.defaultTimeout,
+  }) : _client = client ?? http.Client(),
+       _baseUrl = baseUrl ?? kApiBaseUrl,
+       _timeout = timeout ?? kApiTimeout;
+
 
   final http.Client _client;
   final String _baseUrl;
   final Duration _timeout;
+
+  /// 单个请求可覆盖的默认超时。
+  ///
+  /// 为什么要有它：Railway 免费实例休眠后冷启动时，首次连接会被网关拖到
+  /// 10s 以上（实测生产环境 16 次请求里有 2 次直接 `UND_ERR_CONNECT_TIMEOUT`，
+  /// 耗时 10.7s）。而 `kApiTimeout`（15s）是给普通读接口的全局默认值。
+  /// 个别「冷启动期第一个请求」（如首页建单要拉考试目标）需要更宽的窗口，
+  /// 但不必把全局值调大——全局调大会让真正卡死的请求也干等更久。
+  final Duration? defaultTimeout;
 
   /// 拼请求 URL。
   ///
@@ -63,26 +77,36 @@ class ApiClient {
   /// 当前使用的 base URL（诊断页展示用）。
   String get baseUrl => _baseUrl;
 
-  Future<Object?> get(String path, {Map<String, String>? query}) =>
-      _send('GET', _uri(path, query));
+  Future<Object?> get(
+    String path, {
+    Map<String, String>? query,
+    Duration? timeout,
+  }) => _send('GET', _uri(path, query), timeout: timeout);
+
 
   Future<Object?> post(
     String path, {
     Object? body,
     Map<String, String>? query,
-  }) => _send('POST', _uri(path, query), body: body);
+    Duration? timeout,
+  }) => _send('POST', _uri(path, query), body: body, timeout: timeout);
+
 
   Future<Object?> patch(
     String path, {
     Object? body,
     Map<String, String>? query,
-  }) => _send('PATCH', _uri(path, query), body: body);
+    Duration? timeout,
+  }) => _send('PATCH', _uri(path, query), body: body, timeout: timeout);
+
 
   Future<Object?> delete(
     String path, {
     Object? body,
     Map<String, String>? query,
-  }) => _send('DELETE', _uri(path, query), body: body);
+    Duration? timeout,
+  }) => _send('DELETE', _uri(path, query), body: body, timeout: timeout);
+
 
   /// 发请求并记日志（任务 B2/B3）。
   ///
@@ -90,7 +114,15 @@ class ApiClient {
   ///   ① 请求前：`[API] GET /users/1111****/defect-tickets`（URL 已脱敏）；
   ///   ② 响应后：`[API] 200 OK 342ms` / `[API] 500 ERROR 1200ms code=xxx`；
   ///   ③ 抛 `ApiException` 前：完整 statusCode / body / url（任务 B3）。
-  Future<Object?> _send(String method, Uri uri, {Object? body}) async {
+  Future<Object?> _send(
+    String method,
+    Uri uri, {
+    Object? body,
+    Duration? timeout,
+  }) async {
+    // 单请求超时优先级：显式参数 > 构造时的 defaultTimeout > 构造时的 timeout > kApiTimeout。
+    final Duration effectiveTimeout = timeout ?? defaultTimeout ?? _timeout;
+
     // 相对路径（不含 host）更短也更好读；host 在启动日志里已经记过一次。
     final String where = '${uri.path}${uri.hasQuery ? '?${uri.query}' : ''}';
     AppLogger.instance.info('API', '$method $where');
@@ -110,15 +142,21 @@ class ApiClient {
 
     http.StreamedResponse streamed;
     try {
-      streamed = await _client.send(request).timeout(_timeout);
+      streamed = await _client.send(request).timeout(effectiveTimeout);
+
     } on TimeoutException {
       watch.stop();
       // 超时是最常被误报成「App 卡住」的情形，必须带超时值直接落盘。
       AppLogger.instance.error(
         'API',
-        '$method $where Timeout ${_timeout.inMilliseconds}ms',
+        '$method $where Timeout ${effectiveTimeout.inMilliseconds}ms',
+
       );
-      throw ApiException('请求超时（${_timeout.inSeconds}s），请检查后端是否在运行', uri: uri);
+      throw ApiException(
+        '请求超时（${effectiveTimeout.inSeconds}s），请检查后端是否在运行',
+        uri: uri,
+      );
+
     } catch (e) {
       watch.stop();
       // SocketException / ClientException 等传输层失败，statusCode 留 null

@@ -26,13 +26,15 @@
 // 所以 `CLOSED / total` 就是严格意义上的验证完成率。
 // 而 `verification-summary.total` 作为「进行中 N」的副标题展示，
 // 两个数字并排才能看出「已完成 / 还在队列里」的真实比例。
-import 'dart:async' show unawaited;
+import 'dart:async' show Timer, unawaited;
 
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/services.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
 import '../api/api_client.dart' show ApiException;
 import '../api/defect_api.dart';
+import '../api/user_api.dart';
 // 只取 summary 相关的两个类型：`VerificationTask` 与首页 mock 里的同名类型
 // 不是一回事，这里不需要任务级模型，用 show 收窄可避免将来 ambiguous_import。
 import '../api/verification_api.dart' show VerificationApi, VerificationSummary;
@@ -40,7 +42,9 @@ import '../config/api_config.dart';
 import '../config/local_config.dart';
 import '../local/local.dart';
 import '../theme/app_theme.dart';
+import '../utils/session.dart';
 import '../widgets/common.dart';
+import '../widgets/toast_overlay.dart';
 import 'api_token_page.dart';
 import 'exam_config_page.dart';
 import 'mock_page.dart';
@@ -61,6 +65,24 @@ class _ProfilePageState extends State<ProfilePage> {
   final DefectApi _defectApi = DefectApi();
   final VerificationApi _verifyApi = VerificationApi();
 
+  /// 当前用户资料（`GET /me`）。
+  final UserApi _userApi = UserApi();
+
+  /// 后端返回的用户资料；null 表示还没拿到（或拿失败）。
+  UserProfile? _user;
+
+  /// 用户资料是否还在加载中。
+  bool _userLoading = true;
+
+  /// 用户资料加载失败的原因（非 null 时在卡片上给一行小字提示）。
+  String? _userError;
+
+  /// 切换 Token 成功后的高亮闪烁（账户卡片背景变淡蓝 600ms 后复原）。
+  bool _highlight = false;
+
+  /// 负责关掉高亮的定时器；dispose 时必须取消，否则会在页面销毁后 setState。
+  Timer? _highlightTimer;
+
   /// 缺陷聚合（`defect-stats`）。null 表示「尚未拿到」——用于把对应格子降级成「—」，
   /// 不额外维护 error 字段：本页的失败语义只有一种，就是「这项没有数字」。
   Map<String, Object?>? _stats;
@@ -77,6 +99,7 @@ class _ProfilePageState extends State<ProfilePage> {
     if (kLocalFirstEnabled) kLocalDataRevision.addListener(_onLocalDataChanged);
     if (!kUseMock) {
       _loadAll();
+      _loadUser();
     }
   }
 
@@ -89,8 +112,10 @@ class _ProfilePageState extends State<ProfilePage> {
   @override
   void dispose() {
     if (kLocalFirstEnabled) kLocalDataRevision.removeListener(_onLocalDataChanged);
+    _highlightTimer?.cancel();
     _defectApi.close();
     _verifyApi.close();
+    _userApi.close();
     super.dispose();
   }
 
@@ -181,6 +206,39 @@ class _ProfilePageState extends State<ProfilePage> {
       debugPrint('[profile] 验证摘要解析异常：$e');
     }
   }
+  /// 拉取当前用户资料（`GET /me`）。
+  ///
+  /// 失败只记日志 + 记下 `_userError`：昵称与 id 有本地回退（见 `_buildAccountCard`），
+  /// 页面不能因为这一个请求失败就变错误页。
+  Future<void> _loadUser() async {
+    try {
+      final UserProfile profile = await _userApi.fetchMe();
+      if (!mounted) return;
+      setState(() {
+        _user = profile;
+        _userLoading = false;
+        _userError = null;
+      });
+      // 后端给的才是真实 id；记下来，之后即使接口挂了也能显示正确的 id。
+      if (profile.id.isNotEmpty) {
+        await persistCurrentUserId(profile.id);
+      }
+    } on ApiException catch (e) {
+      debugPrint('[profile] 用户信息加载失败：${e.message}（uri=${e.uri}）');
+      if (!mounted) return;
+      setState(() {
+        _userLoading = false;
+        _userError = e.message;
+      });
+    } catch (e) {
+      debugPrint('[profile] 用户信息解析异常：$e');
+      if (!mounted) return;
+      setState(() {
+        _userLoading = false;
+        _userError = '$e';
+      });
+    }
+  }
 
   // ───────────────────────── 账户 ─────────────────────────
 
@@ -193,10 +251,14 @@ class _ProfilePageState extends State<ProfilePage> {
     return '$head****';
   }
 
-  /// 切换 Token：弹框输入 → `saveApiToken()` → 清掉本页缓存重拉。
+  /// 切换 Token：弹框输入 → 共享的 [switchApiToken]（校验 + 落盘 + 清旧账号）
+  /// → 刷新本页数据 + 顶部 toast + 账户卡片高亮闪烁。
   ///
   /// 为什么不直接跳 `ApiTokenPage`：那个页面是「首次启动」形态（带大标题与说明），
   /// 用在这里会让人以为登录态丢了。弹框更贴近「换一个凭证继续用」的意图。
+  ///
+  /// 与设置页的「切换 Token」共用同一段核心逻辑（`lib/utils/session.dart`），
+  /// 两边的校验、清理与报错口径完全一致。
   Future<void> _switchToken() async {
     // 不用 TextEditingController：弹框 pop 之后退出动画还会再跑一帧，
     // 若此时 dispose controller，退场动画重建 TextField 就会踩到
@@ -279,7 +341,20 @@ class _ProfilePageState extends State<ProfilePage> {
     // 弹框已出栈，draft 是纯 Dart 字符串，不存在控制器生命周期问题。
     if (token == null || token.isEmpty) return;
 
-    await saveApiToken(token);
+    // 共享实现：先用新 token 校验 `GET /me`，通过后才写盘 + 清旧账号残留。
+    // 校验失败会抛异常（此时**旧 token 仍然有效**，本机数据也没被动过）。
+    SwitchTokenResult result;
+    try {
+      result = await switchApiToken(token);
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      await _showSwitchError(e.message);
+      return;
+    } catch (e) {
+      if (!mounted) return;
+      await _showSwitchError('$e');
+      return;
+    }
     if (!mounted) return;
     // 旧数字属于旧账号，先清空再重拉，避免「新 token + 旧缺陷统计」的错配。
     setState(() {
@@ -289,7 +364,11 @@ class _ProfilePageState extends State<ProfilePage> {
     });
     await _loadAll();
     if (!mounted) return;
-    _toast('已切换 Token', '新凭证已生效，概览数据已重新拉取。');
+    await _loadUser();
+    if (!mounted) return;
+    // 账户卡片高亮闪烁 600ms：让用户看到「切换真的生效了」。
+    _flashHighlight();
+    showAppToast(context, '已切换至 ${result.displayName}');
   }
 
   /// 退出：清掉本机 token，回到 token 输入页。
@@ -377,21 +456,26 @@ class _ProfilePageState extends State<ProfilePage> {
     await _refresh();
   }
 
-  void _toast(String title, String message) {
-    showCupertinoDialog<void>(
+  /// 切换 Token 失败时的报错弹窗。
+  ///
+  /// 需求明确要求「切换失败必须报错，不得静默失败」，所以这里用弹窗而不是
+  /// 只打日志：用户必须看到「为什么没切成」。
+  Future<void> _showSwitchError(String reason) async {
+    if (!mounted) return;
+    await showCupertinoDialog<void>(
       context: context,
       builder: (BuildContext ctx) => CupertinoAlertDialog(
-        title: Text(
-          title,
-          style: const TextStyle(
+        title: const Text(
+          '切换失败',
+          style: TextStyle(
             fontFamily: kFontFamily,
             fontSize: 17,
             fontWeight: FontWeight.w600,
-            color: AppColors.label,
+            color: AppColors.overdue,
           ),
         ),
         content: Text(
-          message,
+          '$reason\n\n原 Token 仍然有效，本机数据未做任何更改。',
           style: const TextStyle(
             fontFamily: kFontFamily,
             fontSize: 13,
@@ -416,6 +500,89 @@ class _ProfilePageState extends State<ProfilePage> {
         ],
       ),
     );
+  }
+
+  /// 账户卡片高亮闪烁 600ms（切换 Token 成功时）。
+  void _flashHighlight() {
+    _highlightTimer?.cancel();
+    setState(() => _highlight = true);
+    _highlightTimer = Timer(const Duration(milliseconds: 600), () {
+      _highlightTimer = null;
+      if (!mounted) return;
+      setState(() => _highlight = false);
+    });
+  }
+
+  /// 复制完整用户 ID 到剪贴板，并给一个轻提示。
+  ///
+  /// 「没有 nickname / id 时也要能复制」：拿不到后端 id 时回退到本地的
+  /// `kDemoUserId`（它已经是当前用户的 id 了）。
+  Future<void> _copyUserId() async {
+    final String id = (_user?.id ?? '').trim().isNotEmpty
+        ? _user!.id.trim()
+        : kDemoUserId;
+    await Clipboard.setData(ClipboardData(text: id));
+    if (!mounted) return;
+    showAppToast(context, '已复制用户 ID');
+  }
+
+  /// 长按 ID 行：说明「点击可复制完整 ID」，并给一个显式的「复制」按钮。
+  ///
+  /// 本工程没有 Tooltip 组件先例（纯 Cupertino，不引 Material），所以长按
+  /// 用 CupertinoAlertDialog 代替 tooltip。
+  Future<void> _showUserIdHelp() async {
+    if (!mounted) return;
+    final String id = (_user?.id ?? '').trim().isNotEmpty
+        ? _user!.id.trim()
+        : kDemoUserId;
+    final bool? copy = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => CupertinoAlertDialog(
+        title: const Text(
+          '用户 ID',
+          style: TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+            color: AppColors.label,
+          ),
+        ),
+        content: Text(
+          '完整 ID：\n$id\n\n点击 ID 这一行可以直接复制；也可以点下方「复制」。',
+          style: const TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 13,
+            height: 1.35,
+            color: AppColors.label,
+          ),
+        ),
+        actions: <Widget>[
+          CupertinoDialogAction(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text(
+              '关闭',
+              style: TextStyle(fontFamily: kFontFamily, fontSize: 17),
+            ),
+          ),
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text(
+              '复制',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 17,
+                fontWeight: FontWeight.w600,
+                color: AppColors.accent,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (copy == true) {
+      await _copyUserId();
+    }
   }
 
   // ───────────────────────── 导航（全部 push）─────────────────────────
@@ -571,6 +738,8 @@ class _ProfilePageState extends State<ProfilePage> {
 
   Widget _buildAccountCard() {
     return _CardBox(
+      // 切换 Token 成功后账户卡片高亮闪烁 600ms（由 _CardBox 内部做淡入淡出）。
+      highlight: _highlight,
       child: Padding(
         padding: const EdgeInsets.all(AppSpacing.cardPadding),
         child: Column(
@@ -596,28 +765,68 @@ class _ProfilePageState extends State<ProfilePage> {
                   child: Column(
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: <Widget>[
-                      // 仓库没有 `/users/:id` 或 `/me` 接口（本轮不新增 API 调用），
-                      // 所以昵称只能给占位，不伪造一个看起来像真的名字。
-                      const Text(
-                        '未命名用户',
-                        style: TextStyle(
-                          fontFamily: kFontFamily,
-                          fontSize: 20,
-                          fontWeight: FontWeight.w600,
-                          letterSpacing: -0.45,
-                          color: AppColors.label,
-                        ),
+                      // 昵称来自后端 `GET /me`（display_name）；拿不到时回退到占位文案，
+                      // 不伪造一个看起来像真的名字。
+                      Row(
+                        children: <Widget>[
+                          Flexible(
+                            child: Text(
+                              _user?.displayName ?? '未命名用户',
+                              style: const TextStyle(
+                                fontFamily: kFontFamily,
+                                fontSize: 20,
+                                fontWeight: FontWeight.w600,
+                                letterSpacing: -0.45,
+                                color: AppColors.label,
+                              ),
+                            ),
+                          ),
+                          if (_userLoading) ...<Widget>[
+                            const SizedBox(width: 8),
+                            const CupertinoActivityIndicator(radius: 7),
+                          ],
+                        ],
                       ),
                       const SizedBox(height: 4),
-                      Text(
-                        'ID  $_maskedUserId',
-                        style: const TextStyle(
-                          fontFamily: kFontFamily,
-                          fontSize: 13,
-                          color: AppColors.secondaryLabel,
+                      // ID 行：点击复制完整 ID，长按弹出说明 + 复制按钮。
+                      GestureDetector(
+                        behavior: HitTestBehavior.opaque,
+                        onTap: _copyUserId,
+                        onLongPress: _showUserIdHelp,
+                        child: Row(
+                          crossAxisAlignment: CrossAxisAlignment.center,
+                          children: <Widget>[
+                            Flexible(
+                              child: Text(
+                                'ID  ${_user?.maskedId ?? _maskedUserId}',
+                                style: const TextStyle(
+                                  fontFamily: kFontFamily,
+                                  fontSize: 13,
+                                  color: AppColors.secondaryLabel,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 6),
+                            const Icon(
+                              CupertinoIcons.doc_on_clipboard,
+                              size: 12,
+                              color: AppColors.tertiaryLabel,
+                            ),
+                          ],
                         ),
                       ),
-                    ],
+                      if (_userError != null) ...<Widget>[
+                        const SizedBox(height: 4),
+                        Text(
+                          '无法获取用户信息，请检查连接',
+                          style: const TextStyle(
+                            fontFamily: kFontFamily,
+                            fontSize: 11,
+                            color: AppColors.overdue,
+                          ),
+                        ),
+                      ],
+                      ],
                   ),
                 ),
               ],
@@ -791,15 +1000,25 @@ class _ProfilePageState extends State<ProfilePage> {
 
 /// 白底圆角卡片（与首页卡片同一套观感：16 圆角 + 极淡投影）。
 class _CardBox extends StatelessWidget {
-  const _CardBox({required this.child});
+  const _CardBox({required this.child, this.highlight = false});
 
   final Widget child;
 
+  /// 高亮闪烁（切换 Token 成功后短暂置 true，600ms 后复原）。
+  ///
+  /// 背景色用 [AnimatedContainer] 做淡入淡出：纯 Cupertino 工程没有
+  /// `Colors.transparent`，透明色用 `const Color(0x00000000)`。
+  final bool highlight;
+
   @override
   Widget build(BuildContext context) {
-    return DecoratedBox(
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 220),
+      curve: Curves.easeOut,
       decoration: BoxDecoration(
-        color: AppColors.card,
+        color: highlight
+            ? AppColors.accent.withValues(alpha: 0.12)
+            : AppColors.card,
         borderRadius: BorderRadius.circular(AppRadii.card),
         boxShadow: const <BoxShadow>[
           BoxShadow(

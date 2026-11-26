@@ -34,12 +34,35 @@ import * as verificationTasks from './verification_tasks.mjs';
 import * as reviewCycles from './review_cycles.mjs';
 // m18680 B1：删除「我的所有数据」（DELETE /users/:userId/data）。
 import * as userData from './user_data.mjs';
+// m27163 A3：当前用户信息（GET /me）。
+// ★ 必须是 /me 而不是 /users/me：server/index.mjs 鉴权后会把任何 /users/<段> 的
+//   第 2 段改写成 authUserId，'me' 这个字面量活不到路由层（见 users.mjs 文件头）。
+import * as users from './users.mjs';
+// m27163 A1⑤：考试目标学习进度（GET /exam-profiles/:id/progress）。
+// 放在 exam_profiles **之前**：本模块认领 seg.length===3 的 /exam-profiles/:id/progress，
+//   而 exam_profiles 的 3 段分支只认 seg[2]==='subjects'，两者本来不冲突，
+//   但「更长的路径优先」是本文件的既有约定，照做更稳。
+import * as examProgress from './exam_progress.mjs';
+// m27163 A2②：题型词表（GET /question-types）。只认单段路径 'question-types'，放前面最稳。
+import * as questionTypes from './question_types.mjs';
+// m27163 C4：缺陷单 ↔ 题目关联端点。
+// ★ 必须排在 defect_tickets **之前**：本模块要抢 GET /defect-tickets/custom-reasons
+//   （seg.length===2）；若 defect_tickets 先命中，它的 GET /defect-tickets/:id
+//   会把 'custom-reasons' 当成 id → uuid 铸型 22P02 → 500 internal。
+import * as defectQuestions from './defect_questions.mjs';
 
 /**
  * 挂载顺序即匹配优先级。长路径模块在前，短路径在后。
  * @type {Array<{name: string, match: Function}>}
  */
 export const ROUTE_MODULES = Object.freeze([
+  // m27163 A1⑤：进度端点（长路径优先）。
+  { name: 'exam_progress', match: examProgress.match },
+  // m27163 A2②：题型词表（只认单段路径，不遮蔽任何已有路径）。
+  { name: 'question_types', match: questionTypes.match },
+  // m27163 C4：缺陷单↔题目关联 + 历史自定义错因。★ 必须排在 defect_tickets 之前，
+  // 否则 GET /defect-tickets/custom-reasons 会被 GET /defect-tickets/:id 抢走。
+  { name: 'defect_questions', match: defectQuestions.match },
   { name: 'exam_profiles', match: examProfiles.match },
   { name: 'knowledge_nodes', match: knowledgeNodes.match },
   { name: 'subjects', match: subjects.match },
@@ -70,6 +93,8 @@ export const ROUTE_MODULES = Object.freeze([
   // 与 GET /users/:id/verification-tasks|verification-summary 的方法不同、
   // 字面量不同，不会互相遮蔽。
   { name: 'user_data', match: userData.match },
+  // m27163 A3：GET /me（单段路径 'me'，不与任何 /users/... 冲突）。
+  { name: 'users', match: users.match },
 ]);
 
 /**

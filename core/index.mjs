@@ -6,7 +6,15 @@
 // Dart(Flutter) 与 NestJS 后端。所有函数均为纯函数或抛带 .code 的 Error。
 
 import { createHash } from 'node:crypto';
+import { sanitizeQuestionText } from './text.mjs';
 
+// 文本清洗（core/text.mjs）：把连续下划线占位符换成括号占位符。
+// ★ 本轮**不改哈希口径**：normalizeQuestionText 的算法与输入形态一行未动，
+//   清洗只作用于展示文本与题型识别，不参与 content_hash 的规范化定义。
+//   （注意：仓储层 questions.create() 是用**传进去的 stem** 现算 hash 的，
+//     所以导入管线里被清洗过的题干，其 hash 会随之变化 —— 详见
+//     server/routes/questions_import.mjs 中的同名说明与交付说明里的「已知偏差」。）
+export { sanitizeQuestionText };
 // ---------------------------------------------------------------------------
 // 枚举与常量（与 schema.sql 的 ENUM 类型一一对应）
 // ---------------------------------------------------------------------------

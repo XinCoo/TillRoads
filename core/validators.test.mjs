@@ -21,7 +21,7 @@ const L2 = { order: 2, key: 'process', label: '流程', desc: '流程层' };
 // ---------------------------------------------------------------------------
 test('V0 常量与 schema.sql ENUM / CHECK 对齐（先读后写的实证锚点）', () => {
   assert.deepEqual([...V.EXAM_TYPES],
-    ['civil_service', 'postgrad', 'final_exam', 'vocational', 'adult_self_study']);
+    ['civil_service', 'postgrad', 'final_exam', 'vocational', 'adult_self_study', 'custom']);
   assert.deepEqual([...V.SUBJECT_KINDS], ['objective', 'subjective', 'essay']);
   assert.deepEqual([...V.FREQ_TAGS], ['high', 'mid', 'low']);
   assert.deepEqual([...V.PROFILE_STATUSES], ['active', 'archived']);
@@ -235,6 +235,43 @@ test('firstInvalid 组合原语：全通过 / 取第一个失败 / 兼容嵌套 
   const nested = { ok: false, error: { code: 'INVALID_COUNT', message: 'x' } };
   assert.equal(V.firstInvalid(nested).ok, false);
   ok(V.firstInvalid());
+});
+
+// ---------------------------------------------------------------------------
+test('V15 validateNickname：中文/英文/数字组合合法，空格与符号/emoji/超长被拒', () => {
+  // 合法：中文、英文、数字各自单独或混合
+  ok(V.validateNickname('张三'));
+  ok(V.validateNickname('Tom'));
+  ok(V.validateNickname('abc123'));
+  ok(V.validateNickname('张三Tom2026'));
+  ok(V.validateNickname('张三A1'));
+  // 首尾空白先 trim 再校验（用户从输入框粘过来的情况）
+  ok(V.validateNickname('  李四  '));
+  // 边界：2 个字符合法、20 个字符合法、21 个被拒
+  ok(V.validateNickname('ab'));
+  const twenty = 'a'.repeat(20);
+  ok(V.validateNickname(twenty));
+  bad(V.validateNickname('a'.repeat(21)), 'INVALID_NICKNAME');
+  // 太短 / 全空白 / 空串
+  bad(V.validateNickname('a'), 'INVALID_NICKNAME');
+  bad(V.validateNickname('   '), 'INVALID_NICKNAME');
+  bad(V.validateNickname(''), 'INVALID_NICKNAME');
+  // 非法字符：空格（中间）、下划线、连字符、标点、emoji、全角空格
+  bad(V.validateNickname('张 三'), 'INVALID_NICKNAME');
+  bad(V.validateNickname('zhang_san'), 'INVALID_NICKNAME');
+  bad(V.validateNickname('zhang-san'), 'INVALID_NICKNAME');
+  bad(V.validateNickname('张三!'), 'INVALID_NICKNAME');
+  bad(V.validateNickname('张三🙂'), 'INVALID_NICKNAME');
+  // 全角空格在中间：非法（在首尾则会被 trim 掉，属预期）
+  bad(V.validateNickname('张　三'), 'INVALID_NICKNAME');
+  // 首尾全角空格被 trim 后合法（与 ASCII 空格一致）
+  ok(V.validateNickname('　　张三　　'));
+  // 非字符串
+  bad(V.validateNickname(null), 'INVALID_NICKNAME');
+  bad(V.validateNickname(123), 'INVALID_NICKNAME');
+  bad(V.validateNickname(undefined), 'INVALID_NICKNAME');
+  // 失败形状冻结（与其他校验器一致）
+  assert.equal(Object.isFrozen(V.validateNickname('张 三')), true);
 });
 
 // ---------------------------------------------------------------------------

@@ -16,31 +16,27 @@
 // 不是 24 小时，用本地时间相减会出现 23/25 小时 -> inDays 截断成 0 天。
 //
 // ── 数据来源 ────────────────────────────────────────────────────────────
-// `GET /users/{userId}/exam-profiles`，复用 `DefectApi.fetchExamProfiles`
+// `GET /users/{userId}/exam-profiles`，走 `ExamApi.fetchExamProfiles`
 // （内部已做 Map{items:[]} / 裸 List 的容错）。返回的是 `List<Map>`，
 // 不是强类型模型 —— 字段按 map key 取，且每个值都可能是 null。
 
 import 'package:flutter/cupertino.dart';
 
 import '../api/api_client.dart' show ApiException;
-import '../api/defect_api.dart';
+import '../api/exam_api.dart';
 import '../config/api_config.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart' show EmptyState, PressableCard;
+import '../local/local.dart' show kLocalFirstEnabled, refreshLocalFromCloud;
 import 'exam_profile_create_page.dart';
 import 'subject_config_page.dart';
 
-/// `schema.sql:46-48` 的 exam_type 枚举 → 中文标签。
-///
-/// 只用于「没有 target_label 时给个能读的兜底标题」，不做输入校验
-/// （枚举合法性由后端 core/validators.mjs 的 validateExamType 判定）。
-const Map<String, String> _kExamTypeLabels = <String, String>{
-  'civil_service': '公务员',
-  'postgrad': '考研',
-  'final_exam': '期末',
-  'vocational': '职业资格',
-  'adult_self_study': '成人自考',
-};
+/// 删除时的二次确认文案（集中在这里，避免散落在 UI 代码里）。
+const String kDeleteConfirmMessage =
+    '删除后该目标下的科目、考点会一并移除，且不可恢复。确认删除？';
+
+/// 后端返回 409 时的提示文案（文案照抄后端契约）。
+const String kExamProfileInUseMessage = '该配置正在使用中，无法删除';
 
 class ExamConfigPage extends StatefulWidget {
   const ExamConfigPage({super.key});
@@ -50,11 +46,14 @@ class ExamConfigPage extends StatefulWidget {
 }
 
 class _ExamConfigPageState extends State<ExamConfigPage> {
-  final DefectApi _api = DefectApi();
+  final ExamApi _api = ExamApi();
 
   List<Map<String, Object?>> _profiles = const <Map<String, Object?>>[];
   bool _loading = true;
   String? _error;
+
+  /// 正在删除的目标 id（null = 无删除进行中）。用于行内 loading 态与防重复点击。
+  String? _deletingId;
 
   @override
   void initState() {
@@ -64,7 +63,7 @@ class _ExamConfigPageState extends State<ExamConfigPage> {
 
   @override
   void dispose() {
-    // DefectApi 内部持有一个 http.Client；不关会泄漏连接池。
+    // ExamApi 内部持有一个 http.Client；不关会泄漏连接池。
     _api.close();
     super.dispose();
   }
@@ -104,7 +103,10 @@ class _ExamConfigPageState extends State<ExamConfigPage> {
       appRoute<bool>(context, const ExamProfileCreatePage()),
     );
     if (!mounted) return;
-    if (changed == true) await _load();
+    if (changed == true) {
+      await _load();
+      await _syncLocalCache();
+    }
   }
 
   Future<void> _openSubjects(String profileId, String label) async {
@@ -112,6 +114,199 @@ class _ExamConfigPageState extends State<ExamConfigPage> {
       appRoute<void>(
         context,
         SubjectConfigPage(profileId: profileId, targetLabel: label),
+      ),
+    );
+    await _syncLocalCache();
+  }
+
+  /// 把云端最新的考试目标/科目/考点写回本地库（m27163 A1④）。
+  ///
+  /// 根因：新建或删除考试目标后，本地 `exam_profiles` 表还是旧的，
+  /// 首页读的是本地表，所以卡片还显示旧目标、甚至「还没有设置考试目标」。
+  /// `refreshLocalFromCloud()` 写回本地后会 `kLocalDataRevision++`，
+  /// 首页的监听器收到通知就会重读 —— 整个 App 只需这一处通知点。
+  Future<void> _syncLocalCache() async {
+    if (!kLocalFirstEnabled) return;
+    try {
+      await refreshLocalFromCloud();
+    } catch (e) {
+      // 本地同步失败不影响云端已成功的操作，只是首页可能晚一点才更新。
+      debugPrint('[exam-config] 写回本地失败：$e');
+    }
+  }
+
+  /// 手动刷新（导航栏「刷新」按钮）。首页卡片不同步时用户可点这里拉最新数据。
+  Future<void> _refresh() async {
+    await _load();
+  }
+
+  // ── 删除流程 ──────────────────────────────────────────────────────────
+
+  /// 删除某条目标：二次确认 → DELETE（带 version）→ 刷新列表。
+  Future<void> _deleteProfile(Map<String, Object?> profile) async {
+    final String id = '${profile['id'] ?? ''}'.trim();
+    if (id.isEmpty) return;
+
+    final bool confirmed = await _confirmDelete();
+    if (!confirmed) return;
+    if (!mounted) return;
+
+    // 乐观锁：`version` 必填。取不到说明这条数据不是本次列表拉到的
+    // （例如后端尚未返回该列），此时不要瞎猜一个值去调删除。
+    final int? version = _versionOf(profile);
+    if (version == null) {
+      await _showMessage(
+        '无法删除',
+        '该配置缺少版本信息，请下拉刷新后重试',
+      );
+      return;
+    }
+
+    setState(() => _deletingId = id);
+    try {
+      await _api.deleteExamProfile(id, version: version);
+      if (!mounted) return;
+      setState(() => _deletingId = null);
+      await _load();
+      await _syncLocalCache();
+      if (!mounted) return;
+      await _showMessage('已删除', '该考试目标及其科目、考点已移除');
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      setState(() => _deletingId = null);
+      await _showMessage('删除失败', _deleteErrorText(e));
+    } catch (e) {
+      if (!mounted) return;
+      setState(() => _deletingId = null);
+      await _showMessage('删除失败', '$e');
+    }
+  }
+
+  /// 409（目标正被缺陷单/模考引用）→ 固定文案；其它错误 → 后端给的 e.message。
+  String _deleteErrorText(ApiException e) {
+    if (e.statusCode == 409 || _errorCodeOf(e) == 'exam_profile_in_use') {
+      return kExamProfileInUseMessage;
+    }
+    return e.message;
+  }
+
+  /// 从响应体里取业务错误码（`{ "error": "exam_profile_in_use" }`）。
+  String? _errorCodeOf(ApiException e) {
+    final Object? body = e.body;
+    if (body is Map) {
+      final Object? code = body['error'];
+      if (code != null) return '$code';
+    }
+    return null;
+  }
+
+  /// 乐观锁版本号。后端给的是 int，但 json 解析出来也可能是数字字符串。
+  int? _versionOf(Map<String, Object?> profile) {
+    final Object? raw = profile['version'];
+    if (raw is int) return raw;
+    if (raw is num) return raw.toInt();
+    if (raw is String) return int.tryParse(raw.trim());
+    return null;
+  }
+
+  /// 二次确认弹窗。返回 true = 用户点了红色的「删除」。
+  Future<bool> _confirmDelete() async {
+    final bool? result = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => CupertinoAlertDialog(
+        title: const Text(
+          '删除这个考试目标？',
+          style: TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+            color: AppColors.label,
+          ),
+        ),
+        content: Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: Text(
+            kDeleteConfirmMessage,
+            style: const TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 13,
+              height: 1.35,
+              color: AppColors.label,
+            ),
+          ),
+        ),
+        actions: <Widget>[
+          CupertinoDialogAction(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text(
+              '取消',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 17,
+                color: AppColors.accent,
+              ),
+            ),
+          ),
+          CupertinoDialogAction(
+            isDestructiveAction: true,
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text(
+              '删除',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 17,
+                fontWeight: FontWeight.w600,
+                color: AppColors.overdue,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    return result == true;
+  }
+
+  /// 统一的提示弹窗（标题 + 正文 + 「好」）。
+  Future<void> _showMessage(String title, String message) {
+    return showCupertinoDialog<void>(
+      context: context,
+      builder: (BuildContext ctx) => CupertinoAlertDialog(
+        title: Text(
+          title,
+          style: const TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+            color: AppColors.label,
+          ),
+        ),
+        content: Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: Text(
+            message,
+            style: const TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 13,
+              height: 1.35,
+              color: AppColors.label,
+            ),
+          ),
+        ),
+        actions: <Widget>[
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text(
+              '好',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 17,
+                fontWeight: FontWeight.w600,
+                color: AppColors.accent,
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }
@@ -135,18 +330,35 @@ class _ExamConfigPageState extends State<ExamConfigPage> {
                 color: AppColors.label,
               ),
             ),
-            trailing: CupertinoButton(
-              padding: EdgeInsets.zero,
-              minimumSize: const Size(36, 36),
-              onPressed: _openCreate,
-              child: const Text(
-                '新建',
-                style: TextStyle(
-                  fontFamily: kFontFamily,
-                  fontSize: 17,
-                  color: AppColors.accent,
+            // trailing 放两个动作：新建（+）与刷新（arrow.clockwise）。
+            // 首页卡片不同步时，用户可以在这里手动拉一次最新数据。
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  minimumSize: const Size(36, 36),
+                  onPressed: _openCreate,
+                  child: const Text(
+                    '新建',
+                    style: TextStyle(
+                      fontFamily: kFontFamily,
+                      fontSize: 17,
+                      color: AppColors.accent,
+                    ),
+                  ),
                 ),
-              ),
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  minimumSize: const Size(36, 36),
+                  onPressed: _refresh,
+                  child: const Icon(
+                    CupertinoIcons.arrow_clockwise,
+                    size: 20,
+                    color: AppColors.accent,
+                  ),
+                ),
+              ],
             ),
           ),
           ..._buildBody(),
@@ -206,6 +418,7 @@ class _ExamConfigPageState extends State<ExamConfigPage> {
     final String label = _labelOf(profile);
     final String? dateText = _dateText(profile['exam_date']);
     final ({String text, Color color})? countdown = _countdown(profile['exam_date']);
+    final bool deleting = _deletingId != null && _deletingId == id;
 
     return PressableCard(
       onTap: id.isEmpty ? null : () => _openSubjects(id, label),
@@ -279,6 +492,34 @@ class _ExamConfigPageState extends State<ExamConfigPage> {
                 ],
               ),
             ),
+            // 删除按钮在行内，必须与「整行可点」隔离：
+            // 用 GestureDetector（而不是 CupertinoButton）包一个 SizedBox，
+            // 命中测试里内层的 recognizer 优先于外层 PressableCard 的，
+            // 点删除不会顺带 push 科目管理页。
+            GestureDetector(
+              behavior: HitTestBehavior.opaque,
+              // 注意：即使在删除中也要保留 onTap（内部再判断），
+              // 否则内层 GestureDetector 不注册 recognizer，点下去会落到
+              // 外层 PressableCard → 顺带 push 科目管理页。
+              onTap: () {
+                if (deleting) return;
+                _deleteProfile(profile);
+              },
+              child: SizedBox(
+                width: 30,
+                height: 30,
+                child: deleting
+                    ? const Center(
+                        child: CupertinoActivityIndicator(radius: 9),
+                      )
+                    : const Icon(
+                        CupertinoIcons.delete,
+                        size: 18,
+                        color: AppColors.overdue,
+                      ),
+              ),
+            ),
+            const SizedBox(width: 6),
             const Icon(
               CupertinoIcons.chevron_forward,
               size: 16,
@@ -290,12 +531,20 @@ class _ExamConfigPageState extends State<ExamConfigPage> {
     );
   }
 
-  /// 主标题：优先 `target_label`，没有就用考试类型的中文名兜底。
+  /// 主标题：优先 `exam_type_custom`（自定义类型填的名字），
+  /// 再退到 `target_label`，最后退到考试类型的中文名。
+  ///
+  /// 显示格式：自定义类型显示「自定义 · <名称>」；其余类型直接显示
+  /// `target_label`（为空才用类型中文名兜底）。
   String _labelOf(Map<String, Object?> profile) {
+    final String type = '${profile['exam_type'] ?? ''}'.trim();
+    final String custom = '${profile['exam_type_custom'] ?? ''}'.trim();
+    if (custom.isNotEmpty) {
+      return type == 'custom' ? '自定义 · $custom' : custom;
+    }
     final String label = '${profile['target_label'] ?? ''}'.trim();
     if (label.isNotEmpty) return label;
-    final String type = '${profile['exam_type'] ?? ''}'.trim();
-    return _kExamTypeLabels[type] ?? '未命名考试目标';
+    return kExamTypeLabels[type] ?? '未命名考试目标';
   }
 
   /// `exam_date` 后端是 date 列 → JSON 里固定是 'YYYY-MM-DD'（`server/db/pool.mjs`

@@ -1,0 +1,1 @@
+﻿SELECT 'tickets', count(*) FROM defect_tickets UNION ALL SELECT 'profiles', count(*) FROM exam_profiles UNION ALL SELECT 'meta', count(*) FROM local_meta UNION ALL SELECT 'pending', count(*) FROM pending_operations;

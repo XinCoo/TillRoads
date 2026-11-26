@@ -19,6 +19,29 @@ import 'dart:convert';
 
 import 'api_client.dart';
 
+/// 题型 → 中文标签的**唯一**映射表。
+///
+/// 题库列表、题型统计（`GET /question-types`）都要用同一套口径，
+/// 免得同一个题型在两个页面上显示成两个名字。
+const Map<String, String> kQuestionTypeLabels = <String, String>{
+  'choice': '选择题',
+  'multi': '多选题',
+  'judge': '判断题',
+  'fill': '填空题',
+  'calculation': '计算题',
+  'short_answer': '简答题',
+  'subjective': '主观题',
+  'essay': '论述题',
+  'material': '材料题',
+};
+
+/// 题型的中文标签。未知题型回退成原值（后端以后加新类型也不至于显示成空白）。
+String questionTypeLabel(String type) {
+  final String t = type.trim();
+  if (t.isEmpty) return '未分类';
+  return kQuestionTypeLabels[t] ?? t;
+}
+
 /// 题库里的一道题（列表口径，不含答案）。
 class BankQuestion {
   const BankQuestion({
@@ -34,6 +57,7 @@ class BankQuestion {
     this.mastered,
     this.createdAt,
     this.options = const <String>[],
+    this.tags = const <String>[],
   });
 
   final String id;
@@ -63,25 +87,11 @@ class BankQuestion {
 
   final List<String> options;
 
+  /// 考点标签（后端 tags jsonb 数组）。列表口径也带上，管理页要显示/编辑它。
+  final List<String> tags;
+
   /// 题型展示名。
-  String get typeLabel {
-    switch (type) {
-      case 'choice':
-        return '选择题';
-      case 'multi':
-        return '多选题';
-      case 'judge':
-        return '判断题';
-      case 'subjective':
-        return '主观题';
-      case 'fill':
-        return '填空题';
-      case 'calculation':
-        return '计算题';
-      default:
-        return type.isEmpty ? '未分类' : type;
-    }
-  }
+  String get typeLabel => questionTypeLabel(type);
 
   /// 来源展示名。
   String get sourceLabel {
@@ -130,6 +140,7 @@ class BankQuestion {
           : (json['mastered'] == true),
       createdAt: _dateOrNull(json['created_at']),
       options: _stringList(json['options']),
+      tags: _tagList(json['tags']),
     );
   }
 }
@@ -286,7 +297,7 @@ class BatchResult {
 
   factory BatchResult.fromJson(Map<String, Object?> json) {
     final int requested = _int(json['requested'], 0);
-    final int deleted = _int(json['deleted'], _int(json['restored'], 0));
+    final int deleted = _int(json['deleted'], _int(json['restored'], _int(json['updated'], 0)));
     return BatchResult(
       requested: requested,
       deleted: deleted,
@@ -298,8 +309,35 @@ class BatchResult {
   final int deleted;
   final int skipped;
 
+  /// 批量改标签时后端回的是 `updated`；[BatchResult.fromJson] 已把它读进
+  /// [deleted]，这里再给一个语义明确的名字。
+  int get updated => deleted;
+
   @override
   String toString() => 'requested=$requested deleted=$deleted skipped=$skipped';
+}
+/// 一种题型的统计（`GET /question-types` 的一项）。
+class QuestionTypeCount {
+  const QuestionTypeCount({required this.type, required this.count});
+
+  /// 后端的题型原始值（如 `choice`）。
+  final String type;
+
+  /// 这种题型有多少道题。
+  final int count;
+
+  /// 中文标签（复用 [questionTypeLabel] 的统一口径，未知类型回退成原值）。
+  String get label => questionTypeLabel(type);
+
+  factory QuestionTypeCount.fromJson(Map<String, Object?> json) {
+    return QuestionTypeCount(
+      type: _str(json['type']),
+      count: _int(json['count'], 0),
+    );
+  }
+
+  @override
+  String toString() => '$type=$count';
 }
 
 class QuestionApi {
@@ -531,6 +569,51 @@ class QuestionApi {
     return items
         .whereType<Map>()
         .map((Map m) => BankQuestion.fromJson(m.cast<String, Object?>(), currentUserId: currentUserId))
+        .toList(growable: false);
+  }
+
+  /// ★ A2③：批量改考点标签：`PATCH /questions/batch/tags`。
+  ///
+  /// body `{ids, tags, mode}`；[mode] 为 `replace`（整组覆盖）或 `add`（追加）。
+  /// 后端只改自己的题 —— 公共题 / 别人的题静默跳过，计入 [BatchResult.skipped]。
+  Future<BatchResult> updateQuestionTags(
+    List<String> ids,
+    List<String> tags, {
+    String mode = 'replace',
+  }) async {
+    final Object? raw = await _client.patch(
+      '/questions/batch/tags',
+      body: <String, Object?>{
+        'ids': ids,
+        'tags': tags,
+        'mode': mode,
+      },
+    );
+    if (raw is! Map) throw ApiException('批量标签响应不是 JSON 对象', body: raw);
+    return BatchResult.fromJson(raw.cast<String, Object?>());
+  }
+
+  /// ★ A2③：题型统计：`GET /question-types?scope=&q=`。
+  ///
+  /// [scope] 为 `imported`（只统计 source='import' 的题）或 `all`；
+  /// [q] 是可选的题干关键词。后端按 count 倒序返回。
+  Future<List<QuestionTypeCount>> fetchQuestionTypes({
+    String scope = 'imported',
+    String? q,
+  }) async {
+    final Object? raw = await _client.get(
+      '/question-types',
+      query: <String, String>{
+        'scope': scope,
+        if (q != null && q.trim().isNotEmpty) 'q': q.trim(),
+      },
+    );
+    if (raw is! Map) throw ApiException('题型统计响应不是 JSON 对象', body: raw);
+    final Object? items = raw.cast<String, Object?>()['items'];
+    if (items is! List) return const <QuestionTypeCount>[];
+    return items
+        .whereType<Map>()
+        .map((Map m) => QuestionTypeCount.fromJson(m.cast<String, Object?>()))
         .toList(growable: false);
   }
 }

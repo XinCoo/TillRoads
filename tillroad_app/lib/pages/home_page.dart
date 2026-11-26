@@ -27,6 +27,7 @@ import '../pages/verify_page.dart';
 import '../theme/app_theme.dart';
 import '../widgets/countdown_card.dart';
 import '../widgets/defect_summary_card.dart';
+import '../widgets/exam_flip_card.dart';
 import '../widgets/common.dart';
 import '../widgets/quick_action_grid.dart';
 import '../widgets/task_card.dart';
@@ -74,6 +75,14 @@ class _HomePageState extends State<HomePage> {
   final vapi.VerificationApi _verifyApi = vapi.VerificationApi();
   final DefectApi _defectApi = DefectApi();
 
+  /// 「建题」这类**读接口**单独放宽的超时（B1）。
+  ///
+  /// 全局 `kApiTimeout` 是 15s，但 Railway 免费实例休眠后冷启动时首连实测
+  /// 出现 10.7s 的 undici 连接超时，服务端自身也在 25s 才收口；
+  /// 读接口等一等总比直接报错强，所以这几个请求用 30s。
+  /// 写接口仍用默认 15s（写超时要尽快让用户知道，避免重复提交）。
+  static const Duration _kReadTimeout = Duration(seconds: 30);
+
   /// —— 倒计时 ——
   Map<String, Object?>? _profile;
   ApiException? _profileError;
@@ -97,6 +106,9 @@ class _HomePageState extends State<HomePage> {
   /// 此时倒计时/分布都显示骨架，并给一行「正在连接服务器」的提示，
   /// 而不是先报「还没有设置考试目标」再把用户吓一跳（任务书 C5 / E4）。
   bool _syncPending = false;
+
+  /// 「建题」请求进行中（B1）。用于防重复点击 + 给按钮一个 loading 态。
+  bool _creating = false;
 
   @override
   void initState() {
@@ -356,9 +368,39 @@ class _HomePageState extends State<HomePage> {
   }
 
   /// 考试配置（m18680 D1）：从「我的」也可以进，但首页空目标卡片直接跳更顺手。
-  void _openExamConfig() {
-    Navigator.of(context)
-        .push<void>(appRoute<void>(context, const ExamConfigPage()));
+  ///
+  /// A1④（m27163）：原来这里是 fire-and-forget（push 完就忘），用户在新页
+  /// 建好/删了考试目标，回到首页还是旧卡片，甚至显示「还没有设置考试目标」。
+  /// 根因：本地 `exam_profiles` 表没被更新、`kLocalDataRevision` 也没动，
+  /// 首页的 `_onLocalDataChanged()` 根本不会被唤醒。
+  ///
+  /// 现在改成：等用户从配置页返回 → 若有变动就重新拉一次云端并回写本地
+  /// → 再重读首页自己的三块数据。
+  Future<void> _openExamConfig() async {
+    // 不看 pop 结果：配置页内部的新建/删除/科目编辑都只刷新它自己的列表，
+    // 并不把「有没有改动」回传给调用方。等它返回就意味着用户可能已经改过什么，
+    // 直接重新同步一次最简单也最可靠（多一次请求换来不会漏更新）。
+    await Navigator.of(context).push<void>(
+      appRoute<void>(context, const ExamConfigPage()),
+    );
+    if (!mounted) return;
+    await _reloadAfterConfigChange();
+  }
+
+  /// 考试配置变更后重新同步并重读首页数据。
+  Future<void> _reloadAfterConfigChange() async {
+    if (kLocalFirstEnabled) {
+      // 先把云端的最新目标写回本地表（writeExamProfiles + kLocalDataRevision++），
+      // 再重读本地。顺序不能反：先重读的话拿到的还是旧数据。
+      try {
+        await refreshLocalFromCloud();
+      } catch (e) {
+        debugPrint('[home] 考试配置变更后刷新本地失败：$e');
+      }
+      await _loadFromLocal();
+      return;
+    }
+    await _loadFromCloud();
   }
 
   /// 缺陷单 id 必须是 UUID（v4 或服务端 `gen_random_uuid()`）。
@@ -474,8 +516,13 @@ class _HomePageState extends State<HomePage> {
     final Object? label = profile['target_label'];
     final String examLabel =
         (label is String && label.trim().isNotEmpty) ? label.trim() : '我的考试';
-    return CountdownCard(
+    final Object? date = profile['exam_date'];
+    final String examDateText = (date is String) ? date.trim() : '';
+    // A1⑤：卡片正面倒计时、背面学习进度，点击 / 回车 / 空格翻转（3D 300ms）。
+    return ExamFlipCard(
+      examProfileId: '${profile['id'] ?? ''}',
       examLabel: examLabel,
+      examDateText: examDateText,
       daysToExam: _daysUntil(profile['exam_date']),
     );
   }
@@ -706,30 +753,69 @@ class _HomePageState extends State<HomePage> {
 
   // ───────────────────────── 快捷入口 ─────────────────────────
 
-  /// 「建题」：建单页需要 `examProfileId` + `subjectId`，与缺陷单页的
-  /// `_openCreate()` 同一套取数逻辑（那边不能改，所以这里独立实现一份）。
+  /// 「建题」：建单页需要 `examProfileId` + `subjectId`。
+  ///
+  /// B1（m27163）：这里原本是**串行两次 await**（先 exam-profiles 再 subjects），
+  /// 任一次冷启动慢都会把总时长累加到 15s 超时（生产实测 p95=3759ms，
+  /// 另有 2/16 次直接连接超时 10.7s——Railway 免费实例休眠唤醒）。
+  /// 改法：
+  ///   ① 考试目标直接复用首页已经拉到的 `_profile`，不再重复发一次请求；
+  ///   ② 科目优先读本地（本地优先模式下建单页本来就要用本地 id），
+  ///      本地没有再打云端，并**单独放宽超时**到 30s；
+  ///   ③ 加 `_creating` 防重复点击，加 loading 提示与「重试」入口。
   Future<void> _openCreate() async {
     if (kUseMock) {
       _toast('建题', '离线演示模式（kUseMock=true）下无法建单。');
       return;
     }
+    if (_creating) return;
+    setState(() => _creating = true);
     try {
-      final profiles = await _defectApi.fetchExamProfiles(kDemoUserId);
-      if (!mounted) return;
-      if (profiles.isEmpty) {
+      // ① 考试目标：优先用已加载的那条（首页 _loadProfile 已经拉过）
+      Map<String, Object?>? profile = _profile;
+      if (profile == null) {
+        final List<Map<String, Object?>> profiles = await _defectApi.fetchExamProfiles(
+          kDemoUserId,
+          timeout: _kReadTimeout,
+        );
+        if (!mounted) return;
+        if (profiles.isEmpty) {
+          _toast('还没有考试目标', '请先创建考试目标，再建缺陷单。');
+          return;
+        }
+        profile = profiles.firstWhere(
+          (Map<String, Object?> p) => p['status'] == 'active',
+          orElse: () => profiles.first,
+        );
+      }
+      final String profileId = '${profile['id'] ?? ''}'.trim();
+      if (profileId.isEmpty) {
         _toast('还没有考试目标', '请先创建考试目标，再建缺陷单。');
         return;
       }
-      final Map<String, Object?> first = profiles.first;
-      final String profileId = '${first['id']}';
-      final subjects = await _defectApi.fetchSubjects(profileId);
-      if (!mounted) return;
-      if (subjects.isEmpty) {
+      // ② 科目：本地优先（本地库里的 exam_profile_id 就是 server id），
+      //    本地没有才打云端。两次请求不再串行叠加。
+      Map<String, Object?>? subject;
+      if (kLocalFirstEnabled) {
+        subject = await loadFirstSubject(profileId);
+      }
+      if (subject == null) {
+        final List<Map<String, Object?>> subjects = await _defectApi.fetchSubjects(
+          profileId,
+          timeout: _kReadTimeout,
+        );
+        if (!mounted) return;
+        if (subjects.isEmpty) {
+          _toast('还没有科目', '该考试目标下没有科目，无法建单。');
+          return;
+        }
+        subject = subjects.first;
+      }
+      final String subjectId = '${subject['id'] ?? ''}'.trim();
+      if (subjectId.isEmpty) {
         _toast('还没有科目', '该考试目标下没有科目，无法建单。');
         return;
       }
-      final Map<String, Object?> subject = subjects.first;
-      final String subjectId = '${subject['id']}';
       final Object? subjectName = subject['name'];
       final bool? changed = await Navigator.of(context).push<bool>(
         appRoute<bool>(
@@ -750,16 +836,62 @@ class _HomePageState extends State<HomePage> {
       }
     } on ApiException catch (e) {
       if (!mounted) return;
-      _toast('无法建题', e.message);
+      await _showCreateError('${e.message}\n如果刚启动 App，可能是后端还在唤醒，稍后再试一次。');
+    } catch (e) {
+      if (!mounted) return;
+      await _showCreateError('$e');
+    } finally {
+      if (mounted) setState(() => _creating = false);
     }
   }
 
-  void _openDefects() {
-    final ValueChanged<int>? switchTab = widget.onSwitchTab;
-    if (switchTab != null) {
-      switchTab(1);
-    } else {
-      _toast('缺陷单', '请在底部标签栏切到「缺陷单」。');
+  /// 「建题」失败时的提示（B1）：除了文案，还给一个「重试」按钮。
+  ///
+  /// 之前是普通 toast，失败后只能自己再点一次入口；这里直接提供重试，
+  /// 应对 Railway 冷启动这种「第一次失败、第二次就好」的场景。
+  Future<void> _showCreateError(String message) async {
+    if (!mounted) return;
+    final bool? retry = await showCupertinoDialog<bool>(
+      context: context,
+      builder: (BuildContext ctx) => CupertinoAlertDialog(
+        title: const Text(
+          '无法建题',
+          style: TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+            color: AppColors.label,
+          ),
+        ),
+        content: Text(
+          message,
+          style: const TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 14,
+            color: AppColors.label,
+          ),
+        ),
+        actions: <Widget>[
+          CupertinoDialogAction(
+            onPressed: () => Navigator.of(ctx).pop(false),
+            child: const Text(
+              '取消',
+              style: TextStyle(fontFamily: kFontFamily, color: AppColors.accent),
+            ),
+          ),
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(ctx).pop(true),
+            child: const Text(
+              '重试',
+              style: TextStyle(fontFamily: kFontFamily, color: AppColors.accent),
+            ),
+          ),
+        ],
+      ),
+    );
+    if (retry == true && mounted) {
+      await _openCreate();
     }
   }
 
@@ -934,11 +1066,7 @@ class _HomePageState extends State<HomePage> {
                         icon: CupertinoIcons.add,
                         label: '建题',
                         onTap: _openCreate,
-                      ),
-                      QuickAction(
-                        icon: CupertinoIcons.doc_text,
-                        label: '转缺陷单',
-                        onTap: _openDefects,
+                        busy: _creating,
                       ),
                       QuickAction(
                         icon: CupertinoIcons.timer,

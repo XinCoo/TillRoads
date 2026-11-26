@@ -112,7 +112,170 @@ export function splitQuestions(text) {
     if (parsed) questions.push(parsed);
   }
 
+  // 每题附一份题型识别结果（detected_type）；不改动 stem/options/answer/analysis
+  // 等既有字段形状，向后兼容（老调用方只会多看到一个新字段）。
+  for (const q of questions) {
+    q.detected_type = detectQuestionType(q);
+  }
+
   return { questions, preamble };
+}
+
+// ---------------------------------------------------------------------------
+// 题型自动识别（关键词 + 结构启发式，纯函数、零依赖）
+//
+// 输入：parseBlock 的产物 { stem, options, answer, analysis }
+// 输出：{ type, confidence: 'high'|'medium'|'low', needsReview: boolean, reason }
+//
+// 规则表（判定顺序自上而下，命中即止）：
+//   1. 判断题  judge       —— 题干/答案出现「判断/对错/正确与否/是否正确」等关键词，
+//                              或答案是「正确/错误/对/错/√/×/T/F」
+//   2. 多选题  multi       —— 有选项(≥2) 且答案是多个选项字母（ABC / A、B / ABD）
+//   3. 单选题  choice      —— 有选项(≥2) 且答案是单个字母（A / A. / A、）
+//   4. 填空题  fill        —— 无选项 且 题干含成对空括号（）/( )/（  ）或连续下划线占位
+//   5. 主观题  short_answer —— 无选项 且 题干较长（简述/论述/解答/分析/说明/证明 或 长度 > 60）
+//   6. 兜底    choice      —— 以上都不命中：沿用历史默认题型，但 needsReview=true、
+//                              confidence='low'，提示人工确认
+//
+// 其它约定：
+//   * answer 为 null（没有答案行）时 confidence 降为 'medium'（无法判分）；
+//   * 有选项但没答案 → 给 'choice'（不判多选），needsReview=true（单选/多选不可分）；
+//   * 识别失败**不阻塞导入**：调用方拿 needsReview 决定是否落库为默认题型。
+// ---------------------------------------------------------------------------
+
+/** 判断题关键词：题干或答案里出现即判 judge。 */
+const JUDGE_KEYWORDS = ['判断', '对错', '正确与否', '是否正确', '正误'];
+
+/** 判断题的「答案值」：正确/错误/对/错/√/×/T/F。 */
+const JUDGE_ANSWER_VALUES = new Set(['正确', '错误', '对', '错', '√', '×', 'T', 'F', 't', 'f']);
+
+/** 主观题关键词：题干里出现即判 short_answer（无选项时）。 */
+const SUBJECTIVE_KEYWORDS = ['简述', '论述', '解答', '分析', '说明', '证明'];
+
+/** 填空占位：成对空括号（各种写法）或连续 ≥2 个下划线（ASCII / 全角）。 */
+const FILL_PLACEHOLDER_RE = /（\s*）|\(\s*\)|[_\uFF3F]{2,}/;
+
+/** 从答案串里抽出「选项字母集合」：按 ,、;；/ 空格 分隔，纯字母 token 逐字展开。 */
+function answerLetters(answer) {
+  if (typeof answer !== 'string') return [];
+  const out = [];
+  for (const token of answer.split(/[,、;；\/\s]+/)) {
+    const t = token.replace(/[.。．:：]/g, '');
+    if (!t) continue;
+    if (/^[A-Ha-h]+$/.test(t)) {
+      for (const ch of t.toUpperCase()) out.push(ch);
+    }
+  }
+  return out;
+}
+
+/** 答案是否「只含一个选项字母」（允许 A / A. / A、 / （A） 等写法）。 */
+function isSingleLetterAnswer(answer) {
+  if (typeof answer !== 'string') return false;
+  const t = answer.trim();
+  if (!t) return false;
+  return /^[（(]?[A-Ha-h][）)]?\s*[.、．:：]?$/.test(t);
+}
+
+/**
+ * 识别单道题的题型。
+ *
+ * @param {{stem?:string, options?:Array<{key:string,text:string}>|null,
+ *          answer?:string|null, analysis?:string|null}} question
+ * @returns {{type:string, confidence:'high'|'medium'|'low', needsReview:boolean, reason:string}}
+ */
+export function detectQuestionType(question) {
+  const q = question || {};
+  const stem = typeof q.stem === 'string' ? q.stem : '';
+  const answer = typeof q.answer === 'string' ? q.answer.trim() : '';
+  const hasAnswer = answer !== '';
+  const optionCount = Array.isArray(q.options) ? q.options.length : 0;
+  const hasOptions = optionCount >= 2;
+
+  // 规则 1：判断题
+  const stemHit = JUDGE_KEYWORDS.some((k) => stem.includes(k));
+  const ansHit = JUDGE_KEYWORDS.some((k) => answer.includes(k));
+  const ansValueHit = JUDGE_ANSWER_VALUES.has(answer);
+  if (stemHit || ansHit || ansValueHit) {
+    return {
+      type: 'judge',
+      confidence: hasAnswer ? 'high' : 'medium',
+      needsReview: false,
+      reason: ansValueHit
+        ? '命中判断题答案值（正确/错误/对/错/√/×/T/F）'
+        : '命中判断题关键词（判断/对错/正确与否/是否正确）',
+    };
+  }
+
+  // 规则 2 / 3：有选项的单选 / 多选
+  if (hasOptions) {
+    const letters = [...new Set(answerLetters(answer))];
+    if (letters.length >= 2) {
+      return {
+        type: 'multi',
+        confidence: hasAnswer ? 'high' : 'medium',
+        needsReview: false,
+        reason: `命中选项行（${optionCount} 项）且答案为多个选项字母（${letters.join('')}）`,
+      };
+    }
+    if (isSingleLetterAnswer(answer) || letters.length === 1) {
+      return {
+        type: 'choice',
+        confidence: hasAnswer ? 'high' : 'medium',
+        needsReview: false,
+        reason: '命中选项行且答案为单个选项字母',
+      };
+    }
+    // 有选项但没有答案行：无法区分单选 / 多选
+    if (!hasAnswer) {
+      return {
+        type: 'choice',
+        confidence: 'medium',
+        needsReview: true,
+        reason: '命中选项行但没有答案行，无法区分单选与多选，请人工确认',
+      };
+    }
+    // 有选项但答案不是字母（如「正确」「以上都对」）：结构上是选择题
+    return {
+      type: 'choice',
+      confidence: 'medium',
+      needsReview: true,
+      reason: '命中选项行但答案不是选项字母，无法判定单选或多选，请人工确认',
+    };
+  }
+
+  // 规则 4：填空题（无选项 + 占位符）
+  if (!hasOptions && FILL_PLACEHOLDER_RE.test(stem)) {
+    return {
+      type: 'fill',
+      confidence: hasAnswer ? 'high' : 'medium',
+      needsReview: false,
+      reason: '无选项且题干含空括号或下划线占位符，判为填空题',
+    };
+  }
+
+  // 规则 5：主观 / 解答题（无选项 + 题干较长或含主观题关键词）
+  if (!hasOptions) {
+    const kw = SUBJECTIVE_KEYWORDS.find((k) => stem.includes(k));
+    if (kw || stem.length > 60) {
+      return {
+        type: 'short_answer',
+        confidence: hasAnswer ? 'high' : 'medium',
+        needsReview: false,
+        reason: kw
+          ? `无选项且题干含「${kw}」等主观题关键词`
+          : `无选项且题干长度 ${stem.length} > 60，判为主观题`,
+      };
+    }
+  }
+
+  // 规则 6：兜底
+  return {
+    type: 'choice',
+    confidence: 'low',
+    needsReview: true,
+    reason: '无法可靠识别，请人工确认',
+  };
 }
 
 /**

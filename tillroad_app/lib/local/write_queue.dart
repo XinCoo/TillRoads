@@ -89,6 +89,7 @@ abstract final class WriteQueue {
     required String qType,
     required String errorCause,
     String? errorLayer,
+    String? customReason,
     String? knowledgeNodeId,
     String? priority,
     String? questionId,
@@ -129,6 +130,10 @@ abstract final class WriteQueue {
         'q_type': qType,
         'error_layer': analyzable ? layer : null,
         'error_cause': cause.isEmpty ? null : cause,
+        // C3 自定义错因：与云端 defect_tickets.custom_reason 一一对应。
+        'custom_reason': (customReason?.trim().isEmpty ?? true)
+            ? null
+            : customReason!.trim(),
         'priority': (priority?.trim().isEmpty ?? true) ? null : priority,
         'status': status,
         Col.verificationRound: 1,
@@ -170,6 +175,9 @@ abstract final class WriteQueue {
           'q_type': qType,
           'error_cause': cause,
           if (analyzable) 'error_layer': layer,
+          // C3：自定义错因文本走独立字段（云端列 custom_reason）。
+          if (customReason != null && customReason.trim().isNotEmpty)
+            'custom_reason': customReason.trim(),
           if (knowledgeNodeId != null && knowledgeNodeId.trim().isNotEmpty)
             'knowledge_node_id': knowledgeNodeId.trim(),
           if (priority != null && priority.trim().isNotEmpty)
@@ -197,6 +205,7 @@ abstract final class WriteQueue {
     required String errorLayer,
     required String errorCause,
     required int baseVersion,
+    String? customReason,
   }) async {
     final Database db = await LocalDb.instance.database;
 
@@ -213,6 +222,9 @@ abstract final class WriteQueue {
       final Map<String, Object?> patch = <String, Object?>{
         'error_layer': errorLayer,
         'error_cause': errorCause,
+        // C3：自定义错因同步进本地行，并随 payload 上行。
+        if (customReason != null && customReason.trim().isNotEmpty)
+          'custom_reason': customReason.trim(),
         'status': 'ANALYZED',
         Col.syncState: SyncState.dirty,
         Col.updatedAt: nowIso(),
@@ -228,6 +240,9 @@ abstract final class WriteQueue {
         payload: <String, Object?>{
           'error_layer': errorLayer,
           'error_cause': errorCause,
+          // C3：自定义错因文本走独立字段（云端列 custom_reason）。
+          if (customReason != null && customReason.trim().isNotEmpty)
+            'custom_reason': customReason.trim(),
           'version': baseVersion,
           // 后端据此走 reanalyze（并要求当前确实是 REOPENED）。
           if (reopened) 'status': 'REOPENED',

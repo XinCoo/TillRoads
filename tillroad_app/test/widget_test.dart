@@ -55,9 +55,8 @@ void main() {
     expect(find.text('缺陷分布'), findsOneWidget);
     expect(find.text('快捷入口'), findsOneWidget);
 
-    // 四个快捷入口
+    // 四个快捷入口（C1：原来的「转缺陷单」与「建题」职责重叠，已删除）
     expect(find.text('建题'), findsOneWidget);
-    expect(find.text('转缺陷单'), findsOneWidget);
     expect(find.text('开始模考'), findsOneWidget);
     expect(find.text('复盘'), findsOneWidget);
   });
@@ -113,8 +112,17 @@ void main() {
     await tester.pumpAndSettle();
 
     // 详情页的前三个分组（时间线在下方，需滚动）
+    // 详情页的前三个分组（时间线在下方，需滚动）
     expect(find.text('基本信息'), findsOneWidget);
     expect(find.text('处理动作'), findsOneWidget);
+
+    // C4 新增了「关联题目」区块，三次验证被推到折叠线以下，需滚到才可见
+    await tester.scrollUntilVisible(
+      find.text('三次验证'),
+      200,
+      scrollable: find.byType(Scrollable).last,
+    );
+    await tester.pumpAndSettle();
     expect(find.text('三次验证'), findsOneWidget);
 
     // 三次验证的三个阶段

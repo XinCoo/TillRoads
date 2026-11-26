@@ -43,7 +43,9 @@ Future<Map<String, Object?>?> loadActiveExamProfile(String userId) async {
     'exam_profiles',
     where: '${Col.userId} = ?',
     whereArgs: <Object?>[userId],
-    orderBy: 'created_at ASC, local_id ASC',
+    // 倒序：同名「生效中」的目标可能有多个（m27163 A1④ 允许新建自定义目标），
+    // 新的排在前面 —— 刚建完的目标要能在首页立刻看到，而不是永远显示最老那个。
+    orderBy: 'created_at DESC, local_id DESC',
   );
   if (rows.isEmpty) return null;
   for (final Map<String, Object?> row in rows) {
@@ -241,6 +243,8 @@ DefectTicket _ticketFromRow(
     qType: text(row['q_type']) ?? '未分类题型',
     errorLayer: text(row['error_layer']) ?? '未归因',
     errorCause: text(row['error_cause']) ?? '尚未填写归因说明',
+    // C3：自定义错因（本地列 custom_reason）。
+    customReason: text(row['custom_reason']) ?? '',
     priority: DefectPriority.fromWire(text(row['priority'])),
     status: DefectStatus.fromWire(text(row['status']) ?? 'DRAFT'),
     verificationRound: round,

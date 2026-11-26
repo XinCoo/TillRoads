@@ -19,30 +19,26 @@
 //    `daily_minutes` 是正整数（0 会被 V6 拒绝）。两者留空时**不传键**，
 //    而不是传空字符串（空串会以 INVALID_* 冒出来）。
 //
+// ── 「自定义」考试类型（A1）────────────────────────────────────────────
+// `exam_type` 新增 `'custom'`（后端迁移 0006），同时新增可空列
+// `exam_type_custom`（自定义名称文本，≤20 字）。选中「自定义」时：
+//   * 必须填「自定义名称」（≤20 字，超了在前端就红字拦下，不等后端 400）；
+//   * 提交体额外带 `exam_type_custom`；
+//   * `target_label` 若为空则用自定义名称填充 —— 后端 AC-EXAM-01 要求
+//     `target_score` 或 `target_label` 至少一个非空。
+//
 // ── 日期为什么手拼 'YYYY-MM-DD' ─────────────────────────────────────────
 // `validateExamDate` 也接受 ISO datetime，但 `exam_date` 是 date 列，
 // 带 `T00:00:00.000` 会被 PG 截断；且列表页按 'YYYY-MM-DD' 展示，
 // 两处格式统一才不会有「提交 2026-03-01T00:00:00 却显示 2026-03-01」的割裂。
 
 import 'package:flutter/cupertino.dart';
-import 'package:flutter/services.dart' show TextInputType;
 
-import '../api/api_client.dart';
+import '../api/api_client.dart' show ApiException;
+import '../api/exam_api.dart';
 import '../config/api_config.dart';
 import '../theme/app_theme.dart';
-
-/// `schema.sql:46-48` 的 exam_type 枚举（顺序即 UI 顺序）。
-///
-/// 值与标签必须与后端 ENUM 逐字一致：拼错不会被前端拦住，
-/// 但会以 `400 INVALID_EXAM_TYPE` 的形式在提交时才失败。
-const List<({String value, String label})> _kExamTypes =
-    <({String value, String label})>[
-  (value: 'civil_service', label: '公务员'),
-  (value: 'postgrad', label: '考研'),
-  (value: 'final_exam', label: '期末'),
-  (value: 'vocational', label: '职业资格'),
-  (value: 'adult_self_study', label: '成人自考'),
-];
+import '../widgets/form_field.dart' show FormFieldGroup, FormTextField;
 
 class ExamProfileCreatePage extends StatefulWidget {
   const ExamProfileCreatePage({super.key});
@@ -52,17 +48,23 @@ class ExamProfileCreatePage extends StatefulWidget {
 }
 
 class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
-  final ApiClient _api = ApiClient();
+  final ExamApi _api = ExamApi();
 
   final TextEditingController _labelCtrl = TextEditingController();
   final TextEditingController _scoreCtrl = TextEditingController();
   final TextEditingController _minutesCtrl = TextEditingController(text: '120');
   final TextEditingController _scopeCtrl = TextEditingController();
 
+  /// 「自定义」类型的名称（≤20 字）。
+  final TextEditingController _customCtrl = TextEditingController();
+
   String _examType = 'civil_service';
   late DateTime _examDate;
   bool _datePickerOpen = false;
   bool _submitting = false;
+
+  /// 「自定义名称」的行内错误（非空时显示红字）。
+  String? _customError;
 
   @override
   void initState() {
@@ -81,9 +83,13 @@ class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
     _scoreCtrl.dispose();
     _minutesCtrl.dispose();
     _scopeCtrl.dispose();
+    _customCtrl.dispose();
     _api.close();
     super.dispose();
   }
+
+  /// 是不是「自定义」类型。
+  bool get _isCustom => _examType == 'custom';
 
   /// 手拼 'YYYY-MM-DD'（不用 toIso8601String：它会带上 T00:00:00.000）。
   String get _examDateText {
@@ -92,8 +98,43 @@ class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
     return '${_examDate.year}-$month-$day';
   }
 
+  /// 切换考试类型。切走时清掉自定义输入框的内容（避免残留的旧名称
+  /// 在切回「自定义」时莫名出现在输入框里）。
+  void _selectType(String value) {
+    if (_examType == value) return;
+    setState(() {
+      _examType = value;
+      if (value != 'custom') {
+        _customCtrl.clear();
+        _customError = null;
+      }
+    });
+  }
+
   Future<void> _submit() async {
-    final String label = _labelCtrl.text.trim();
+    final String custom = _customCtrl.text.trim();
+
+    // 自定义类型的名称：必填 + ≤20 字。前端先拦一道，别只靠后端 400。
+    if (_isCustom) {
+      if (custom.isEmpty) {
+        setState(() => _customError = '请填写自定义名称');
+        await _alert('无法提交', '请填写「自定义名称」，它会作为这个考试类型的名字。');
+        return;
+      }
+      if (custom.length > kExamTypeCustomMaxLength) {
+        setState(
+          () => _customError =
+              '自定义名称不能超过 $kExamTypeCustomMaxLength 个字',
+        );
+        return;
+      }
+    }
+
+    // `target_label`：用户填了就用用户的；自定义类型下留空则用自定义名称
+    // 兜底（后端 AC-EXAM-01 要求 target_score 或 target_label 至少一个非空）。
+    final String label = _labelCtrl.text.trim().isEmpty
+        ? (custom)
+        : _labelCtrl.text.trim();
     if (label.isEmpty) {
       await _alert('无法提交', '请填写「目标名称」，它是这个考试目标的唯一标识。');
       return;
@@ -106,18 +147,16 @@ class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
 
     setState(() => _submitting = true);
     try {
-      final Map<String, Object?> body = <String, Object?>{
-        'user_id': kDemoUserId,
-        'exam_type': _examType,
-        'target_label': label,
-        'exam_date': _examDateText,
-        if (score != null) 'target_score': score,
-        if (minutes != null) 'daily_minutes': minutes,
-        // jsonb 列：必须给合法 JSON 文本，{'raw': ...} 由 toJsonbParam 序列化。
-        if (scope.isNotEmpty) 'source_scope': <String, Object?>{'raw': scope},
-      };
-
-      final Object? raw = await _api.post('/exam-profiles', body: body);
+      final Map<String, Object?> raw = await _api.createExamProfile(
+        userId: kDemoUserId,
+        examType: _examType,
+        targetLabel: label,
+        examDate: _examDateText,
+        targetScore: score,
+        dailyMinutes: minutes,
+        sourceScope: scope,
+        examTypeCustom: _isCustom ? custom : null,
+      );
       if (!mounted) return;
 
       final int preset = _countSubjects(raw);
@@ -129,15 +168,17 @@ class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
       );
       if (!mounted) return;
       Navigator.of(context).pop(true);
-    } on ApiException catch (e) {
-      if (!mounted) return;
-      setState(() => _submitting = false);
-      await _alert('创建失败', e.message);
     } catch (e) {
       if (!mounted) return;
       setState(() => _submitting = false);
-      await _alert('创建失败', '$e');
+      await _alert('创建失败', _errorText(e));
     }
+  }
+
+  /// ApiException 有面向用户的中文 message；其它异常退化成异常文本。
+  String _errorText(Object e) {
+    if (e is ApiException) return e.message;
+    return '$e';
   }
 
   /// 201 的 body 是 `{profile, subjects}`（不是裸 profile）。
@@ -194,6 +235,54 @@ class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
     );
   }
 
+  /// 「每日可用分钟」说明弹窗。
+  ///
+  /// 本工程全前端没有任何 Flutter `Tooltip` 组件先例（grep Tooltip 零命中），
+  /// 所以这里用 CupertinoAlertDialog 而不是引入 Tooltip。
+  Future<void> _showDailyMinutesHelp() {
+    return showCupertinoDialog<void>(
+      context: context,
+      builder: (BuildContext ctx) => CupertinoAlertDialog(
+        title: const Text(
+          '每日可用分钟',
+          style: TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 17,
+            fontWeight: FontWeight.w600,
+            color: AppColors.label,
+          ),
+        ),
+        content: Padding(
+          padding: const EdgeInsets.only(top: 8),
+          child: Text(
+            kDailyMinutesHelp,
+            style: const TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 13,
+              height: 1.35,
+              color: AppColors.label,
+            ),
+          ),
+        ),
+        actions: <Widget>[
+          CupertinoDialogAction(
+            isDefaultAction: true,
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text(
+              '知道了',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 17,
+                fontWeight: FontWeight.w600,
+                color: AppColors.accent,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     return CupertinoPageScaffold(
@@ -221,6 +310,27 @@ class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
               children: <Widget>[
                 _sectionTitle('考试类型'),
                 _card(child: _buildTypeChips()),
+                if (_isCustom) ...<Widget>[
+                  const SizedBox(height: 20),
+                  _sectionTitle('自定义名称'),
+                  _card(
+                    child: FormFieldGroup(
+                      label: '自定义名称',
+                      required: true,
+                      error: _customError,
+                      child: FormTextField(
+                        controller: _customCtrl,
+                        placeholder: '例如：公司法务岗考试',
+                        hasError: _customError != null,
+                        onChanged: (String _) {
+                          if (_customError != null) {
+                            setState(() => _customError = null);
+                          }
+                        },
+                      ),
+                    ),
+                  ),
+                ],
                 const SizedBox(height: 20),
                 _sectionTitle('目标名称'),
                 _card(
@@ -244,7 +354,22 @@ class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
                 _sectionTitle('考试日期'),
                 _card(child: _buildDateSection()),
                 const SizedBox(height: 20),
-                _sectionTitle('每日可用分钟'),
+                _sectionTitle(
+                  '每日可用分钟',
+                  trailing: GestureDetector(
+                    behavior: HitTestBehavior.opaque,
+                    onTap: _submitting ? null : _showDailyMinutesHelp,
+                    child: const SizedBox(
+                      width: 24,
+                      height: 24,
+                      child: Icon(
+                        CupertinoIcons.info_circle,
+                        size: 16,
+                        color: AppColors.secondaryLabel,
+                      ),
+                    ),
+                  ),
+                ),
                 _card(
                   child: _field(
                     controller: _minutesCtrl,
@@ -270,17 +395,27 @@ class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
     );
   }
 
-  Widget _sectionTitle(String text) {
+  /// 小标题。[trailing] 用于在标题行右侧挂图标按钮（如「每日可用分钟」的
+  /// 说明图标）。
+  Widget _sectionTitle(String text, {Widget? trailing}) {
     return Padding(
       padding: const EdgeInsets.fromLTRB(4, 0, 4, 8),
-      child: Text(
-        text,
-        style: const TextStyle(
-          fontFamily: kFontFamily,
-          fontSize: 13,
-          fontWeight: FontWeight.w600,
-          color: AppColors.secondaryLabel,
-        ),
+      child: Row(
+        children: <Widget>[
+          Text(
+            text,
+            style: const TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
+              color: AppColors.secondaryLabel,
+            ),
+          ),
+          if (trailing != null) ...<Widget>[
+            const Spacer(),
+            trailing,
+          ],
+        ],
       ),
     );
   }
@@ -337,13 +472,11 @@ class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
       spacing: 8,
       runSpacing: 8,
       children: <Widget>[
-        for (final ({String value, String label}) type in _kExamTypes)
+        for (final ({String value, String label}) type in kExamTypeOptions)
           _OptionChip(
             label: type.label,
             selected: _examType == type.value,
-            onTap: _submitting
-                ? null
-                : () => setState(() => _examType = type.value),
+            onTap: _submitting ? null : () => _selectType(type.value),
           ),
       ],
     );

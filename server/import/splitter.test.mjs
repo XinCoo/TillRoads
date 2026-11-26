@@ -21,7 +21,7 @@ import { readFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { SEPARATORS, matchSeparator, splitQuestions, splitStats } from './splitter.mjs';
+import { SEPARATORS, matchSeparator, splitQuestions, splitStats, detectQuestionType } from './splitter.mjs';
 import { extractText } from './extract.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -232,4 +232,167 @@ test('已知局限：题干内部的编号列表会被误判为新题起点', ()
   const result = splitQuestions(text);
   // 预期：`（1）` `（2）` 被当成新题起点 —— 题数 > 1 就是局限仍在
   assert.ok(result.questions.length > 1, '局限已被修复！请更新本测试并同步 README 的已知局限');
+});
+
+// ---------------------------------------------------------------------------
+// detectQuestionType：题型自动识别（关键词 + 结构启发式）
+// ---------------------------------------------------------------------------
+test('detectQuestionType：判断题（关键词 / 答案值 两种命中方式）', () => {
+  const byKeyword = detectQuestionType({
+    stem: '判断题：地球围绕太阳运行。',
+    options: null,
+    answer: '正确',
+  });
+  assert.equal(byKeyword.type, 'judge');
+  assert.equal(byKeyword.needsReview, false);
+  assert.equal(byKeyword.confidence, 'high');
+
+  // 关键词不在题干里，但答案是「错误」→ 靠答案值命中
+  const byAnswer = detectQuestionType({
+    stem: '太阳系中存在第十颗行星。',
+    options: null,
+    answer: '错误',
+  });
+  assert.equal(byAnswer.type, 'judge');
+
+  // 「是否正确」也算判断题关键词
+  const byQuestion = detectQuestionType({
+    stem: '以下说法是否正确：光速是最快的。',
+    options: null,
+    answer: '正确',
+  });
+  assert.equal(byQuestion.type, 'judge');
+});
+
+test('detectQuestionType：多选题（多个选项字母）', () => {
+  const r = detectQuestionType({
+    stem: '下列属于马克思主义哲学基本原理的有',
+    options: [
+      { key: 'A', text: 'a' },
+      { key: 'B', text: 'b' },
+      { key: 'C', text: 'c' },
+      { key: 'D', text: 'd' },
+    ],
+    answer: 'ABC',
+  });
+  assert.equal(r.type, 'multi');
+  assert.equal(r.needsReview, false);
+  assert.equal(r.confidence, 'high');
+
+  // 顿号分隔也要能识别
+  const dun = detectQuestionType({
+    stem: '多选',
+    options: [
+      { key: 'A', text: 'a' },
+      { key: 'B', text: 'b' },
+    ],
+    answer: 'A、B',
+  });
+  assert.equal(dun.type, 'multi');
+});
+
+test('detectQuestionType：单选题（单个选项字母）', () => {
+  const r = detectQuestionType({
+    stem: '下列说法正确的是',
+    options: [
+      { key: 'A', text: 'a' },
+      { key: 'B', text: 'b' },
+    ],
+    answer: 'A',
+  });
+  assert.equal(r.type, 'choice');
+  assert.equal(r.needsReview, false);
+  assert.equal(r.confidence, 'high');
+
+  // 「A.」这种带标点的写法也要认
+  const withDot = detectQuestionType({
+    stem: '下列说法正确的是',
+    options: [
+      { key: 'A', text: 'a' },
+      { key: 'B', text: 'b' },
+    ],
+    answer: 'B.',
+  });
+  assert.equal(withDot.type, 'choice');
+});
+
+test('detectQuestionType：填空题（无选项 + 占位符）', () => {
+  const bracket = detectQuestionType({
+    stem: '中国的首都是（  ）。',
+    options: null,
+    answer: '北京',
+  });
+  assert.equal(bracket.type, 'fill');
+  assert.equal(bracket.needsReview, false);
+
+  const underscore = detectQuestionType({
+    stem: '他____学习，成绩优异。',
+    options: null,
+    answer: '努力',
+  });
+  assert.equal(underscore.type, 'fill');
+});
+
+test('detectQuestionType：主观 / 解答题（无选项 + 关键词或长题干）', () => {
+  const byKeyword = detectQuestionType({
+    stem: '简述马克思主义哲学的基本特征。',
+    options: null,
+    answer: '见解析',
+  });
+  assert.equal(byKeyword.type, 'short_answer');
+  assert.equal(byKeyword.needsReview, false);
+
+  // 题干超过 60 字也算主观题
+  const long = '请结合具体历史材料，分析这一事件的背景、主要经过、重大影响与历史意义，并谈谈你的认识。'.repeat(2);
+  const byLength = detectQuestionType({
+    stem: long,
+    options: null,
+    answer: '见解析',
+  });
+  assert.equal(byLength.type, 'short_answer');
+});
+
+test('detectQuestionType：无法识别时兜底为 choice 且 needsReview=true', () => {
+  const r = detectQuestionType({
+    stem: '简单的几个字',
+    options: null,
+    answer: null,
+  });
+  assert.equal(r.type, 'choice');
+  assert.equal(r.needsReview, true);
+  assert.equal(r.confidence, 'low');
+  assert.ok(r.reason.includes('人工确认'), `reason 应提示人工确认：${r.reason}`);
+});
+
+test('detectQuestionType：有选项但没答案行时给 choice 且标记待确认', () => {
+  const r = detectQuestionType({
+    stem: '下列说法正确的是',
+    options: [
+      { key: 'A', text: 'a' },
+      { key: 'B', text: 'b' },
+    ],
+    answer: null,
+  });
+  assert.equal(r.type, 'choice');
+  assert.equal(r.needsReview, true);
+  assert.equal(r.confidence, 'medium');
+});
+
+test('splitQuestions：每题都带上 detected_type，且不改动原有字段', () => {
+  const text = readFixture('sample-01-markdown.md');
+  const result = splitQuestions(text);
+  for (const q of result.questions) {
+    assert.ok(q.detected_type, '每题都应有 detected_type');
+    assert.ok(typeof q.detected_type.type === 'string');
+    assert.ok(['high', 'medium', 'low'].includes(q.detected_type.confidence));
+    assert.equal(typeof q.detected_type.needsReview, 'boolean');
+    assert.ok(typeof q.detected_type.reason === 'string' && q.detected_type.reason.length > 0);
+  }
+  // 样本 1 全是四选项单选题 + 字母答案 → 应识别为单选
+  // 样本 1 全是四选项题，答案要么单字母要么多字母 → 识别为单选或多选，且都不需人工确认
+  assert.ok(
+    result.questions.every((q) => ['choice', 'multi'].includes(q.detected_type.type)),
+    `样本 1 应识别为 choice/multi：${JSON.stringify(result.questions.map((q) => q.detected_type.type))}`,
+  );
+  assert.ok(result.questions.every((q) => q.detected_type.needsReview === false));
 });

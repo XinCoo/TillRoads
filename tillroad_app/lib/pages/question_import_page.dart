@@ -525,6 +525,12 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
 
   Widget _buildResult(ImportResult result) {
     final bool anySuccess = result.imported > 0;
+    // ★ A2②：题型识别统计。这三个值旧后端可能不返回 ——
+    // 缺失就整块不显示（显示 0 会让人误以为「一道都没识别出来」）。
+    final int? detected = _statInt(result, 'type_detected');
+    final int? review = _statInt(result, 'type_needs_review');
+    final int? sanitized = _statInt(result, 'sanitized');
+    final bool hasTypeStats = detected != null || review != null || sanitized != null;
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 24, 16, 32),
       children: <Widget>[
@@ -559,6 +565,35 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
             ],
           ),
         ),
+        if (hasTypeStats) ...<Widget>[
+          const SizedBox(height: 16),
+          const SectionHeader(text: '识别统计'),
+          _CardBox(
+            child: Column(
+              children: <Widget>[
+                if (detected != null)
+                  _ResultRow(label: '自动识别题型', value: '$detected'),
+                if (review != null)
+                  _ResultRow(label: '待人工确认', value: '$review'),
+                if (sanitized != null)
+                  _ResultRow(label: '题干清洗', value: '$sanitized'),
+                if (review != null && review > 0)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      '有 $review 道题的题型没能可靠识别，已按默认题型入库，可在题库里逐条调整。',
+                      style: const TextStyle(
+                        fontFamily: kFontFamily,
+                        fontSize: 13,
+                        height: 1.4,
+                        color: AppColors.dueSoon,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
         if (result.duplicates.isNotEmpty) ...<Widget>[
           const SizedBox(height: 16),
           const SectionHeader(text: '已存在的题（未重复入库）'),
@@ -622,6 +657,18 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
         ),
       ],
     );
+  }
+
+  /// ★ A2②：从后端 stats 里读一个整数字段。
+  ///
+  /// 缺失（旧后端没这个字段）返回 null —— 调用方据此决定「整块不显示」，
+  /// 不用 0 冒充。
+  static int? _statInt(ImportResult result, String key) {
+    final Object? v = result.stats[key];
+    if (v is int) return v;
+    if (v is num) return v.toInt();
+    if (v is String) return int.tryParse(v.trim());
+    return null;
   }
 
   static String _sizeLabel(int bytes) {

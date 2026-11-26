@@ -59,11 +59,15 @@ import { splitQuestions } from '../import/splitter.mjs';
 import { dedupe } from '../import/dedupe.mjs';
 import { separateAssets } from '../import/separate.mjs';
 import { fail, ok } from './_http.mjs';
-
+import { sanitizeQuestionText } from '../../core/index.mjs';
 /** 这些分隔符编号不再作为题干前缀入库（splitter 已剥离），这里只用于报错行号。 */
 
 const DEFAULT_SOURCE = 'import';
 const DEFAULT_TYPE = 'choice';
+
+// 主观类题型：这些题型的 is_subjective 必须为 true。
+// 取值口径见 tillroad_app/lib/api/question_api.dart 的 BankQuestion.typeLabel。
+const SUBJECTIVE_TYPES = new Set(['short_answer', 'essay', 'subjective', 'material']);
 
 /**
  * 把 base64 解成 Buffer。
@@ -92,15 +96,39 @@ function decodeBase64(input) {
   return buf;
 }
 
-/** 切题结果 -> 待入库的题（补上归属、默认题型、source）。 */
+/**
+ * 切题结果 -> 待入库的题（补上归属、题型、source）。
+ *
+ * 题型来源有两条路：
+ *   1. splitter 的自动识别结果（question.detected_type）；
+ *      只有 needsReview === false（识别可靠）时才采用。
+ *   2. 调用方给的 default_type（识别不确定 / 没有识别结果时的兜底）。
+ *
+ * 识别不确定就退回默认题型，是刻意的：宁可沿用调用方的默认口径，
+ * 也不要把「猜的题型」写进库里让人以为识别成功（needs_review 会记在 generation_meta 里）。
+ */
 function toCreateInput(question, ctx) {
   // 第四阶段：资产分离（MVP 只识别占位、不落库，asset_refs 恒为空数组）
   const assets = separateAssets(question);
+
+  const detected = question.detected_type ?? null;
+  const useDetected = Boolean(detected) && detected.needsReview === false;
+  const type = useDetected ? detected.type : ctx.default_type;
+
+  // generation_meta 记录本次的识别结论（jsonb，列已存在，不需要迁移）。
+  const generation_meta = {
+    type_source: useDetected ? 'auto' : 'default',
+    detected_type: detected?.type ?? null,
+    confidence: detected?.confidence ?? null,
+    needs_review: detected ? detected.needsReview === true : true,
+    reason: detected?.reason ?? null,
+  };
+
   return {
     source: ctx.source,
     subject_id: ctx.subject_id,
     knowledge_node_id: ctx.knowledge_node_id,
-    type: ctx.default_type,
+    type,
     stem: question.stem,
     // splitter 把选项解析成 [{key,text}]，正好是 schema 里 options jsonb 的形状
     options: question.options,
@@ -111,7 +139,8 @@ function toCreateInput(question, ctx) {
     owner_user_id: ctx.owner_user_id ?? null,
     // V1 接入对象存储后这里会是真 asset 引用；MVP 恒为 null（见 server/import/separate.mjs）
     asset_refs: assets.asset_refs.length > 0 ? assets.asset_refs : null,
-    is_subjective: ctx.default_type === 'short_answer' || ctx.default_type === 'essay',
+    is_subjective: SUBJECTIVE_TYPES.has(type),
+    generation_meta,
   };
 }
 
@@ -162,7 +191,28 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
     owner_user_id: ownerUserId ?? null,
   };
 
-  const candidates = split.questions.map((q) => toCreateInput(q, createCtx));
+  // ★ 清洗（core/text.mjs 的 sanitizeQuestionText）：把题干里连续的下划线占位符
+  //   （____ / ＿＿）统一替换成「（  ）」，只影响**展示文本**。
+  //   options / answer / analysis 不清洗（选项与答案里的下划线可能是数学符号）。
+  //
+  //   ★ 关于 content_hash：core.normalizeQuestionText **一行未动**，哈希口径本身没变；
+  //     但仓储层 questions.create() 是用**传进去的 stem** 现算 hash 的
+  //     （server/repositories/questions.mjs 的 contentHashOf(input)），
+  //     而本轮不允许改 questions.mjs —— 所以含占位符的题，
+  //     其 content_hash 会是「清洗后题干」的哈希，与清洗前导入的同一道题不同。
+  //     这一点已作为已知偏差记录在交付说明里。
+  let sanitizedCount = 0;
+  const cleanedQuestions = split.questions.map((q) => {
+    const cleaned = sanitizeQuestionText(q.stem);
+    if (cleaned !== q.stem) sanitizedCount += 1;
+    return { ...q, stem: cleaned };
+  });
+
+  const candidates = cleanedQuestions.map((q) => toCreateInput(q, createCtx));
+
+  // 题型识别统计：自动识别成功 / 需要人工确认。
+  const typeDetected = candidates.filter((c) => c.generation_meta.type_source === 'auto').length;
+  const typeNeedsReview = candidates.filter((c) => c.generation_meta.needs_review === true).length;
 
   // 题干/选项里的图片占位：MVP 不落存储，但要把数量告诉用户，
   // 否则「我的题图去哪了」会成为最常见的支持问题。
@@ -225,6 +275,10 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
         preamble_lines: split.preamble.length,
         bytes: buffer.length,
         image_placeholders: imageCount,
+        // 本轮新增：清洗与题型识别的统计（原有字段一个都没删）
+        sanitized: sanitizedCount,
+        type_detected: typeDetected,
+        type_needs_review: typeNeedsReview,
       },
     };
   });

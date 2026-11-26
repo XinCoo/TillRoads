@@ -256,7 +256,9 @@ test('POST /questions/import：纯文本样本（折行 + 无 Markdown 语法）
     c.release();
   }
   assert.ok(row, '首题应已入库');
-  assert.ok(row.stem.includes('难以____'), '折行后半句必须还在同一题里');
+  // ★ 本轮新增清洗：题干里的连续下划线占位符入库前已被替换成「（  ）」
+  assert.ok(row.stem.includes('难以（  ）'), `题干占位符应被清洗：${row.stem}`);
+  assert.ok(!row.stem.includes('____'), '入库后不应再有连续下划线占位符');
 });
 
 // ---------------------------------------------------------------------------
@@ -365,4 +367,133 @@ test('导入是原子的：不可解析的 PDF 不会留下任何 questions 行'
     c2.release();
   }
   assert.equal(after2, before, '失败的导入不应改变题目总数');
+});
+
+// ---------------------------------------------------------------------------
+// 7) 本轮新增：题干清洗 + 题型自动识别 + generation_meta + 新 stats 字段
+// ---------------------------------------------------------------------------
+
+/** 直接构造一个 md 文件的导入请求体（不落 fixture 文件）。 */
+function textBody(filename, text, extra = {}) {
+  return {
+    filename,
+    mime: 'text/markdown',
+    content_base64: Buffer.from(text, 'utf8').toString('base64'),
+    ...extra,
+  };
+}
+
+async function queryQuestions(whereSql, params) {
+  const c = await pool.connect();
+  try {
+    const r = await c.query(
+      `SELECT id, stem, type, is_subjective, generation_meta, content_hash
+         FROM questions
+        WHERE subject_id = $1 AND deleted_at IS NULL AND ${whereSql}`,
+      [seed.subjectId, ...params],
+    );
+    return r.rows;
+  } finally {
+    c.release();
+  }
+}
+
+test('导入清洗：题干里的 ____ 占位符入库前变成「（  ）」', skipOpt, async () => {
+  const text = [
+    '1. 中国的首都是____，上海是____。',
+    '答案：北京；上海',
+  ].join('\n');
+
+  const r = await req('POST', '/questions/import', textBody('sanitize.md', text, {
+    subject_id: seed.subjectId,
+  }));
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.imported, 1);
+
+  const rows = await queryQuestions('stem LIKE $2', ['%中国的首都是%']);
+  assert.equal(rows.length, 1);
+  assert.ok(rows[0].stem.includes('（  ）'), `占位符应被清洗：${rows[0].stem}`);
+  assert.ok(!rows[0].stem.includes('____'), '入库后不应再有连续下划线占位符');
+});
+
+test('题型自动识别：单选题落库 type=choice 且 type_source=auto', skipOpt, async () => {
+  const text = [
+    '1. 下列说法正确的是：',
+    'A. 甲说法',
+    'B. 乙说法',
+    '答案：A',
+  ].join('\n');
+
+  const r = await req('POST', '/questions/import', textBody('auto-choice.md', text, {
+    subject_id: seed.subjectId,
+  }));
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.imported, 1);
+
+  const rows = await queryQuestions('stem LIKE $2', ['%下列说法正确的是%']);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].type, 'choice');
+  assert.equal(rows[0].generation_meta.type_source, 'auto');
+  assert.equal(rows[0].generation_meta.detected_type, 'choice');
+  assert.equal(rows[0].generation_meta.needs_review, false);
+  assert.equal(rows[0].is_subjective, false);
+});
+
+test('题型自动识别：判断题落库 type=judge', skipOpt, async () => {
+  const text = ['1. 地球围绕太阳运行。', '答案：正确'].join('\n');
+
+  const r = await req('POST', '/questions/import', textBody('auto-judge.md', text, {
+    subject_id: seed.subjectId,
+  }));
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.imported, 1);
+
+  const rows = await queryQuestions('stem LIKE $2', ['%地球围绕太阳运行%']);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].type, 'judge');
+  assert.equal(rows[0].generation_meta.type_source, 'auto');
+  assert.equal(rows[0].generation_meta.needs_review, false);
+});
+
+test('题型无法识别：落库用 default_type，generation_meta 标记 needs_review', skipOpt, async () => {
+  const text = ['1. 简单的几个字'].join('\n');
+
+  const r = await req('POST', '/questions/import', textBody('auto-unknown.md', text, {
+    subject_id: seed.subjectId,
+  }));
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.imported, 1);
+
+  const rows = await queryQuestions('stem LIKE $2', ['%简单的几个字%']);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].type, 'choice', '识别不确定时应退回默认题型');
+  assert.equal(rows[0].generation_meta.type_source, 'default');
+  assert.equal(rows[0].generation_meta.needs_review, true);
+});
+
+test('stats：新增 sanitized / type_detected / type_needs_review 三个字段', skipOpt, async () => {
+  const text = [
+    '1. 填空题：中国的首都是____。',
+    '答案：北京',
+    '2. 下列说法正确的是：',
+    'A. 甲说法',
+    'B. 乙说法',
+    '答案：A',
+  ].join('\n');
+
+  const r = await req('POST', '/questions/import', textBody('stats.md', text, {
+    subject_id: seed.subjectId,
+  }));
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+
+  const s = r.data.stats;
+  assert.equal(typeof s.sanitized, 'number', 'stats.sanitized 应存在');
+  assert.equal(typeof s.type_detected, 'number', 'stats.type_detected 应存在');
+  assert.equal(typeof s.type_needs_review, 'number', 'stats.type_needs_review 应存在');
+  assert.equal(s.sanitized, 1, '只有含占位符的那题被清洗');
+  assert.ok(s.type_detected >= 1, '至少有一题自动识别成功');
+  // 原有 stats 字段一个都不能少
+  for (const key of ['kind', 'mime', 'pages', 'total', 'preamble_lines', 'bytes', 'image_placeholders']) {
+    assert.ok(key in s, `stats.${key} 不应被删掉`);
+  }
 });

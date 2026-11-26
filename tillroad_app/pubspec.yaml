@@ -93,3 +93,13 @@ flutter:
     - family: LXGWNeoZhiSong
       fonts:
         - asset: "assets/fonts/霞鹜新致宋字体.ttf"
+
+hooks:
+  # sqlite3 包在构建时要从 GitHub Releases 下载预编译的原生库
+  # （libsqlite3.<abi>.so）。直连 github.com 在本机网络下超时，
+  # 而 ghproxy 转发可用，故用它取同一个 Release 资产。
+  # 文件内容与官方完全一致 —— 下载后仍按官方 SHA-256 校验（sqlite3 包自带 hash 表），
+  # 校验不过会直接构建失败，所以这里不会引入“来路不明”的二进制。
+  user_defines:
+    sqlite3:
+      url_pattern: https://ghproxy.net/https://github.com/simolus3/sqlite3.dart/releases/download/$RELEASE_TAG/$FILENAME

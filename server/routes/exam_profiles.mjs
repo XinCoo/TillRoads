@@ -30,6 +30,7 @@ import {
   validateExamDate,
   validateExamProfileRequired,
   validateExamType,
+  validateExamTypeCustomName,
   validateProfileStatus,
   validateTargetScore,
   firstInvalid,
@@ -55,6 +56,14 @@ function pickProfileFields(body, { partial = false } = {}) {
       assertValid(validateExamType(body.exam_type));
       out.exam_type = body.exam_type;
     }
+  }
+  // m27163 A1②：exam_type='custom' 时必须带自定义名称（≤20 字），其他类型忽略该字段。
+  if (has('exam_type_custom')) {
+    assertValid(validateExamTypeCustomName(body.exam_type_custom));
+    out.exam_type_custom = body.exam_type_custom;
+  }
+  if (out.exam_type === 'custom') {
+    assertValid(validateExamTypeCustomName(out.exam_type_custom));
   }
   if (has('target_label')) out.target_label = body.target_label;
   if (has('target_score')) {
@@ -146,6 +155,21 @@ async function createProfile(pool, body) {
  *   （列表可能只加载了第一页）。这也是这里不用 archiveWithVersion 的原因。
  */
 async function deleteProfile(client, id, baseVersion) {
+  // m27163 A1①：被业务数据引用时拒绝删除（409），而不是默默软删掉
+  // 用户还在用的目标（那会让已有的缺陷单/模考指向一个「已删除」的考试目标）。
+  const refs = await rep.countReferences(client, id);
+  const used = refs.defect_tickets + refs.mock_exams;
+  if (used > 0) {
+    const e = new Error('exam profile in use');
+    e.statusCode = 409;
+    e.body = {
+      error: 'exam_profile_in_use',
+      message: '该配置正在使用中，无法删除',
+      references: refs,
+    };
+    throw e;
+  }
+
   const archived = await rep.archive(client, id, baseVersion);
 
   const subjectsRes = await client.query(

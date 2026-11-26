@@ -41,8 +41,18 @@ function resourcePath(pathname) {
   return { kind, id };
 }
 
+/// UUID 形态的资源 id。
+///
+/// `resourcePath()` 只看路径的前两段，所以 `/defect-tickets/custom-reasons`
+/// 这类「子路径」会被当成 id='custom-reasons'。直接拿它去查 uuid 列会报
+/// 22P02（invalid input syntax for type uuid），而 `httpError` 会把 SQLSTATE
+/// 吞成 500 internal —— 路由模块根本收不到请求。非 uuid 就不是资源 id，
+/// 交给 dispatch 正常路由即可。
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
 async function findResourceOwner(pool, kind, id) {
   if (!id) return null;
+  if (!UUID_RE.test(id)) return null;
   if (kind === 'defect-tickets') {
     const result = await pool.query('SELECT user_id FROM defect_tickets WHERE id = $1 AND deleted_at IS NULL', [id]);
     return result.rows[0]?.user_id ?? null;
@@ -123,14 +133,27 @@ export function createApp(options = {}) {
       }
 
       const seg = pathname.split('/').filter(Boolean);
-      const out = await dispatch(req.method, seg, {
-        pool,
-        repos: reposCtx,
-        state,
-        authUserId,
-        searchParams: u.searchParams,
-        body: scopedBody,
-      });
+      const dispatchStartedAt = Date.now();
+      const out = await withRequestTimeout(
+        dispatch(req.method, seg, {
+          pool,
+          repos: reposCtx,
+          state,
+          authUserId,
+          searchParams: u.searchParams,
+          body: scopedBody,
+        }),
+        REQUEST_TIMEOUT_MS,
+        req.method,
+        pathname,
+      );
+      // 慢请求日志（m27163 B1 的 P95 观测手段）：
+      // 只打方法 + 路径 + 耗时，不打 query / body，避免把 token 或题干写进日志。
+      const dispatchCost = Date.now() - dispatchStartedAt;
+      if (dispatchCost > SLOW_REQUEST_MS) {
+        // eslint-disable-next-line no-console
+        console.log(`[SLOW] ${req.method} ${pathname} ${dispatchCost}ms`);
+      }
 
       if (out === null || out === undefined) {
         json(res, 404, { error: 'not_found' });
@@ -155,6 +178,54 @@ export function createApp(options = {}) {
       return server.close(...args);
     },
   };
+}
+
+/**
+ * 请求级超时（m27163 B1）。
+ *
+ * 为什么需要：
+ *   Railway 免费实例休眠后第一次请求要等实例唤醒 + Neon 连接池冷启动，
+ *   实测生产环境 16 次请求里有 2 次首连直接 `UND_ERR_CONNECT_TIMEOUT`（10.7s），
+ *   另有若干次成功请求 p95 达 3.8s。若某个请求碰上「刚好卡住」的情况，
+ *   没有这层兜底，连接会一直挂着直到客户端自己超时 —— 服务端资源也被占着。
+ *
+ * 为什么是 25s 而不是更短：
+ *   客户端 `kApiTimeout` 是 15s，冷启动首连实测要 10.7s+，服务端阈值必须**大于**
+ *   客户端阈值才有意义：让服务端先收口并回一个明确的 504（可读错误码），
+ *   而不是让客户端先超时、用户只看到「网络错误」。
+ *
+ * 超时后回 504 `request_timeout`（不是 500）：这是「服务端处理超时」，
+ *   客户端可以据此提示「服务器忙，请重试」。
+ */
+const REQUEST_TIMEOUT_MS = Number(process.env.REQUEST_TIMEOUT_MS) || 25000;
+
+/** 慢请求日志阈值（ms）：超过就打 [SLOW]，用于观察 P95。 */
+const SLOW_REQUEST_MS = Number(process.env.SLOW_REQUEST_MS) || 2000;
+
+/**
+ * 把一个 promise 限制在 ms 内。超时后抛出带 statusCode 的 Error，
+ * 交给统一的 sendError -> httpError 出口（它会照发 body）。
+ */
+function withRequestTimeout(promise, ms, method, pathname) {
+  let timer = null;
+  const timeout = new Promise((_resolve, reject) => {
+    timer = setTimeout(() => {
+      const e = new Error('request timeout');
+      e.statusCode = 504;
+      e.body = {
+        error: 'request_timeout',
+        message: `服务端处理超过 ${Math.round(ms / 1000)}s，请稍后重试`,
+      };
+      reject(e);
+    }, ms);
+    // 不因为这个定时器而阻止进程退出。
+    if (typeof timer.unref === 'function') timer.unref();
+  });
+  return Promise.race([promise, timeout]).finally(() => {
+    // ★ 必须 clearTimeout：否则每个请求都会留下一个 ms 级定时器，
+    //   高 QPS 下会攒出大量句柄，进程迟迟不退出（CI 里表现为「测试挂住」）。
+    if (timer) clearTimeout(timer);
+  });
 }
 
 // 同时导出 createServer 别名，便于不同工厂命名习惯。

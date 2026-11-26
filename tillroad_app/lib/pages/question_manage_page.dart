@@ -139,6 +139,63 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
     });
   }
 
+  /// ★ A2③：全选 / 取消全选。
+  ///
+  /// 把当前列表里所有题的 id 批量加入/移出 [_selected] —— 口径与 [_toggleSelect] 一致。
+  void _toggleSelectAll() {
+    if (_questions.isEmpty) return;
+    setState(() {
+      final bool allSelected =
+          _questions.every((BankQuestion q) => _selected.contains(q.id));
+      if (allSelected) {
+        for (final BankQuestion q in _questions) {
+          _selected.remove(q.id);
+        }
+      } else {
+        for (final BankQuestion q in _questions) {
+          _selected.add(q.id);
+        }
+      }
+    });
+  }
+
+  /// ★ A2③：批量编辑考点标签。
+  ///
+  /// 弹窗里用逗号分隔输入多个标签，提交时 `PATCH /questions/batch/tags`。
+  /// 后端会跳过公共题 / 别人的题并回一个 skipped 计数 ——
+  /// 这里如实告诉用户「其中 N 道没更新」。
+  Future<void> _batchTags() async {
+    if (_selected.isEmpty || _busy || _filter.isDeleted) return;
+    final int count = _selected.length;
+    final List<String>? tags = await _showTagEditor(count);
+    if (tags == null || tags.isEmpty || !mounted) return;
+    setState(() => _busy = true);
+    try {
+      final BatchResult result = await _api.updateQuestionTags(
+        _selected.toList(),
+        tags,
+        mode: 'replace',
+      );
+      if (!mounted) return;
+      final String skippedNote = result.skipped > 0
+          ? '\n其中 ${result.skipped} 道没更新（公共题或别人的题不属于你）。'
+          : '';
+      await _showMessage(
+        '已更新 ${result.updated} 道题的标签',
+        '标签：${tags.join('、')}$skippedNote',
+      );
+      await _load();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      await _showMessage('更新标签失败', e.message);
+    } catch (e) {
+      if (!mounted) return;
+      await _showMessage('更新标签失败', '请求失败：$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
   /// ★ m26090：批量移除（软删自己的题）。
   ///
   /// 后端会跳过公共题 / 别人的题并回一个 skipped 计数 ——
@@ -199,6 +256,15 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
     } finally {
       if (mounted) setState(() => _busy = false);
     }
+  }
+  /// ★ A2③：弹出标签编辑弹窗。
+  ///
+  /// 返回 null = 用户取消；返回空列表 = 用户没填标签（当作取消）。
+  Future<List<String>?> _showTagEditor(int count) {
+    return showCupertinoModalPopup<List<String>>(
+      context: context,
+      builder: (BuildContext ctx) => _TagEditorSheet(count: count),
+    );
   }
 
   /// ★ m26090：单题移除（软删）。
@@ -412,6 +478,11 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
             padding: const EdgeInsets.fromLTRB(16, 10, 16, 2),
             sliver: SliverToBoxAdapter(child: _buildFilterRow()),
           ),
+          if (!_loading && _error == null && _questions.isNotEmpty)
+            SliverPadding(
+              padding: const EdgeInsets.fromLTRB(16, 4, 16, 2),
+              sliver: SliverToBoxAdapter(child: _buildSelectAllRow()),
+            ),
           if (_selected.isNotEmpty)
             SliverPadding(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
@@ -438,10 +509,35 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
     );
   }
 
+  /// 全选 / 取消全选行（需求：表头要有「全选」）。
+  Widget _buildSelectAllRow() {
+    final bool allSelected =
+        _questions.every((BankQuestion q) => _selected.contains(q.id));
+    return Row(
+      children: <Widget>[
+        const Spacer(),
+        CupertinoButton(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+          minimumSize: const Size(0, 28),
+          onPressed: _toggleSelectAll,
+          child: Text(
+            allSelected ? '取消全选' : '全选',
+            style: const TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 13,
+              color: AppColors.accent,
+            ),
+          ),
+        ),
+      ],
+    );
+  }
+
   /// 批量操作条：只在有勾选时出现。
   Widget _buildBatchBar() {
     final bool isDeleted = _filter.isDeleted;
-    final String label = isDeleted ? '批量恢复（${_selected.length}）' : '批量移除（${_selected.length}）';
+    final int count = _selected.length;
+    final String label = isDeleted ? '批量恢复（$count）' : '批量移除（$count）';
     final Color color = isDeleted ? AppColors.accent : AppColors.overdue;
     return Row(
       children: <Widget>[
@@ -462,6 +558,36 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
             ),
           ),
         ),
+        // ★ A2③：批量标签 —— 「已删除」档不显示（给墓碑改标签没意义）。
+        if (!isDeleted) ...<Widget>[
+          const SizedBox(width: 8),
+          CupertinoButton(
+            padding: const EdgeInsets.symmetric(vertical: 10),
+            color: AppColors.accent.withValues(alpha: 0.14),
+            borderRadius: BorderRadius.circular(AppRadii.chip),
+            onPressed: _busy ? null : _batchTags,
+            child: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                const Icon(
+                  CupertinoIcons.tag,
+                  size: 18,
+                  color: AppColors.accent,
+                ),
+                const SizedBox(width: 4),
+                Text(
+                  '批量标签',
+                  style: TextStyle(
+                    fontFamily: kFontFamily,
+                    fontSize: 14,
+                    fontWeight: FontWeight.w600,
+                    color: AppColors.accent,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
         const SizedBox(width: 8),
         CupertinoButton(
           padding: const EdgeInsets.symmetric(vertical: 10),
@@ -641,6 +767,18 @@ class _ManageCard extends StatelessWidget {
                         const _Tag(text: '已移除', color: AppColors.secondaryLabel),
                     ],
                   ),
+                  // ★ A2③：考点标签（批量标签编辑后这里会更新）。
+                  if (question.tags.isNotEmpty) ...<Widget>[
+                    const SizedBox(height: 6),
+                    Wrap(
+                      spacing: 6,
+                      runSpacing: 4,
+                      children: <Widget>[
+                        for (final String tag in question.tags)
+                          _Tag(text: tag, color: AppColors.tertiaryLabel),
+                      ],
+                    ),
+                  ],
                 ],
               ),
             ),
@@ -762,6 +900,125 @@ class _ErrorView extends StatelessWidget {
               ),
             ),
           ],
+        ),
+      ),
+    );
+  }
+}
+
+/// ★ A2③：批量标签编辑弹窗。
+///
+/// 一个输入框，用逗号 / 顿号 / 空格分隔多个标签；
+/// 「保存」时切分、trim、剔空串、去重后回传给调用方。
+class _TagEditorSheet extends StatefulWidget {
+  const _TagEditorSheet({required this.count});
+
+  /// 本次要改多少道题（展示给用户看）。
+  final int count;
+
+  @override
+  State<_TagEditorSheet> createState() => _TagEditorSheetState();
+}
+
+class _TagEditorSheetState extends State<_TagEditorSheet> {
+  final TextEditingController _controller = TextEditingController();
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  /// 把输入切分成标签数组：逗号 / 顿号 / 空格分隔，trim、剔空串、去重。
+  List<String> _parseTags(String raw) {
+    final List<String> parts = raw
+        .split(RegExp(r'[,，、\s]+'))
+        .map((String s) => s.trim())
+        .where((String s) => s.isNotEmpty)
+        .toList();
+    final Set<String> seen = <String>{};
+    return parts.where(seen.add).toList(growable: false);
+  }
+
+  void _submit() {
+    final List<String> tags = _parseTags(_controller.text);
+    if (tags.isEmpty) {
+      Navigator.of(context).pop(<String>[]);
+      return;
+    }
+    Navigator.of(context).pop(tags);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return CupertinoActionSheet(
+      title: Text(
+        '批量编辑考点标签（${widget.count} 道题）',
+        style: const TextStyle(
+          fontFamily: kFontFamily,
+          fontSize: 14,
+          fontWeight: FontWeight.w600,
+        ),
+      ),
+      message: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: <Widget>[
+          const SizedBox(height: 8),
+          const Text(
+            '用逗号分隔多个标签，例如：资料分析,速算',
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 13,
+              color: AppColors.secondaryLabel,
+            ),
+          ),
+          const SizedBox(height: 12),
+          CupertinoTextField(
+            controller: _controller,
+            autofocus: true,
+            placeholder: '例如：资料分析,速算',
+            placeholderStyle: const TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 15,
+              color: AppColors.tertiaryLabel,
+            ),
+            style: const TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 15,
+              color: AppColors.label,
+            ),
+            padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+            decoration: BoxDecoration(
+              color: AppColors.groupedBackground,
+              borderRadius: BorderRadius.circular(AppRadii.chip),
+            ),
+          ),
+        ],
+      ),
+      actions: <Widget>[
+        CupertinoActionSheetAction(
+          isDefaultAction: true,
+          onPressed: _submit,
+          child: const Text(
+            '保存',
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 17,
+              fontWeight: FontWeight.w600,
+              color: AppColors.accent,
+            ),
+          ),
+        ),
+      ],
+      cancelButton: CupertinoActionSheetAction(
+        onPressed: () => Navigator.of(context).pop(<String>[]),
+        child: const Text(
+          '取消',
+          style: TextStyle(
+            fontFamily: kFontFamily,
+            fontSize: 17,
+            color: AppColors.secondaryLabel,
+          ),
         ),
       ),
     );

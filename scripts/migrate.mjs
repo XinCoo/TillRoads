@@ -39,9 +39,11 @@ const UP_MIGRATIONS = [
   'migrations/0003_practice.sql',
   'migrations/0004_question_mastery.sql',
   'migrations/0005_question_hidden.sql',
+  'migrations/0006_exam_custom_defect_questions.sql',
 ];
 // 回滚顺序与建表相反（先回 0003 再回 0002），否则外键依赖会挡住。
 const DOWN_MIGRATIONS = [
+  'migrations/0006_exam_custom_defect_questions_down.sql',
   'migrations/0005_question_hidden_down.sql',
   'migrations/0004_question_mastery_down.sql',
   'migrations/0003_practice_down.sql',

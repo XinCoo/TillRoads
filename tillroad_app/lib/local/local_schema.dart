@@ -29,7 +29,7 @@
 //   · 枚举一律 TEXT，取值与 schema.sql 的 enum 逐字一致。
 
 /// 本地库 schema 版本。改表结构必须 +1 并在 [LocalSchema.onUpgrade] 里加迁移。
-const int kLocalSchemaVersion = 1;
+const int kLocalSchemaVersion = 2;
 
 /// 建表语句：顺序即执行顺序（无外键约束，故顺序只影响可读性）。
 ///
@@ -124,6 +124,9 @@ CREATE TABLE defect_tickets (
   q_type            TEXT,
   error_layer       TEXT,
   error_cause       TEXT,
+  -- v2 新增：自定义错因（C3）。云端 defect_tickets.custom_reason（varchar(60)）。
+  -- 只在错因层级选了「自定义」时才有值；其余情况为 NULL。
+  custom_reason     TEXT,
   priority          TEXT,
   status            TEXT NOT NULL DEFAULT 'DRAFT',
   verification_round INTEGER NOT NULL DEFAULT 1,

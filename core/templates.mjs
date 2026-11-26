@@ -69,6 +69,17 @@ const TEMPLATES = Object.freeze({
     Object.freeze({ name: '实践环节', kind: 'essay' }),
   ]),
 });
+/**
+ * 没有预置科目的 exam_type（m27163 A1② 新增 'custom'）。
+ *
+ * 'custom'（自定义考试）没有官方考点树可套：用户自己定义这是什么考试，
+ * 我们无从得知该有哪些科目。因此建目标时只建 profile，科目由用户手动添加
+ * （这正是 getTemplateSubjects 对未知类型返回 [] 的同一条设计原则）。
+ *
+ * 单独列成常量而不是在测试里硬编码，是为了「例外也是文档」：
+ * 将来再加一个没有模板的类型，只改这一处。
+ */
+export const EXAM_TYPES_WITHOUT_TEMPLATE = Object.freeze(['custom']);
 
 /** 有预置模板的 exam_type 列表（供测试/文档对齐，不含未知类型）。 */
 export const TEMPLATE_EXAM_TYPES = Object.freeze(Object.keys(TEMPLATES));

@@ -29,8 +29,10 @@ import '../config/app_info.dart';
 import '../logging/app_logger.dart';
 import '../logging/log_export.dart';
 import '../theme/app_theme.dart';
+import '../utils/session.dart' show SwitchTokenResult, switchApiToken;
 import '../widgets/diagnose_dialog.dart';
 import '../widgets/log_export_sheet.dart' show kLogExportIcon, kLogExportLabel;
+import '../widgets/toast_overlay.dart';
 import 'api_token_page.dart';
 
 /// Token 在 shared_preferences 里的键名。
@@ -506,7 +508,11 @@ class _SettingsPageState extends State<SettingsPage> {
     );
   }
 
-  /// 切换 Token：弹窗输入 → `saveApiToken` → 刷新本页展示。
+  /// 切换 Token：弹窗输入 → 校验新 token → 落盘 → 清旧账号残留 → 刷新本页展示。
+  ///
+  /// 与「我的」页共用 [switchApiToken]（lib/utils/session.dart），两边行为与文案一致：
+  ///   · 新 token 无效 → 抛错，弹窗明确报错，旧 token 继续有效；
+  ///   · 新 token 有效 → 已切换至 {displayName}。
   Future<void> _changeToken() async {
     final String? token = await showCupertinoDialog<String>(
       context: context,
@@ -514,10 +520,26 @@ class _SettingsPageState extends State<SettingsPage> {
     );
     if (token == null || token.isEmpty || !mounted) return;
 
-    await saveApiToken(token);
-    if (!mounted) return;
-    setState(() => _token = kApiToken);
-    await _info(title: 'Token 已更新', message: '后续请求将使用新的 Token。');
+    try {
+      final SwitchTokenResult result = await switchApiToken(token);
+      if (!mounted) return;
+      setState(() => _token = kApiToken);
+      showAppToast(context, '已切换至 ${result.displayName}');
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      AppLogger.instance.error('TOKEN', '切换 Token 失败：${e.message}（status=${e.statusCode}）');
+      await _info(
+        title: '切换失败',
+        message: '${e.message}\n\n原 Token 仍然有效，本机数据未做任何更改。',
+      );
+    } catch (e) {
+      if (!mounted) return;
+      AppLogger.instance.error('TOKEN', '切换 Token 出错：$e');
+      await _info(
+        title: '切换失败',
+        message: '切换过程出错：$e\n\n原 Token 仍然有效，本机数据未做任何更改。',
+      );
+    }
   }
 
   // ------------------------------------------------------------ 清理实现细节

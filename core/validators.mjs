@@ -31,7 +31,10 @@
 // 冻结常量（与 schema.sql 的 ENUM / CHECK 一一对应）
 // ---------------------------------------------------------------------------
 export const EXAM_TYPES = Object.freeze([
-  'civil_service', 'postgrad', 'final_exam', 'vocational', 'adult_self_study'
+  'civil_service', 'postgrad', 'final_exam', 'vocational', 'adult_self_study',
+  // 'custom' = 自定义考试（m27163 A1②）。DB 侧由 migrations/0006_exam_custom_defect_questions.sql
+  // 的 `ALTER TYPE exam_type ADD VALUE IF NOT EXISTS 'custom'` 加好，本层只负责放行。
+  'custom'
 ]);
 export const SUBJECT_KINDS = Object.freeze(['objective', 'subjective', 'essay']);
 export const FREQ_TAGS = Object.freeze(['high', 'mid', 'low']);
@@ -348,6 +351,73 @@ export function validateBaseVersion(v) {
 }
 
 // ---------------------------------------------------------------------------
+// V13. validateCustomReason(v)
+//   自定义错因（defect_tickets.custom_reason）：列可空 → null/undefined 合法；
+//   非字符串非法；trim 后 ≤30 字（DB 列是 varchar(60)，留一半余量给中文/emoji 计数差异）。
+// ---------------------------------------------------------------------------
+export function validateCustomReason(v) {
+  if (v === undefined || v === null) return OK;
+  if (typeof v !== 'string') {
+    return invalid('INVALID_CUSTOM_REASON', 'custom_reason must be a string');
+  }
+  if (v.trim().length > 30) {
+    return invalid('INVALID_CUSTOM_REASON', '自定义错因不能超过 30 个字');
+  }
+  return OK;
+}
+
+// ---------------------------------------------------------------------------
+// V14. validateExamTypeCustomName(v)
+//   自定义考试名称（exam_profiles.exam_type_custom）：仅 exam_type='custom' 时必填；
+//   非空字符串、trim 后 ≤20 字（DB 列 text，限长在应用层做，给前端稳定提示）。
+// ---------------------------------------------------------------------------
+export function validateExamTypeCustomName(v) {
+  if (typeof v !== 'string') {
+    return invalid('INVALID_EXAM_TYPE_CUSTOM_NAME', 'exam_type_custom must be a string');
+  }
+  const name = v.trim();
+  if (name === '') {
+    return invalid('INVALID_EXAM_TYPE_CUSTOM_NAME', '自定义考试名称不能为空');
+  }
+  if (name.length > 20) {
+    return invalid('INVALID_EXAM_TYPE_CUSTOM_NAME', '自定义考试名称不能超过 20 个字');
+  }
+  return OK;
+}
+
+// ---------------------------------------------------------------------------
+// V15. validateNickname(v)
+//   用户名（users.nickname）：PATCH /me 修改昵称时校验。
+//   规则（用户要求 m28943）：只允许中文、英文、数字的组合，不含空格与符号。
+//     * 汉字：基本区 U+4E00–U+9FA5（覆盖常用规范汉字；扩展区生僻字暂不放行）
+//     * 英文：A–Z a–z
+//     * 数字：0–9
+//   长度 2–20 个字符（按 code point 计，emoji 等已在正则处被拒）。
+//   为什么限制长度：昵称会出现在「我的」页、导出日志头部与将来的分享卡片里，
+//   过长会把布局挤坏；DB 列是 text 无长度约束，所以上限只能在应用层做。
+// ---------------------------------------------------------------------------
+export function validateNickname(v) {
+  if (typeof v !== 'string') {
+    return invalid('INVALID_NICKNAME', 'nickname must be a string');
+  }
+  const name = v.trim();
+  if (name === '') {
+    return invalid('INVALID_NICKNAME', '用户名不能为空');
+  }
+  if (!/^[\u4e00-\u9fa5A-Za-z0-9]+$/.test(name)) {
+    return invalid('INVALID_NICKNAME', '用户名只能包含中文、英文、数字，不能有空格或符号');
+  }
+  const length = Array.from(name).length;
+  if (length < 2) {
+    return invalid('INVALID_NICKNAME', '用户名至少 2 个字符');
+  }
+  if (length > 20) {
+    return invalid('INVALID_NICKNAME', '用户名不能超过 20 个字符');
+  }
+  return OK;
+}
+
+// ---------------------------------------------------------------------------
 // 组合原语（纯函数；本轮只提供，第 3/4 步才接线调用）
 //   create/update 前把多个校验结果串起来，取第一个失败：
 //     const r = firstInvalid(validateExamType(x), validateTargetScore(y), ...);
@@ -374,4 +444,8 @@ export function firstInvalid(...results) {
 //      唯一差异是它用 { ok:false, error:{code,message} } 嵌套形，本文件用扁平形。
 //      因硬约束禁止改 index.mjs 现有导出，此处不强行统一，差异已在交付说明标注，
 //      HTTP 层映射时写 `r.error?.code ?? r.code` 即可兼容两族。
+//   5. V13/V14 是后加的两个「用户自由文本」校验器（自定义错因 / 自定义考试名称）：
+//      它们存在的理由是**用户可复用的自定义值需要长度上限**——自定义错因要能在
+//      错因统计里按字面聚合，必须短且稳定；DB 列虽是 varchar(60)，但把上限放在
+//      应用层（30 / 20）能给出稳定的 400 与前端 i18n 文案，也避免 DB 直接截断报错。
 // ---------------------------------------------------------------------------

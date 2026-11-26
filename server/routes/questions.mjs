@@ -151,6 +151,24 @@ function optionalText(value) {
 }
 
 /**
+ * tags 归一（m27163）：请求里的 tags → 「非空字符串数组 或 null」。
+ *
+ * 单题编辑（PATCH /questions/:id）与批量编辑（PATCH /questions/batch/tags）
+ * 共用这一份语义，避免两处实现漂移（口径不同会让前端踩坑）。
+ *   * null      → null（清空标签）
+ *   * 非数组    → 400 INVALID_TAGS
+ *   * 数组      → 去空白、剔空串；剔完为空 → null（等价于清空）
+ */
+function normalizeTags(value) {
+  if (value === null) return null;
+  if (!Array.isArray(value)) {
+    throw badRequest('INVALID_TAGS', 'tags 必须是字符串数组');
+  }
+  const cleaned = value.map((t) => optionalText(t)).filter((t) => t !== null);
+  return cleaned.length > 0 ? cleaned : null;
+}
+
+/**
  * options 归一：接受 [{key,text}] 或 ['A. xx','B. yy'] 两种前端写法。
  *
  * 统一成 schema 的 [{key,text}] —— 否则同一道题从导入和手动录入进去形状不一，
@@ -237,15 +255,7 @@ function pickQuestionFields(body, { partial = false } = {}) {
   }
 
   if (has('tags')) {
-    const tags = body.tags;
-    if (tags === null) {
-      out.tags = null;
-    } else if (!Array.isArray(tags)) {
-      throw badRequest('INVALID_TAGS', 'tags 必须是字符串数组');
-    } else {
-      const cleaned = tags.map((t) => optionalText(t)).filter((t) => t !== null);
-      out.tags = cleaned.length > 0 ? cleaned : null;
-    }
+    out.tags = normalizeTags(body.tags);
   }
 
   if (has('is_subjective')) {
@@ -550,6 +560,46 @@ async function restoreQuestionsBatch(ctx) {
 }
 
 /**
+ * PATCH /questions/batch/tags —— 批量编辑标签（m27163）。
+ *
+ * body: { "ids": ["uuid", ...], "tags": ["考点A","考点B"], "mode": "replace" | "add" }
+ *   * mode 缺省 replace（整组覆盖）；add = 与现有标签求并集。
+ *   * tags 空数组在 replace 下合法（= 清空标签）；在 add 下无意义 → 400 INVALID_TAGS。
+ *
+ * 只改自己的题（owner_user_id = $2）：公共题与别人的题被静默跳过，
+ * 体现在响应里的 skipped 计数（与 deleteQuestionsBatch 同口径）。
+ */
+async function updateQuestionsTagsBatch(ctx) {
+  if (!ctx.authUserId) {
+    return fail('unauthorized', 401, { message: '批量编辑标签需要有效的 Bearer Token' });
+  }
+  const body = ctx.body ?? {};
+  const ids = Array.isArray(body.ids)
+    ? body.ids.map((v) => optionalId(v)).filter((v) => v !== null)
+    : [];
+  if (ids.length === 0) {
+    return fail('EMPTY_IDS', 400, { message: 'ids 不能为空' });
+  }
+  const mode = body.mode === undefined || body.mode === null ? 'replace' : body.mode;
+  if (mode !== 'replace' && mode !== 'add') {
+    return fail('INVALID_TAGS_MODE', 400, { message: "mode 只能是 'replace' 或 'add'" });
+  }
+  if (!Array.isArray(body.tags)) {
+    return fail('INVALID_TAGS', 400, { message: 'tags 必须是字符串数组' });
+  }
+  // 与单题编辑共用同一份归一语义（normalizeTags）
+  const tags = normalizeTags(body.tags);
+  if (mode === 'add' && (tags === null || tags.length === 0)) {
+    return fail('INVALID_TAGS', 400, { message: "mode='add' 时 tags 不能为空" });
+  }
+  const updated = await withTransaction(ctx.pool, (client) =>
+    qRepo.updateTagsBatch(client, ids, tags ?? [], mode, ctx.authUserId),
+  );
+  return ok({ updated, requested: ids.length, skipped: ids.length - updated });
+}
+
+
+/**
  * GET /questions/deleted —— 列某用户已软删的题（m26090 题库管理页「已删除」筛选）。
  *
  * 只列自己的题（公共题永远不会被软删）。
@@ -611,6 +661,13 @@ export async function match(method, seg, ctx) {
   //     PG 报 22P02 → 在 httpError 里被吞成 500 internal（极难查）。
   if (method === 'PATCH' && seg.length === 3 && seg[0] === 'questions' && seg[1] === 'batch' && seg[2] === 'restore') {
     return restoreQuestionsBatch(ctx);
+  }
+  //   PATCH /questions/batch/tags —— 批量编辑标签（m27163）
+  //   ★ 必须排在 PATCH /questions/:id/... 系列**之前**：
+  //     /questions/batch/tags 的 seg = ['questions','batch','tags']，
+  //     若被 :id 分支抢走就会拿 'batch' 当 uuid 查，PG 报 22P02 → 被 httpError 吞成 500。
+  if (method === 'PATCH' && seg.length === 3 && seg[0] === 'questions' && seg[1] === 'batch' && seg[2] === 'tags') {
+    return updateQuestionsTagsBatch(ctx);
   }
   //   PATCH /questions/:id/restore —— 恢复软删的题
   if (method === 'PATCH' && seg.length === 3 && seg[0] === 'questions' && seg[2] === 'restore') {

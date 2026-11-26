@@ -138,6 +138,7 @@ class DefectTicket {
     required this.qType,
     required this.errorLayer,
     required this.errorCause,
+    this.customReason = '',
     required this.priority,
     required this.status,
     required this.verificationRound,
@@ -164,6 +165,10 @@ class DefectTicket {
 
   /// 归因说明。**禁止出现「粗心/马虎/没掌握/我懂了/大意/差不多/忘了」**
   final String errorCause;
+
+  /// 自定义错因（C3）：只有错因层级选了「自定义」时才有值。
+  /// 对应云端 `defect_tickets.custom_reason`。
+  final String customReason;
 
   final DefectPriority priority;
   final DefectStatus status;

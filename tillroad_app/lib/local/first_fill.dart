@@ -307,6 +307,8 @@ abstract final class LocalCache {
       'q_type': text(json['q_type']),
       'error_layer': text(json['error_layer']),
       'error_cause': text(json['error_cause']),
+      // C3：自定义错因（云端 custom_reason）。
+      'custom_reason': text(json['custom_reason']),
       'priority': text(json['priority']),
       'status': text(json['status']) ?? 'DRAFT',
       'verification_round': asInt(json['verification_round'], 1),

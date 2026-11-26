@@ -11,10 +11,13 @@
 // 「该单已被修改，请刷新后重试」并提供刷新入口 —— 这里用顶部条的「刷新」动作，
 // 点它会重新拉详情并把表单回填成服务端最新值。
 
+import 'dart:async';
+
 import 'package:flutter/cupertino.dart';
 
 import '../../api/api_client.dart';
 import '../../api/defect_api.dart';
+import '../../config/api_config.dart';
 import '../../logging/app_logger.dart';
 // 只取写队列相关符号：`local.dart` 也导出 `findForbiddenPhrases`，与 defect_api 冲突。
 import '../../local/local.dart'
@@ -47,6 +50,12 @@ class _DefectAnalyzePageState extends State<DefectAnalyzePage> {
       TextEditingController(text: _initialCause);
   String? _errorLayer;
 
+  /// 自定义错因文本（选「自定义」层级时填写，≤30 字）。
+  final TextEditingController _customReason = TextEditingController();
+
+  /// 历史自定义错因（可复用），最近 5 条。
+  List<String> _customReasons = const <String>[];
+
   final Map<String, String> _errors = <String, String>{};
   String? _bannerError;
 
@@ -77,13 +86,68 @@ class _DefectAnalyzePageState extends State<DefectAnalyzePage> {
       // （UI 只有六选项），因此不预选，由用户重新确认一次。已在 hint 说明。
       _errorLayer = null;
     }
+    // 后端还可能存着历史自定义错因（custom_reason）：回填时选中「自定义」
+    // 并把文本填回输入框。
+    unawaited(_loadCustomReason());
+    unawaited(_loadCustomReasons());
   }
+
 
   @override
   void dispose() {
     _errorCause.dispose();
+    _customReason.dispose();
     _api.close();
     super.dispose();
+  }
+  // ── 自定义错因（任务 C3）─────────────────────────────────────────────
+
+  /// 拉本单的历史自定义错因（后端 `custom_reason`），回填到输入框。
+  Future<void> _loadCustomReason() async {
+    if (kUseMock) return;
+    try {
+      final String? reason = await _api.fetchTicketCustomReason(widget.ticket.id);
+      if (!mounted) return;
+      if (reason == null || reason.isEmpty) return;
+      setState(() {
+        _customReason.text = reason;
+        // 选了「自定义」就把层级也切过去，否则文本无处安放。
+        // 但如果用户已经自己选过层级，就不要覆盖他的选择。
+        if (_errorLayer == null) {
+          _errorLayer = kCustomErrorLayerValue;
+        }
+      });
+    } on ApiException catch (e) {
+      debugPrint('[analyze] 历史自定义错因读取失败：${e.message}');
+    }
+  }
+
+  /// 拉可复用的历史自定义错因（最近 5 条）。
+  Future<void> _loadCustomReasons() async {
+    if (kUseMock) return;
+    try {
+      final List<String> reasons = await _api.fetchCustomReasons();
+      if (!mounted) return;
+      setState(() => _customReasons = reasons.take(5).toList(growable: false));
+    } on ApiException catch (e) {
+      debugPrint('[analyze] 历史自定义错因列表读取失败：${e.message}');
+    }
+  }
+
+  /// 提交时真正发给后端的 `error_layer`。
+  ///
+  /// 「自定义」只是前端哨兵值，不作为 error_layer 提交：选它时仍传一个六层
+  /// 枚举里的默认层（识别），用户写的文本走新字段 `custom_reason`。
+  String get _submitErrorLayer {
+    if (_errorLayer == kCustomErrorLayerValue) return kPracticeDefaultErrorLayer;
+    return _errorLayer ?? kPracticeDefaultErrorLayer;
+  }
+
+  /// 提交时真正发给后端的 `custom_reason`（空则不带该字段）。
+  String? get _submitCustomReason {
+    if (_errorLayer != kCustomErrorLayerValue) return null;
+    final String text = _customReason.text.trim();
+    return text.isEmpty ? null : text;
   }
 
   bool _validate() {
@@ -99,6 +163,15 @@ class _DefectAnalyzePageState extends State<DefectAnalyzePage> {
       if (hits.isNotEmpty) {
         errors['errorCause'] =
             '请写出具体哪一步算错或记错，不要写「${hits.first}」这类词';
+      }
+    }
+    // 自定义错因：选「自定义」时必填且 ≤30 字（后端 400 INVALID_CUSTOM_REASON）。
+    if (_errorLayer == kCustomErrorLayerValue) {
+      final String custom = _customReason.text.trim();
+      if (custom.isEmpty) {
+        errors['customReason'] = '请填写自定义错因';
+      } else if (custom.length > 30) {
+        errors['customReason'] = '自定义错因最多 30 字（当前 ${custom.length} 字）';
       }
     }
     setState(() {
@@ -149,6 +222,12 @@ class _DefectAnalyzePageState extends State<DefectAnalyzePage> {
       });
       return;
     }
+    if (code == 'INVALID_CUSTOM_REASON') {
+      setState(() {
+        _errors['customReason'] = '自定义错因不合法（最多 30 字）';
+      });
+      return;
+    }
 
     setState(() {
       _bannerError = e.isNetworkError
@@ -176,6 +255,8 @@ class _DefectAnalyzePageState extends State<DefectAnalyzePage> {
             ? ''
             : fresh.errorCause;
       });
+      // 自定义错因也回填（后端 custom_reason）。
+      unawaited(_loadCustomReason());
     } on ApiException catch (e) {
       if (!mounted) return;
       setState(() {
@@ -197,8 +278,10 @@ class _DefectAnalyzePageState extends State<DefectAnalyzePage> {
         // 本地优先（R4a）：写本地库 + 入队。REOPENED 时会自动 round+1。
         final WriteQueueResult queued = await WriteQueue.enqueueAnalyze(
           ticketId: widget.ticket.id,
-          errorLayer: _errorLayer!,
+          errorLayer: _submitErrorLayer,
           errorCause: _errorCause.text.trim(),
+          // C3：自定义错因必须随入队 payload 一起上行，否则云端拿不到。
+          customReason: _submitCustomReason,
           baseVersion: _version,
         );
         AppLogger.instance.info(
@@ -216,7 +299,8 @@ class _DefectAnalyzePageState extends State<DefectAnalyzePage> {
 
       await _api.analyzeDefectTicket(
         widget.ticket.id,
-        errorLayer: _errorLayer!,
+        errorLayer: _submitErrorLayer,
+        customReason: _submitCustomReason,
         errorCause: _errorCause.text.trim(),
         version: _version,
         reopened: _isReopened,
@@ -320,6 +404,89 @@ class _DefectAnalyzePageState extends State<DefectAnalyzePage> {
             }),
           ),
         ),
+
+        // 选了「自定义」才出现自定义错因输入框。
+        //
+        // 提交约定：`error_layer` 仍然只传六层枚举里的一个值（默认「识别」），
+        // 用户写的这段文本走新字段 `custom_reason`；「自定义」两个字只是前端
+        // 的哨兵值，永远不作为 error_layer 提交。
+        if (_errorLayer == kCustomErrorLayerValue)
+          FormFieldGroup(
+            label: '自定义错因',
+            required: true,
+            error: _errors['customReason'],
+            hint: '最多 30 字。提交时错因层级仍记为「$kPracticeDefaultErrorLayer」，这段文本单独保存。',
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                FormTextField(
+                  controller: _customReason,
+                  placeholder: '如：计算失误（两位数乘法口诀不熟）',
+                  hasError: _errors.containsKey('customReason'),
+                  onChanged: (_) {
+                    if (_errors.containsKey('customReason')) {
+                      setState(() => _errors.remove('customReason'));
+                    }
+                  },
+                ),
+                if (_customReasons.isNotEmpty) ...<Widget>[
+                  const SizedBox(height: 8),
+                  const Text(
+                    '最近用过',
+                    style: TextStyle(
+                      fontFamily: kFontFamily,
+                      fontSize: 12,
+                      color: AppColors.secondaryLabel,
+                    ),
+                  ),
+                  const SizedBox(height: 6),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    children: _customReasons
+                        .map(
+                          (String reason) => GestureDetector(
+                            onTap: () => setState(() {
+                              _customReason.text = reason;
+                              _errors.remove('customReason');
+                            }),
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 6,
+                              ),
+                              decoration: BoxDecoration(
+                                color: AppColors.accent.withValues(alpha: 0.10),
+                                borderRadius: BorderRadius.circular(AppRadii.chip),
+                              ),
+                              child: Text(
+                                reason,
+                                style: const TextStyle(
+                                  fontFamily: kFontFamily,
+                                  fontSize: 13,
+                                  color: AppColors.accent,
+                                ),
+                              ),
+                            ),
+                          ),
+                        )
+                        .toList(growable: false),
+                  ),
+                ],
+                if (_customReason.text.trim().isNotEmpty) ...<Widget>[
+                  const SizedBox(height: 8),
+                  Text(
+                    '自定义错因：${_customReason.text.trim()}',
+                    style: const TextStyle(
+                      fontFamily: kFontFamily,
+                      fontSize: 12,
+                      color: AppColors.secondaryLabel,
+                    ),
+                  ),
+                ],
+              ],
+            ),
+          ),
 
         FormFieldGroup(
           label: '具体错因',

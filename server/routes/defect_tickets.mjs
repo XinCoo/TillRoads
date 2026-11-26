@@ -21,7 +21,8 @@ import { withTransaction } from '../repositories/base.mjs';
 import * as dtRepo from '../repositories/defect_tickets.mjs';
 import * as actionRepo from '../repositories/actions.mjs';
 import * as verRepo from '../repositories/verifications.mjs';
-import { ok, fail, pagination, readBaseVersion } from './_http.mjs';
+import { ok, fail, pagination, readBaseVersion, assertValid } from './_http.mjs';
+import { validateCustomReason } from '../../core/validators.mjs';
 
 const now = () => new Date().toISOString();
 
@@ -46,6 +47,18 @@ function toHttpError(e) {
     return out;
   }
   return e;
+}
+
+/**
+ * ★ m27163：自定义错因入库前的归一。
+ *   * undefined / null → null（不写）
+ *   * 字符串 → trim；空串 → null（= 清除自定义错因）
+ * 非字符串已在 validateCustomReason 里被判 400（INVALID_CUSTOM_REASON）。
+ */
+function normalizeCustomReason(value) {
+  if (value === undefined || value === null) return null;
+  const s = String(value).trim();
+  return s === '' ? null : s;
 }
 
 /**
@@ -83,6 +96,10 @@ async function createTicket(ctx) {
   const { body } = ctx;
   const { repos, run } = resolve(ctx);
   const wantDraft = body.status === 'DRAFT' || body.draft === true;
+  // ★ m27163：自定义错因校验（非字符串 / 超 30 字 → 400 INVALID_CUSTOM_REASON）
+  if (Object.prototype.hasOwnProperty.call(body, 'custom_reason')) {
+    assertValid(validateCustomReason(body.custom_reason));
+  }
 
   try {
     // 带完整归因直接建 ANALYZED 时，仓储内会走 C.assertAnalyzable 前置校验；
@@ -104,6 +121,8 @@ async function createTicket(ctx) {
       loss: body.loss,
       closability: body.closability,
       targetContribution: body.targetContribution,
+      // ★ m27163：自定义错因（可复用短标签，如「计算失误」）；应用层限长 30 字。
+      custom_reason: normalizeCustomReason(body.custom_reason),
       status: wantDraft ? 'DRAFT' : 'ANALYZED',
     };
     const ticket = await run((client) => repos.defectTickets.create(client, input));
@@ -222,11 +241,19 @@ async function patchTicket(ctx, id) {
   const baseVersion = readBaseVersion(ctx.body);
   const { repos, run } = resolve(ctx);
   const { body } = ctx;
+  // ★ m27163：自定义错因校验（非字符串 / 超 30 字 → 400 INVALID_CUSTOM_REASON）
+  if (Object.prototype.hasOwnProperty.call(body, 'custom_reason')) {
+    assertValid(validateCustomReason(body.custom_reason));
+  }
   // 通用 PATCH 只改非状态字段；status 变更必须走上面的专用方法（仓储层已拒绝）。
   const patch = {};
   for (const k of ['priority', 'q_type', 'error_layer', 'error_cause', 'knowledge_node_id',
-    'question_id', 'exam_profile_id', 'user_id', 'actions', 'reopen_reason', 'verification_state']) {
-    if (Object.prototype.hasOwnProperty.call(body, k)) patch[k] = body[k];
+    'question_id', 'exam_profile_id', 'user_id', 'actions', 'reopen_reason', 'verification_state',
+    // ★ m27163：自定义错因可改（空串 = 清除）
+    'custom_reason']) {
+    if (Object.prototype.hasOwnProperty.call(body, k)) {
+      patch[k] = k === 'custom_reason' ? normalizeCustomReason(body[k]) : body[k];
+    }
   }
   // T5：q_type / 归因因子变化则重算 priority（未显式传 priority 时）。
   if (!Object.prototype.hasOwnProperty.call(patch, 'priority') &&
@@ -266,7 +293,19 @@ async function getTicket(ctx, id) {
       read((c) => repos.verifications.listByDefect(c, id)),
       read((c) => repos.actions.listByDefect(c, id)),
     ]);
-    return ok({ ...ticket, verifications, actions });
+    // ★ m27163：详情里回带关联题目（一对多），只给前端够用的展示字段。
+    //   注入 fake repos 的单测里该函数可能不存在 → 跳过（questions 置空数组）。
+    const linkReader = typeof repos.defectTickets.listQuestionLinksWithQuestions === 'function'
+      ? repos.defectTickets.listQuestionLinksWithQuestions
+      : (ctx.repos ? null : dtRepo.listQuestionLinksWithQuestions);
+    const linkRows = linkReader ? await read((c) => linkReader(c, id)) : [];
+    const questions = (linkRows || []).map((r) => ({
+      question_id: r.question_id,
+      sort: r.sort,
+      stem: r.stem ?? null,
+      type: r.type ?? null,
+    }));
+    return ok({ ...ticket, verifications, actions, questions });
   } catch (e) {
     throw toHttpError(e);
   }

@@ -79,9 +79,25 @@ class LocalDb {
           await batch.commit(noResult: true);
         },
         onUpgrade: (Database db, int from, int to) async {
-          // R1 只有 version 1，不存在升级路径。
-          // 将来加迁移时：按 from→to 逐版本执行，**不要**写 `DROP TABLE` 重建
-          // （本地库里有尚未推送的写操作，重建会丢队列）。
+          // v1 → v2：defect_tickets 新增 custom_reason 列（C3 自定义错因）。
+          //
+          // 刻意**不**重建表：本地库里有尚未推送的写操作，重建会把队列丢掉。
+          // 加列是幂等的（IF NOT EXISTS 语义），重复执行也安全。
+          if (from < 2) {
+            // 先查列是否已存在：ALTER TABLE ADD COLUMN 不幂等，
+            // 重复执行会报「duplicate column name」。
+            final List<Map<String, Object?>> cols = await db.rawQuery(
+              "PRAGMA table_info(defect_tickets)",
+            );
+            final bool hasCustomReason = cols.any(
+              (Map<String, Object?> c) => c['name'] == 'custom_reason',
+            );
+            if (!hasCustomReason) {
+              await db.execute(
+                'ALTER TABLE defect_tickets ADD COLUMN custom_reason TEXT',
+              );
+            }
+          }
           assert(from < to, 'onUpgrade 只在版本上升时触发');
         },
       ),

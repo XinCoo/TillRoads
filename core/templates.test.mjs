@@ -9,23 +9,33 @@ import {
   hasTemplate,
   TEMPLATE_VERSION,
   TEMPLATE_EXAM_TYPES,
+  EXAM_TYPES_WITHOUT_TEMPLATE,
 } from './templates.mjs';
 import { EXAM_TYPES, SUBJECT_KINDS } from './validators.mjs';
 
 const VALID_KINDS = new Set(SUBJECT_KINDS);
 
-test('T0 常量对齐：模板覆盖全部 5 个 exam_type，kind 全落在 subject_kind 枚举内', () => {
-  // 模板覆盖度：EXAM_TYPES 与 TEMPLATE_EXAM_TYPES 必须集合相等。
+test('T0 常量对齐：模板覆盖全部有模板的 exam_type，kind 全落在 subject_kind 枚举内', () => {
+  // 模板覆盖度：EXAM_TYPES 里**除了显式豁免的类型**以外，必须都有预置模板。
   // 若将来 schema 新增 exam_type 而模板没补，这条会红 —— 正是我们要的提醒，
   // 因为 getTemplateSubjects 对未知类型返回 []（不抛错），没有这条断言就没人发现漏补。
-  assert.equal(TEMPLATE_EXAM_TYPES.length, EXAM_TYPES.length);
-  for (const t of EXAM_TYPES) {
+  //
+  // m27163 A1② 起 'custom'（自定义考试）是**显式豁免**：没有官方科目树，
+  // 科目由用户自己加，所以它允许「有类型但无模板」。
+  const withTemplate = EXAM_TYPES.filter((t) => !EXAM_TYPES_WITHOUT_TEMPLATE.includes(t));
+  assert.equal(TEMPLATE_EXAM_TYPES.length, withTemplate.length);
+  for (const t of withTemplate) {
     assert.ok(hasTemplate(t), `exam_type ${t} 缺少预置模板`);
     assert.ok(TEMPLATE_EXAM_TYPES.includes(t), `TEMPLATE_EXAM_TYPES 缺少 ${t}`);
   }
+  // 豁免类型：不得有模板（否则会默默套上一个不相关的科目表）。
+  for (const t of EXAM_TYPES_WITHOUT_TEMPLATE) {
+    assert.ok(EXAM_TYPES.includes(t), `豁免类型 ${t} 不在 EXAM_TYPES 里`);
+    assert.equal(hasTemplate(t), false, `豁免类型 ${t} 不应配有预置模板`);
+  }
 
   // 每个模板的每个科目：name 非空字符串、kind ∈ subject_kind ENUM。
-  for (const t of EXAM_TYPES) {
+  for (const t of withTemplate) {
     const list = getTemplateSubjects(t);
     assert.ok(Array.isArray(list), `${t} 应返回数组`);
     assert.ok(list.length > 0, `${t} 的模板不应为空（空模板请用 hasTemplate=false 表达）`);
@@ -39,7 +49,6 @@ test('T0 常量对齐：模板覆盖全部 5 个 exam_type，kind 全落在 subj
   assert.equal(typeof TEMPLATE_VERSION, 'string');
   assert.ok(TEMPLATE_VERSION.length > 0);
 });
-
 test('T1 getTemplateSubjects 五个 exam_type 各自返回预期科目', () => {
   assert.deepEqual(
     getTemplateSubjects('civil_service').map((s) => s.name),
