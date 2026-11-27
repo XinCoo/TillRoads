@@ -54,6 +54,33 @@ Future<Map<String, Object?>?> loadActiveExamProfile(String userId) async {
   return _profileToWire(rows.first);
 }
 
+/// T1b：取**全部**考试目标（首页卡片堆叠用，m29656 任务 B）。
+///
+/// 与 [loadActiveExamProfile] 的差别：那个只返回「一张」（首页原本只显示倒计时），
+/// 这个返回列表，让首页能堆叠展示多个考试目标并左右滑动切换。
+///
+/// 排序规则与单条版保持一致：active 优先、其余按新建时间倒序。
+/// 不用 `ORDER BY status`（`status` 是文本，'archived' < 'active' 会让
+/// archived 排前面）—— 在 Dart 里按 active 分组更直白。
+Future<List<Map<String, Object?>>> loadExamProfiles(String userId) async {
+  final Database db = await LocalDb.instance.database;
+  final List<Map<String, Object?>> rows = await db.query(
+    'exam_profiles',
+    where: '${Col.userId} = ?',
+    whereArgs: <Object?>[userId],
+    orderBy: 'created_at DESC, local_id DESC',
+  );
+  if (rows.isEmpty) return const <Map<String, Object?>>[];
+  final List<Map<String, Object?>> active = <Map<String, Object?>>[];
+  final List<Map<String, Object?>> others = <Map<String, Object?>>[];
+  for (final Map<String, Object?> row in rows) {
+    (text(row['status']) == 'active' ? active : others).add(
+      _profileToWire(row),
+    );
+  }
+  return <Map<String, Object?>>[...active, ...others];
+}
+
 /// 把本地行翻成页面期望的 JSON 形状（`target_label` / `exam_date`），
 /// 这样 `home_page` 不必区分「数据来自本地」还是「来自云端」。
 Map<String, Object?> _profileToWire(Map<String, Object?> row) => <String, Object?>{
@@ -62,6 +89,13 @@ Map<String, Object?> _profileToWire(Map<String, Object?> row) => <String, Object
       'exam_date': row['exam_date'],
       'target_score': row['target_score'],
       'status': row['status'],
+      // m29656：长按编辑要回填表单，下面几列本地表里有但原来没映射。
+      // `exam_type_custom` 不在本地表里（local_schema 没这列），所以仍拿不到；
+      // 编辑页只在「用户真的改了这一项」时才会把这个键写回去。
+      'exam_type': row['exam_type'],
+      'daily_minutes': row['daily_minutes'],
+      'source_scope': row['source_scope'],
+      'version': row['version'],
     };
 
 /// T2：取某个考试目标下的第一个科目（建单页需要）。

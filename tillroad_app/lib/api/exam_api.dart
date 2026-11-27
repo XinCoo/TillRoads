@@ -120,6 +120,50 @@ class ExamApi {
     return raw.cast<String, Object?>();
   }
 
+  /// 编辑考试目标：`PATCH /exam-profiles/:id`（m29656 任务 B5 长按编辑）。
+  ///
+  /// 与 [createExamProfile] 的三个差别：
+  ///   1. `PATCH` 走**部分更新**（后端 `pickProfileFields(body, {partial:true})`），
+  ///      只传用户真正改过的键；没传的键保持原值——所以这里每个参数都可空；
+  ///   2. 必须带 `version`（后端 `readBaseVersion` 强制要求正整数），否则 400；
+  ///   3. 不带 `user_id`（后端按 token 认人，改别人的目标一律 404）。
+  ///
+  /// [targetScore] / [dailyMinutes] 传 null 表示「不改」，不是「清空」——
+  /// 清空需要后端单独支持（当前 MVP 不需要，故意不做）。
+  ///
+  /// 失败时抛 [ApiException]：409 → `body.error == 'conflict'`（别的端已改）；
+  /// 404 → 目标不存在或不属于当前用户。
+  Future<Map<String, Object?>> updateExamProfile(
+    String id, {
+    required int version,
+    String? examType,
+    String? examTypeCustom,
+    String? targetLabel,
+    String? examDate,
+    double? targetScore,
+    int? dailyMinutes,
+    String? sourceScope,
+  }) async {
+    final String scope = sourceScope?.trim() ?? '';
+    final String custom = examTypeCustom?.trim() ?? '';
+    final Map<String, Object?> body = <String, Object?>{
+      'version': version,
+      if (examType != null) 'exam_type': examType,
+      if (custom.isNotEmpty) 'exam_type_custom': custom,
+      if (targetLabel != null) 'target_label': targetLabel,
+      if (examDate != null) 'exam_date': examDate,
+      if (targetScore != null) 'target_score': targetScore,
+      if (dailyMinutes != null) 'daily_minutes': dailyMinutes,
+      if (scope.isNotEmpty) 'source_scope': <String, Object?>{'raw': scope},
+    };
+    final Object? raw = await _client.patch(
+      '/exam-profiles/${Uri.encodeComponent(id)}',
+      body: body,
+    );
+    if (raw is! Map) throw ApiException('更新响应不是 JSON 对象', body: raw);
+    return raw.cast<String, Object?>();
+  }
+
   /// 删除考试目标：`DELETE /exam-profiles/:id`，body 带 `version`（乐观锁）。
   ///
   /// 调用方必须先从列表项里拿到该目标的 `version`，取不到就不要调

@@ -8,11 +8,13 @@
 //   * 公共题不属于任何用户，所以**不能软删**，只能「只对我隐藏」。
 //   * 软删是墓碑不是坟墓 —— 管理页的「已删除」筛选可以批量恢复。
 //
-// ── 四个筛选 ────────────────────────────────────────────────────────────
-//   全部 / 已掌握 / 未掌握 / 已删除。
+// ── 五个筛选 ────────────────────────────────────────────────────────────
+//   全部 / 已掌握 / 未掌握 / 已删除 / 已隐藏。
 //   「已掌握 / 未掌握」复用 R2 的 mastered 过滤（后端 EXISTS 子查询）；
 //   「已删除」走独立的 `GET /questions/deleted`（只列自己的题）。
-//
+//   「已隐藏」**完全走本地快照**（lib/local/hidden_questions_store.dart）：
+//   后端没有「列出已隐藏题」的端点，且 `GET /questions` 默认排除已隐藏的题，
+//   所以这一档只能读本机记录 —— 跨设备看不到，这是已知限制，不是 bug。
 // ── 批量操作的诚实口径 ──────────────────────────────────────────────────
 // 后端批量软删时会把「公共题 / 别人的题」静默跳过（SQL 的 owner_user_id
 // 条件），并回一个 skipped 计数。前端**必须**把这个数字告诉用户 ——
@@ -23,16 +25,21 @@ import 'package:flutter/cupertino.dart';
 import '../api/api_client.dart' show ApiException;
 import '../api/question_api.dart';
 import '../config/api_config.dart';
+import '../local/hidden_questions_store.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart' show EmptyState;
 import 'question_bank_page.dart';
-
-/// 四个筛选档。
+import 'question_edit_page.dart';
+/// 五个筛选档。
+///
+/// [hidden] 与其它四个档有一点本质不同：它**没有网络请求**，
+/// 数据源是本机快照 `HiddenQuestionStore`（原因见文件头注释）。
 enum _ManageFilter {
   all('全部'),
   mastered('已掌握'),
   unmastered('未掌握'),
-  deleted('已删除');
+  deleted('已删除'),
+  hidden('已隐藏');
 
   const _ManageFilter(this.label);
 
@@ -40,6 +47,9 @@ enum _ManageFilter {
 
   /// 「已删除」是独立端点，不走 mastered 参数。
   bool get isDeleted => this == _ManageFilter.deleted;
+
+  /// 「已隐藏」只读本地快照，不走网络。
+  bool get isHidden => this == _ManageFilter.hidden;
 
   /// 传给后端的 mastered 参数（null = 不筛选）。
   bool? get masteredParam {
@@ -50,6 +60,8 @@ enum _ManageFilter {
         return false;
       case _ManageFilter.all:
       case _ManageFilter.deleted:
+      // 「已隐藏」不发请求，但 switch 是穷举的，必须给一个返回值。
+      case _ManageFilter.hidden:
         return null;
     }
   }
@@ -65,6 +77,8 @@ class QuestionManagePage extends StatefulWidget {
 class _QuestionManagePageState extends State<QuestionManagePage> {
   final QuestionApi _api = QuestionApi();
 
+  /// 「已隐藏」档的数据源（本机快照，见 lib/local/hidden_questions_store.dart）。
+  final HiddenQuestionStore _store = const HiddenQuestionStore();
   _ManageFilter _filter = _ManageFilter.all;
 
   /// 当前列表（按筛选取回来的题）。
@@ -95,6 +109,30 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
       _error = null;
       _selected.clear();
     });
+    // ★ 「已隐藏」没有网络数据源：后端没有 list-hidden 端点，且
+    // `GET /questions` 默认排除已隐藏的题。只能读本机快照。
+    if (_filter.isHidden) {
+      final List<HiddenQuestion> hidden = await _store.load(kDemoUserId);
+      if (!mounted) return;
+      setState(() {
+        _questions = hidden
+            .map(
+              (HiddenQuestion h) => BankQuestion(
+                id: h.id,
+                stem: h.stem,
+                type: h.type,
+                source: h.source,
+                // 隐藏只对公共题开放（自己的题给的是「编辑 / 删除」），
+                // 所以快照里的题一律按公共题展示。
+                isMine: false,
+              ),
+            )
+            .toList(growable: false);
+        _loading = false;
+      });
+      return;
+    }
+
     try {
       final List<BankQuestion> list = _filter.isDeleted
           ? await _api.fetchDeletedQuestions(limit: 100, currentUserId: kDemoUserId)
@@ -103,7 +141,6 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
               mastered: _filter.masteredParam,
               currentUserId: kDemoUserId,
             );
-      if (!mounted) return;
       setState(() {
         _questions = list;
         _loading = false;
@@ -336,6 +373,240 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
     }
   }
 
+  /// 打开一道题的编辑页（只对自己的题开放）。
+  ///
+  /// 列表口径的 [BankQuestion] 不带 answer / analysis / version，
+  /// 所以先拉一次详情（`GET /questions/:id`）再进编辑页 ——
+  /// 与 `question_bank_page.dart` 的 `_openEdit` 保持同一个做法。
+  Future<void> _openEdit(BankQuestion question) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      final QuestionDetail detail = await _api.fetchQuestion(question.id);
+      if (!mounted) return;
+      final bool? changed = await Navigator.of(context).push<bool>(
+        appRoute<bool>(context, QuestionEditPage(existing: detail)),
+      );
+      if (changed == true) await _load();
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      await _showMessage('打不开这道题', e.message);
+    } catch (e) {
+      if (!mounted) return;
+      await _showMessage('打不开这道题', '加载详情失败：$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// ★ 隐藏一道公共题：`PATCH /questions/:id/hide {hidden:true}`。
+  ///
+  /// 成功后做两件事：
+  ///   1. 写一条本机快照（后端不提供「已隐藏」列表，只能自己记）；
+  ///   2. 从当前列表里移除这道题 —— 因为服务端已经会排除它，
+  ///      如果不移除，用户会看到「提示说隐藏了、题还在列表里」的怪异观感。
+  Future<void> _hideOne(BankQuestion question) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      await _api.setHidden(id: question.id, hidden: true);
+      await _store.add(
+        kDemoUserId,
+        HiddenQuestion(
+          id: question.id,
+          stem: question.stem,
+          type: question.type,
+          source: question.source,
+          hiddenAt: DateTime.now().toIso8601String(),
+        ),
+      );
+      if (!mounted) return;
+      setState(() {
+        _questions = _questions
+            .where((BankQuestion q) => q.id != question.id)
+            .toList(growable: false);
+      });
+      await _showMessage(
+        '已隐藏',
+        '这道题不会再出现在你的题库列表里；模考仍可能抽到它。',
+      );
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      await _showMessage('隐藏失败', e.message);
+    } catch (e) {
+      if (!mounted) return;
+      await _showMessage('隐藏失败', '请求失败：$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// ★ 取消隐藏：`PATCH /questions/:id/hide {hidden:false}`。
+  ///
+  /// 后端不校验当前状态（幂等），所以直接调即可；
+  /// 本地快照与列表都在成功后同步删除，避免两边不一致。
+  Future<void> _unhideOne(BankQuestion question) async {
+    if (_busy) return;
+    setState(() => _busy = true);
+    try {
+      await _api.setHidden(id: question.id, hidden: false);
+      await _store.remove(kDemoUserId, question.id);
+      if (!mounted) return;
+      setState(() {
+        _questions = _questions
+            .where((BankQuestion q) => q.id != question.id)
+            .toList(growable: false);
+      });
+      await _showMessage('已取消隐藏', '这道题已回到题库列表。');
+    } on ApiException catch (e) {
+      if (!mounted) return;
+      await _showMessage('取消隐藏失败', e.message);
+    } catch (e) {
+      if (!mounted) return;
+      await _showMessage('取消隐藏失败', '请求失败：$e');
+    } finally {
+      if (mounted) setState(() => _busy = false);
+    }
+  }
+
+  /// 卡片右侧「⋯」：按当前筛选档 + 题目归属弹不同的菜单。
+  ///
+  /// 口径：
+  ///   * 自己的题（isMine）→ 编辑 / 删除；**不给隐藏**。
+  ///     取舍理由：自己的题本来就能直接删，再给一个「隐藏」只会让
+  ///     「为什么这题不见了」变得难解释；公共题不能删，才需要「隐藏」当退路。
+  ///   * 公共题 → 隐藏（不显示删除：后端会回 403 FORBIDDEN_DELETE），
+  ///     并在菜单里用一行小字说明「公共题不能删除，只能隐藏」；
+  ///   * 已删除档 → 恢复；已隐藏档 → 取消隐藏。
+  Future<void> _openActions(BankQuestion question) async {
+    final bool isDeleted = _filter.isDeleted;
+    final bool isHidden = _filter.isHidden;
+    final bool canManage = !isDeleted && !isHidden;
+
+    final String? action = await showCupertinoModalPopup<String>(
+      context: context,
+      builder: (BuildContext ctx) {
+        return CupertinoActionSheet(
+          title: const Text(
+            '题目操作',
+            style: TextStyle(fontFamily: kFontFamily, fontSize: 14),
+          ),
+          message: Column(
+            children: <Widget>[
+              Text(
+                question.preview,
+                style: const TextStyle(
+                  fontFamily: kFontFamily,
+                  fontSize: 13,
+                  color: AppColors.secondaryLabel,
+                ),
+              ),
+              if (canManage && !question.isMine) ...<Widget>[
+                const SizedBox(height: 8),
+                const Text(
+                  '公共题不能删除，只能隐藏',
+                  style: TextStyle(
+                    fontFamily: kFontFamily,
+                    fontSize: 12,
+                    color: AppColors.tertiaryLabel,
+                  ),
+                ),
+              ],
+            ],
+          ),
+          actions: <Widget>[
+            if (isDeleted)
+              CupertinoActionSheetAction(
+                onPressed: () => Navigator.of(ctx).pop('restore'),
+                child: const Text(
+                  '恢复',
+                  style: TextStyle(
+                    fontFamily: kFontFamily,
+                    fontSize: 17,
+                    color: AppColors.accent,
+                  ),
+                ),
+              ),
+            if (isHidden)
+              CupertinoActionSheetAction(
+                onPressed: () => Navigator.of(ctx).pop('unhide'),
+                child: const Text(
+                  '取消隐藏',
+                  style: TextStyle(
+                    fontFamily: kFontFamily,
+                    fontSize: 17,
+                    color: AppColors.accent,
+                  ),
+                ),
+              ),
+            if (canManage && question.isMine) ...<Widget>[
+              CupertinoActionSheetAction(
+                onPressed: () => Navigator.of(ctx).pop('edit'),
+                child: const Text(
+                  '编辑',
+                  style: TextStyle(
+                    fontFamily: kFontFamily,
+                    fontSize: 17,
+                    color: AppColors.accent,
+                  ),
+                ),
+              ),
+              CupertinoActionSheetAction(
+                isDestructiveAction: true,
+                onPressed: () => Navigator.of(ctx).pop('remove'),
+                child: const Text(
+                  '删除',
+                  style: TextStyle(
+                    fontFamily: kFontFamily,
+                    fontSize: 17,
+                    color: AppColors.overdue,
+                  ),
+                ),
+              ),
+            ],
+            if (canManage && !question.isMine)
+              CupertinoActionSheetAction(
+                onPressed: () => Navigator.of(ctx).pop('hide'),
+                child: const Text(
+                  '隐藏',
+                  style: TextStyle(
+                    fontFamily: kFontFamily,
+                    fontSize: 17,
+                    color: AppColors.accent,
+                  ),
+                ),
+              ),
+          ],
+          cancelButton: CupertinoActionSheetAction(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text(
+              '取消',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 17,
+                fontWeight: FontWeight.w600,
+                color: AppColors.accent,
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    if (!mounted || action == null) return;
+    switch (action) {
+      case 'edit':
+        await _openEdit(question);
+      case 'remove':
+        await _removeOne(question);
+      case 'hide':
+        await _hideOne(question);
+      case 'unhide':
+        await _unhideOne(question);
+      case 'restore':
+        await _restoreOne(question);
+    }
+  }
+
   /// 打开题库浏览页（导入 / 建题 / 练习的入口在那儿）。
   Future<void> _openBank() async {
     await Navigator.of(context).push<void>(
@@ -478,12 +749,18 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
             padding: const EdgeInsets.fromLTRB(16, 10, 16, 2),
             sliver: SliverToBoxAdapter(child: _buildFilterRow()),
           ),
-          if (!_loading && _error == null && _questions.isNotEmpty)
+          // ★ 已隐藏档没有批量操作（批量移除 / 批量恢复 / 批量标签对隐藏列表
+          // 都没意义），所以全选行和批量条都不渲染，也避免 _selected 里
+          // 残留一批无法执行的 id。
+          if (!_loading &&
+              _error == null &&
+              _questions.isNotEmpty &&
+              !_filter.isHidden)
             SliverPadding(
               padding: const EdgeInsets.fromLTRB(16, 4, 16, 2),
               sliver: SliverToBoxAdapter(child: _buildSelectAllRow()),
             ),
-          if (_selected.isNotEmpty)
+          if (_selected.isNotEmpty && !_filter.isHidden)
             SliverPadding(
               padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
               sliver: SliverToBoxAdapter(child: _buildBatchBar()),
@@ -626,15 +903,22 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
 
     if (_questions.isEmpty) {
       final bool isDeleted = _filter.isDeleted;
+      final bool isHidden = _filter.isHidden;
       return <Widget>[
         SliverFillRemaining(
           hasScrollBody: false,
           child: EmptyState(
-            icon: isDeleted ? CupertinoIcons.trash : CupertinoIcons.doc_text,
-            title: isDeleted ? '没有被移除的题' : '这个筛选下没有题',
+            icon: isDeleted
+                ? CupertinoIcons.trash
+                : (isHidden ? CupertinoIcons.eye_slash : CupertinoIcons.doc_text),
+            title: isDeleted
+                ? '没有被移除的题'
+                : (isHidden ? '没有隐藏的题' : '这个筛选下没有题'),
             message: isDeleted
                 ? '你还没有移除过任何题。'
-                : '换个筛选看看，或者去「浏览」导入 / 建几道题。',
+                : (isHidden
+                    ? '只有在题库里对公共题点「隐藏」后，才会出现在这里。'
+                    : '换个筛选看看，或者去「浏览」导入 / 建几道题。'),
             actionLabel: '去题库',
             onAction: _openBank,
           ),
@@ -643,19 +927,40 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
     }
 
     final bool isDeleted = _filter.isDeleted;
+    final bool isHidden = _filter.isHidden;
+    final String countLabel = isDeleted
+        ? '共 ${_questions.length} 道被移除的题，可批量恢复'
+        : (isHidden
+            ? '共 ${_questions.length} 道被隐藏的题'
+            : '共 ${_questions.length} 道题');
     return <Widget>[
       SliverPadding(
         padding: const EdgeInsets.fromLTRB(16, 8, 16, 4),
         sliver: SliverToBoxAdapter(
-          child: Text(
-            isDeleted
-                ? '共 ${_questions.length} 道被移除的题，可批量恢复'
-                : '共 ${_questions.length} 道题',
-            style: const TextStyle(
-              fontFamily: kFontFamily,
-              fontSize: 13,
-              color: AppColors.secondaryLabel,
-            ),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: <Widget>[
+              Text(
+                countLabel,
+                style: const TextStyle(
+                  fontFamily: kFontFamily,
+                  fontSize: 13,
+                  color: AppColors.secondaryLabel,
+                ),
+              ),
+              // ★ 已隐藏档的说明行：避免用户把「隐藏」误解成删除 / 不再考。
+              if (isHidden) ...<Widget>[
+                const SizedBox(height: 4),
+                const Text(
+                  '隐藏只影响题库列表，模考仍会抽到这些题',
+                  style: TextStyle(
+                    fontFamily: kFontFamily,
+                    fontSize: 12,
+                    color: AppColors.tertiaryLabel,
+                  ),
+                ),
+              ],
+            ],
           ),
         ),
       ),
@@ -670,10 +975,11 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
                   question: q,
                   selected: _selected.contains(q.id),
                   isDeleted: isDeleted,
+                  isHidden: isHidden,
+                  selectable: !isHidden,
                   busy: _busy,
                   onToggle: () => _toggleSelect(q),
-                  onRemove: () => _removeOne(q),
-                  onRestore: () => _restoreOne(q),
+                  onActions: () => _openActions(q),
                 ),
               ),
           ],
@@ -683,31 +989,42 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
   }
 }
 
-/// 一张可勾选、可移除/恢复的题卡。
+/// 一张题卡：左侧可勾选（仅批量有意义的两档），右侧是「⋯」操作菜单。
+///
+/// ★ 改造点：原本右侧只有一个「删除 / 恢复」按钮，而按档位 + 题目归属
+/// 实际需要的动作已经到 5 种（编辑 / 删除 / 恢复 / 隐藏 / 取消隐藏），
+/// 单按钮装不下，所以统一交给 [_openActions] 弹 CupertinoActionSheet。
+/// 三个档位共用同一个入口，交互风格保持一致。
 class _ManageCard extends StatelessWidget {
   const _ManageCard({
     required this.question,
     required this.selected,
     required this.isDeleted,
+    required this.isHidden,
+    required this.selectable,
     required this.busy,
     required this.onToggle,
-    required this.onRemove,
-    required this.onRestore,
+    required this.onActions,
   });
 
   final BankQuestion question;
   final bool selected;
   final bool isDeleted;
+  final bool isHidden;
+
+  /// 这张卡是否参与批量选择。
+  ///
+  /// 「已隐藏」档没有批量操作（见 `_buildBody` 上方注释），
+  /// 所以那里不画勾选圈、整卡点击也不切勾选 —— 避免出现「勾了却不能操作」。
+  final bool selectable;
   final bool busy;
   final VoidCallback onToggle;
-  final VoidCallback onRemove;
-  final VoidCallback onRestore;
-
+  final VoidCallback onActions;
   @override
   Widget build(BuildContext context) {
     return GestureDetector(
       behavior: HitTestBehavior.opaque,
-      onTap: busy ? null : onToggle,
+      onTap: (!selectable || busy) ? null : onToggle,
       child: Container(
         width: double.infinity,
         padding: const EdgeInsets.all(14),
@@ -728,16 +1045,18 @@ class _ManageCard extends StatelessWidget {
         child: Row(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: <Widget>[
-            Padding(
-              padding: const EdgeInsets.only(top: 2, right: 10),
-              child: Icon(
-                selected
-                    ? CupertinoIcons.checkmark_circle_fill
-                    : CupertinoIcons.circle,
-                size: 20,
-                color: selected ? AppColors.accent : AppColors.tertiaryLabel,
+            if (selectable)
+              Padding(
+                padding: const EdgeInsets.only(top: 2, right: 10),
+                child: Icon(
+                  selected
+                      ? CupertinoIcons.checkmark_circle_fill
+                      : CupertinoIcons.circle,
+                  size: 20,
+                  color:
+                      selected ? AppColors.accent : AppColors.tertiaryLabel,
+                ),
               ),
-            ),
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -765,6 +1084,8 @@ class _ManageCard extends StatelessWidget {
                       ],
                       if (isDeleted)
                         const _Tag(text: '已移除', color: AppColors.secondaryLabel),
+                      if (isHidden)
+                        const _Tag(text: '已隐藏', color: AppColors.secondaryLabel),
                     ],
                   ),
                   // ★ A2③：考点标签（批量标签编辑后这里会更新）。
@@ -786,11 +1107,11 @@ class _ManageCard extends StatelessWidget {
             CupertinoButton(
               padding: EdgeInsets.zero,
               minimumSize: const Size(28, 28),
-              onPressed: busy ? null : (isDeleted ? onRestore : onRemove),
-              child: Icon(
-                isDeleted ? CupertinoIcons.arrow_uturn_left : CupertinoIcons.trash,
-                size: 18,
-                color: isDeleted ? AppColors.accent : AppColors.overdue,
+              onPressed: busy ? null : onActions,
+              child: const Icon(
+                CupertinoIcons.ellipsis,
+                size: 20,
+                color: AppColors.secondaryLabel,
               ),
             ),
           ],

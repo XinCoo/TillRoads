@@ -21,13 +21,16 @@ import '../pages/defect_detail_page.dart';
 import '../pages/exam_config_page.dart';
 import '../pages/mock_create_page.dart';
 import '../pages/practice_config_page.dart';
+import '../pages/exam_profile_create_page.dart';
 import '../pages/review_page.dart';
 import '../pages/settings_page.dart';
 import '../pages/verify_page.dart';
 import '../theme/app_theme.dart';
 import '../widgets/countdown_card.dart';
 import '../widgets/defect_summary_card.dart';
-import '../widgets/exam_flip_card.dart';
+import '../widgets/exam_card_stack.dart';
+// 只取高度常量：骨架块要和真卡同高，否则加载完成时会有一次布局跳动。
+import '../widgets/exam_flip_card.dart' show kExamFlipCardHeight;
 import '../widgets/common.dart';
 import '../widgets/quick_action_grid.dart';
 import '../widgets/task_card.dart';
@@ -84,7 +87,25 @@ class _HomePageState extends State<HomePage> {
   static const Duration _kReadTimeout = Duration(seconds: 30);
 
   /// —— 倒计时 ——
-  Map<String, Object?>? _profile;
+  ///
+  /// 全部考试目标（B 任务：首页时间卡支持多张堆叠）。
+  /// 排序约定：`status == 'active'` 排在前面，其余按服务端返回顺序。
+  /// 第 0 条就是首页默认展示的那张卡。
+  List<Map<String, Object?>> _profiles = const <Map<String, Object?>>[];
+
+  /// 当前展示第几张（与 `ExamCardStack` 的 PageView 索引同步）。
+  int _cardIndex = 0;
+
+  /// 当前卡片对应的 profile。
+  ///
+  /// 保留这个 getter 而不是让所有调用点改用 `_profiles[_cardIndex]`：
+  /// 「建题」等 10 处只关心「当前这张卡的考试目标」，不需要知道堆叠的存在。
+  Map<String, Object?>? get _profile {
+    if (_profiles.isEmpty) return null;
+    final int safe = _cardIndex.clamp(0, _profiles.length - 1);
+    return _profiles[safe];
+  }
+
   ApiException? _profileError;
   bool _profileLoaded = false;
   /// —— 今日待验证 ——
@@ -168,7 +189,7 @@ class _HomePageState extends State<HomePage> {
       if (!fillDone) {
         if (!mounted) return;
         setState(() {
-          _profile = null;
+          _profiles = const <Map<String, Object?>>[];
           _summary = null;
           _stats = null;
           _profileError = null;
@@ -180,7 +201,7 @@ class _HomePageState extends State<HomePage> {
         });
         return;
       }
-      final Map<String, Object?>? profile = await loadActiveExamProfile(kDemoUserId);
+      final List<Map<String, Object?>> profiles = await loadExamProfiles(kDemoUserId);
       final vapi.VerificationSummary summary = await loadVerificationSummary(kDemoUserId);
       final Map<String, Object?> stats = await loadDefectStats(kDemoUserId);
       // R4b：今日待验证也从本地算，不再渲染 mock。
@@ -190,7 +211,7 @@ class _HomePageState extends State<HomePage> {
       if (!mounted) return;
       setState(() {
         // 三块已是「本地真实值」，不再标降级：离线也能读到的数据不该带「离线数据」标记。
-        _profile = profile;
+        _profiles = profiles;
         _summary = summary;
         _tasks = tasks;
         _stats = stats;
@@ -221,12 +242,15 @@ class _HomePageState extends State<HomePage> {
       final profiles = await _defectApi.fetchExamProfiles(kDemoUserId);
       if (!mounted) return;
       setState(() {
-        // Prefer the active profile; otherwise fall back to the first archived profile.
-        _profile = profiles.cast<Map<String, Object?>?>().firstWhere(
-          (Map<String, Object?>? p) => p?['status'] == 'active',
-          orElse: () => profiles.isEmpty ? null : profiles.first,
-        );
-        _profileError = null;
+        // m29656：保留全部考试目标（首页卡片堆叠），active 排到最前。
+        // 旧代码用 firstWhere 只取一条，其余 profile 被丢弃。
+        final List<Map<String, Object?>> active = <Map<String, Object?>>[];
+        final List<Map<String, Object?>> others = <Map<String, Object?>>[];
+        for (final Map<String, Object?> p in profiles) {
+          (p['status'] == 'active' ? active : others).add(p);
+        }
+        _profiles = <Map<String, Object?>>[...active, ...others];
+        _cardIndex = 0;
         _profileLoaded = true;
       });
     } on ApiException catch (e) {
@@ -500,7 +524,7 @@ class _HomePageState extends State<HomePage> {
 
     // 数据没到且没失败 → 骨架
     if (!_profileLoaded && profile == null && _profileError == null) {
-      return const _SkeletonBlock(height: 108);
+      return const _SkeletonBlock(height: kExamFlipCardHeight);
     }
 
 
@@ -513,18 +537,46 @@ class _HomePageState extends State<HomePage> {
       );
     }
 
-    final Object? label = profile['target_label'];
-    final String examLabel =
-        (label is String && label.trim().isNotEmpty) ? label.trim() : '我的考试';
-    final Object? date = profile['exam_date'];
-    final String examDateText = (date is String) ? date.trim() : '';
-    // A1⑤：卡片正面倒计时、背面学习进度，点击 / 回车 / 空格翻转（3D 300ms）。
-    return ExamFlipCard(
-      examProfileId: '${profile['id'] ?? ''}',
-      examLabel: examLabel,
-      examDateText: examDateText,
-      daysToExam: _daysUntil(profile['exam_date']),
+    // m29656 B2：多张考试目标时堆叠展示（Apple Wallet 手感），
+    // 单张时 `ExamCardStack` 内部会退化成「单卡无堆叠」，外观与改造前一致。
+    return ExamCardStack(
+      profiles: _profiles,
+      daysUntil: _daysUntil,
+      onIndexChanged: (int index) {
+        // 同步「当前是哪张卡」：建题 / 翻面报进度都得用当前这张的 id。
+        if (_cardIndex == index) return;
+        setState(() => _cardIndex = index);
+      },
+      onEdit: _editProfile,
+      onOverflowTap: _openExamConfig,
     );
+  }
+
+  /// 长按卡片（≥500ms）→ 用这条 profile 回填后打开编辑页（B5）。
+  ///
+  /// 直接复用新建页（`ExamProfileCreatePage(initial: ...)`）：两页字段完全一样，
+  /// 新建页已经带了本工程最全的校验与日期选择器。
+  Future<void> _editProfile(Map<String, Object?> profile) async {
+    // 无 id / 无 version 就编辑不了（PATCH 必须带乐观锁版本）。
+    // 这种数据只可能来自旧本地缓存，提示刷新而不是让用户白跑一趟。
+    if (profile['id'] is! String || _versionOf(profile) == null) {
+      _toast('无法编辑', '这条考试目标缺少有效的标识或版本号，请下拉刷新后重试。');
+      return;
+    }
+    await Navigator.of(context).push<void>(
+      appRoute<void>(context, ExamProfileCreatePage(initial: profile)),
+    );
+    if (!mounted) return;
+    await _reloadAfterConfigChange();
+  }
+
+  /// 从 profile 取乐观锁版本号（可能与 `exam_profile_create_page` 同一套容错）。
+  static int? _versionOf(Map<String, Object?> profile) {
+    final Object? raw = profile['version'];
+    if (raw is int) return raw;
+    if (raw is num) return raw.toInt();
+    if (raw is String) return int.tryParse(raw.trim());
+    return null;
   }
 
   // ───────────────────────── 今日待验证 ─────────────────────────

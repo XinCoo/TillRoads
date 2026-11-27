@@ -1,8 +1,18 @@
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/physics.dart';
 import 'package:flutter/services.dart';
-
 import '../api/exam_progress_api.dart';
 import '../theme/app_theme.dart';
+
+/// 单卡固定高度（逻辑像素）。
+///
+/// 为什么固定而不是让内容撑开：首页的卡片堆叠（`ExamCardStack`）要让后面几层
+/// 与当前卡严格对齐，层与层的高度必须由外部约定，否则翻面（正面 44pt 大字、
+/// 背面三行小字）会让同一张卡在两个面高度不同，堆叠就会跳动。
+///
+/// 108 与首页骨架块 `_SkeletonBlock(height: 108)` 取同一个值：加载完成时
+/// 从骨架切到真卡不会引起布局位移。
+const double kExamFlipCardHeight = 108;
 
 /// 考试目标卡片：正面是「名称 + 距考试天数」，背面是「学习进度」。
 ///
@@ -13,13 +23,19 @@ import '../theme/app_theme.dart';
 ///
 /// 翻转动效用 3D（rotateY）而不是 crossfade：
 ///   crossfade 读起来像「内容被换掉了」，而 3D 翻转读起来像「同一张卡翻了一面」，
-///   符合 iOS 的空间感。300ms 是 iOS 常用的轻交互时长。
+///   符合 iOS 的空间感。翻页用弹簧（ratio 0.85 / stiffness 220，周期约 424ms），
+///   比写死 300ms 的匀速曲线更有「扣上」的手感。
 ///
 /// 无障碍：
 ///   · 整卡是一个可聚焦控件（Focus + onKeyEvent），键盘 Enter / Space 也能翻；
 ///   · Semantics(button: true, label: …) 让读屏软件把它当按钮念出来；
 ///   · 开启「减弱动态效果」（系统设置 → 辅助功能 → 减弱动态效果）时直接切换，
-///     不做 3D 旋转。
+///     不做 3D 旋转（直接换面）。
+///
+/// 与首页卡片堆叠（ExamCardStack）的分工：
+///   · 本组件只负责「一张卡翻面」，不知道自己在第几张；
+///   · 长按（≥500ms）通过 onLongPress 上抛给堆叠组件，由它 push 编辑页；
+///   · 父层切页时把 flipResetToken +1，本组件据此把翻转角度归零。
 class ExamFlipCard extends StatefulWidget {
   const ExamFlipCard({
     super.key,
@@ -27,6 +43,8 @@ class ExamFlipCard extends StatefulWidget {
     required this.examLabel,
     required this.examDateText,
     required this.daysToExam,
+    this.onLongPress,
+    this.flipResetToken = 0,
   });
 
   /// 考试目标 id（用来拉学习进度）。
@@ -39,17 +57,56 @@ class ExamFlipCard extends StatefulWidget {
   final String examDateText;
 
   /// 距离考试的天数。
+  /// 距离考试的天数。
   final int daysToExam;
+
+  /// 长按卡片（≥500ms 且几乎没滑动）时回调：父层用它 push 考试目标编辑页。
+  ///
+  /// 为什么把长按挂在卡片自己的 GestureDetector 上：
+  ///   B6 要求「单击翻转 / 长按编辑 / 水平滑动切卡」三者互斥。Tap 与
+  ///   LongPress 都属于本卡片的识别器，水平拖拽由外层 PageView 的
+  ///   HorizontalDragGestureRecognizer 接管——三者进同一个手势竞技场，
+  ///   谁先满足自己的判定条件谁胜出，天然互斥，不需要手写计时器去互锁。
+  final VoidCallback? onLongPress;
+
+  /// 翻转状态重置令牌：父层切换到别的卡片时把数字 +1，本组件在
+  /// didUpdateWidget 里把翻转角归零（B4：翻转状态不跨卡片保留）。
+  final int flipResetToken;
 
   @override
   State<ExamFlipCard> createState() => _ExamFlipCardState();
 }
 
 class _ExamFlipCardState extends State<ExamFlipCard>
-    with SingleTickerProviderStateMixin {
-  late final AnimationController _controller = AnimationController(
+    with TickerProviderStateMixin {
+  /// 翻转弹簧：任务书 B8 要求 `SpringDescription.withDampingRatio(
+  /// ratio: 0.85, stiffness: 220)`，约 400ms。
+  ///
+  /// 为什么用 `AnimationController.unbounded` + `SpringSimulation`，而不是
+  /// 写死 `duration: 400ms` + `CurvedAnimation`：
+  ///   弹簧的时长由 mass/stiffness/ratio 决定（周期 2π/√220 ≈ 424ms），
+  ///   写死 duration 只能拿到「近似 easeOut」的手感，没有过冲与回弹。
+  ///   用 unbounded 是因为弹簧中间值会略微越过 1（ratio 0.85 时约 1.02），
+  ///   有界 controller 会把它截断成硬停，弹性就没了。
+  static final SpringDescription _kFlipSpring =
+      SpringDescription.withDampingRatio(
+    mass: 1,
+    stiffness: 220,
+    ratio: 0.85,
+  );
+
+  late final AnimationController _controller = AnimationController.unbounded(
     vsync: this,
-    duration: const Duration(milliseconds: 300),
+    value: 0,
+  );
+
+  /// 长按放大：1.0 → 1.02（B5）。独立 controller，与翻转互不干扰。
+  late final AnimationController _pressCtrl = AnimationController(
+    vsync: this,
+    duration: const Duration(milliseconds: 120),
+    lowerBound: 1.0,
+    upperBound: 1.02,
+    value: 1.0,
   );
   /// 进度 API。**持有实例**而不是每次现建：ApiClient 内部持 http.Client，
   /// 每次 new 都会多一个连接池，且不 close 会漏连接。dispose 时统一关。
@@ -67,8 +124,24 @@ class _ExamFlipCardState extends State<ExamFlipCard>
   @override
   void dispose() {
     _controller.dispose();
+    _pressCtrl.dispose();
     _progressApi.close();
     super.dispose();
+  }
+
+  @override
+  void didUpdateWidget(covariant ExamFlipCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // B4：翻转状态不跨卡片保留。父层切页时把 flipResetToken +1，
+    // 这里把角度与已拉到的进度都归零，保证滑到下一张一定是正面。
+    // 直接改字段而不是 setState：didUpdateWidget 之后必然紧跟一次 build。
+    if (oldWidget.flipResetToken != widget.flipResetToken) {
+      _controller.stop();
+      _controller.value = 0;
+      _progress = null;
+      _progressFailed = false;
+      _loadingProgress = false;
+    }
   }
 
   Future<void> _flip() async {
@@ -76,19 +149,17 @@ class _ExamFlipCardState extends State<ExamFlipCard>
         MediaQuery.maybeOf(context)?.disableAnimations ?? false;
     if (reduceMotion) {
       // 减弱动态效果：不做旋转，直接换面。
+      _controller.stop();
       setState(() {
-        if (_controller.value > 0.5) {
-          _controller.value = 0;
-        } else {
-          _controller.value = 1;
-        }
+        _controller.value = _controller.value > 0.5 ? 0 : 1;
       });
     } else {
-      if (_controller.value > 0.5) {
-        await _controller.reverse();
-      } else {
-        await _controller.forward();
-      }
+      final double from = _controller.value;
+      final double to = from > 0.5 ? 0 : 1;
+      // animateWith 会接管 controller，等价于 forward/reverse，但走弹簧曲线。
+      await _controller.animateWith(
+        SpringSimulation(_kFlipSpring, from, to, 0),
+      );
     }
     if (_isBack) await _ensureProgress();
   }
@@ -132,6 +203,17 @@ class _ExamFlipCardState extends State<ExamFlipCard>
     _flip();
   }
 
+  /// 长按按下：立刻给触觉反馈 + 放大到 1.02（B5）。
+  void _onLongPressStart(LongPressStartDetails details) {
+    HapticFeedback.mediumImpact();
+    _pressCtrl.animateTo(1.02);
+  }
+
+  /// 松手回弹：缩回 1.0。onLongPress 已在松手时触发过父层回调。
+  void _onLongPressEnd(LongPressEndDetails details) {
+    _pressCtrl.animateTo(1.0);
+  }
+
   @override
   Widget build(BuildContext context) {
     // 这里的 reduceMotion 只用于「是否要做 3D 翻转」；
@@ -145,15 +227,28 @@ class _ExamFlipCardState extends State<ExamFlipCard>
         child: GestureDetector(
           behavior: HitTestBehavior.opaque,
           onTap: _flip,
+          // B5：长按 ≥500ms（Flutter 的 kLongPressTimeout 正是 500ms）。
+          // B6：只有位移 <18px（kTouchSlop）时 LongPress 才可能胜出；一旦
+          // 水平位移超过 18px，外层 PageView 的拖拽识别器先赢，
+          // onLongPressStart 根本不会触发——这就是「二者互斥」的实现机制。
+          onLongPressStart:
+              widget.onLongPress == null ? null : _onLongPressStart,
+          onLongPressEnd:
+              widget.onLongPress == null ? null : _onLongPressEnd,
+          onLongPress: widget.onLongPress,
           child: AnimatedBuilder(
-            animation: _controller,
+            animation: Listenable.merge(<Listenable>[_controller, _pressCtrl]),
             builder: (BuildContext context, Widget? child) {
-              final double t = _controller.value;
+              // 弹簧会过冲，先钳到 [0,1] 再算角度，否则会翻过头露出镜像面。
+              final double t = _controller.value.clamp(0.0, 1.0);
               // 0 → 正面（0 度）；1 → 背面（180 度）。
               final double angle = t * 3.141592653589793;
               final Matrix4 matrix = Matrix4.identity()
                 ..setEntry(3, 2, 0.0012)
-                ..rotateY(angle);
+                ..rotateY(angle)
+                // 长按放大 1.02（B5）：放进同一个矩阵，避免为缩放再加一层
+                // Transform；两个 controller 由 Listenable.merge 一起驱动。
+                ..scale(_pressCtrl.value);
               final Widget face = t > 0.5
                   ? _buildBack()
                   : _buildFront();
@@ -383,6 +478,7 @@ class _ExamFlipCardState extends State<ExamFlipCard>
 
   Widget _shell({required Widget child}) {
     return Container(
+      height: kExamFlipCardHeight,
       padding: const EdgeInsets.symmetric(
         horizontal: AppSpacing.cardPadding,
         vertical: 18,

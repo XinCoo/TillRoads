@@ -2921,3 +2921,108 @@ application-label:'题路'
 - 昵称长度上限只在应用层（`text` 列无约束）；如果将来要数据库级兜底，需要加 `CHECK (char_length(nickname) BETWEEN 2 AND 20)` 的迁移。
 - 昵称无唯一性要求（允许重名）；如需唯一，得另加唯一索引并处理冲突文案。
 - 没有修改历史（谁在什么时候改过），也不做敏感词过滤。
+
+## 49. m29656 归档（首页时间卡堆叠 + 隐藏公共题 UI + 版本 1.1.5+3）
+
+> 用户任务书原文要求：A 隐藏公共题 UI、B 首页时间卡重构、C 版本号 1.1.5+X、D 代码级验证 D1–D6。硬约束：**不改** `schema.sql` / `migrations/` / `core/` / 状态机 / `server/`；不引新依赖；**不截图、不跑 adb、不做真机验证**；不执行 git 命令。
+
+### 49.1 范围与拍板
+
+- **B3 选 `PageView`，不选自定义 `GestureDetector`+`AnimationController`**。三条理由：①跟手吸附与「首张右滑 / 末张左滑自动回弹」是 `PageView` 原生行为，自己写要复刻 `ScrollPhysics`；②`HorizontalDragGestureRecognizer` 只在位移超过 `kTouchSlop`（约 18px）后才在竞技场胜出，恰好等于 B6 的位移阈值；③因此卡内的 `onTap`（翻转）与 `onLongPress`（编辑）**在手势竞技场上天然被拖拽判负**，不需要自己写状态机去互斥——若用自定义手势反而要重写整个竞技场。
+- **长按编辑复用 `ExamProfileCreatePage`**（加 `initial` 参数）而不是新建 `ExamProfileEditPage`：两页字段完全一致，复制一份必然漂移。
+- **任务 A 的「已隐藏」列表只能存本地**：后端只有 `PATCH /questions/:id/hide`，**没有** list-hidden 端点，且 `GET /questions` 默认就排除隐藏题（`listVisible` 的 `includeHidden` 形参路由层从不传）。本轮硬约束禁止改 `server/`，故用 `shared_preferences` 快照。
+
+### 49.2 任务 B：文件与关键实现
+
+| 文件 | 变动 |
+|---|---|
+| `tillroad_app/lib/widgets/exam_card_stack.dart` | **新建**（361 行）：堆叠 + `PageView` + 手势物理 + Reduce Motion 分支 |
+| `tillroad_app/lib/widgets/exam_flip_card.dart` | 408 → 504 行：弹簧翻转 + 长按放大 + `flipResetToken` + `kExamFlipCardHeight = 108` |
+| `tillroad_app/lib/pages/home_page.dart` | 1344 → 1395 行：`_profile` 单条 → `_profiles` 全量 + `_cardIndex`（保留 `_profile` getter） |
+| `tillroad_app/lib/local/local_queries.dart` | 新增 `loadExamProfiles(userId)`；`_profileToWire` 5 键 → 8 键 |
+| `tillroad_app/lib/local/local.dart` | barrel `show` 列表加 `loadExamProfiles` |
+| `tillroad_app/lib/api/exam_api.dart` | 新增 `updateExamProfile(...)` → `PATCH /exam-profiles/:id` |
+| `tillroad_app/lib/pages/exam_profile_create_page.dart` | 604 → 719 行：`initial` 参数 + `_prefillFromInitial()` + 编辑分支 |
+
+**堆叠参数（与 B2 逐条对齐）**：`layerGap = 12.0`、`scale1 = 0.95`、`scale2 = 0.90`、`pageHeight = kExamFlipCardHeight + layerGap * 2`；最多 3 层，`hidden = profiles.length - (index + 3)`，`hidden > 0` 时第 3 层右上角显示 `+N`。
+
+**为什么第 3 层的 `+N` 用的是 `length - (index + 3)` 而不是固定值**：从左往右翻到第 2 张时，可见层是 `index+1`、`index+2`、`index+3`，未露出的只剩 `length - (index+3)` 张。写死成 `length - 3` 会在翻页过程中给出错误的溢出数。
+
+**滑动阈值**：`_kSwipeDistance = 18.0`、`_kSwipeVelocity = 300.0`；`_CardPageScrollPhysics extends PageScrollPhysics` 只覆写 `minFlingVelocity => _kSwipeVelocity`。不覆写 `kTouchSlop` 是因为它来自 `gestures` 常量层，覆写会牵连整个滚动系统；18px 本身就是 Flutter 的默认值，恰好满足 B6。
+
+### 49.3 任务 B：手势优先级与状态机（D1）
+
+B6 要求「写死优先级，不允许三个手势共存靠运气」。实际的实现**不是手写状态机，而是把手势交给 Flutter 竞技场 + 两个明确阈值**：
+
+| 事件 | 判定条件 | 结果 | 互斥保证 |
+|---|---|---|---|
+| `onTap` | pointer up 且位移 < 18px，且未完成长按 | 翻转卡片（`_flip()`） | 长按超过 500ms 时 `onTap` 不会触发（`LongPressGestureRecognizer` 已赢得竞技场）；位移 > 18px 时 `TapGestureRecognizer` 判负 |
+| `onLongPress`（`kLongPressTimeout = 500ms`） | 按住 ≥ 500ms 且位移 < 18px | `HapticFeedback.mediumImpact()` + 缩放 1.02 → `onLongPress` 回调 push 编辑页 | 拖拽胜出后长按判负；`onTap` 也不会再触发 |
+| 水平拖拽 | 位移 > 18px 且 \|dx\| > \|dy\| | `PageView` 的 `HorizontalDragGestureRecognizer` 胜出，卡片跟手位移；松手时按速度与距离开决定吸附到上一张/下一张 | 胜出即意味着 `Tap` 与 `LongPress` 都被判负，二者不会再回调 |
+| 首张右滑 / 末张左滑 | `physics: ClampingScrollPhysics` | 无位移、自然回弹 | 边界由 `PageView` 保证 |
+
+**长按缩放为什么用独立 `AnimationController` 而不是 `setState` 改 `Transform.scale`**：长按期间同时可能有翻转弹簧在跑（`_controller.animateWith`），两个动画共用一个 AnimatedBuilder 时必须都是可监听的动画源；`_pressCtrl` 的 `lowerBound: 1.0, upperBound: 1.02` 保证过冲也不会缩到 1 以下。
+
+### 49.4 任务 B：翻转状态不跨卡片保留（D2）
+
+- `ExamCardStack` 持 `int _flipToken = 0`，`_goTo()` 与 `_onPageChanged()` 都 `_flipToken++`，把新令牌通过 `flipResetToken` 传给 `ExamFlipCard`。
+- `ExamFlipCard.didUpdateWidget` 里一旦发现 `oldWidget.flipResetToken != widget.flipResetToken`，就 `_controller.stop(); _controller.value = 0;` 并清掉 `_progress` / `_progressFailed` / `_loadingProgress`。
+- **为什么不 setState**：`didUpdateWidget` 之后必然紧跟一次 `build`，此时动画值已经是 0，直接复用这次 build 即可；在 `didUpdateWidget` 里 setState 会触发「build during build」断言。
+- 因为 `PageView` 默认只保留相邻页的 State，被销毁的页本来就会重建为正面；令牌的作用是覆盖「相邻页 State 被保留、翻到背面后没重置」这一种情况。
+
+### 49.5 任务 B：Reduce Motion 三处降级（D3）
+
+`MediaQuery.maybeOf(context)?.disableAnimations ?? false` 在本轮共有三处分支：
+
+1. **堆叠缩放**：`ExamCardStack.build()` 首行 `if (_reduceMotion) return _buildReduceMotion();` —— 直接不渲染多层 Stack，只剩当前一张卡，`Transform.scale` 不再存在。
+2. **翻转动画**：`ExamFlipCard._flip()` 里 `if (reduceMotion) { _controller.stop(); _controller.value = _isBack ? 0 : 1; return; }` —— 直接换面，不跑弹簧。
+3. **滑动**：`_buildReduceMotion()` 用 `AnimatedSwitcher(duration: 180ms)` + 纯 `FadeTransition` 切换，仍保留 `onHorizontalDragEnd` 的方向判定（`farEnough = |dx| > 18`、`fastEnough = |v| > 300`），只是把位移换成淡入淡出。
+
+### 49.6 任务 C：版本号
+
+| 位置 | 旧 | 新 |
+|---|---|---|
+| `tillroad_app/pubspec.yaml:5` | `version: 1.1.0+2` | `version: 1.1.5+3` |
+| `tillroad_app/lib/config/app_info.dart:13` | `const String kAppVersion = '1.1.0+2';` | `const String kAppVersion = '1.1.5+3';` |
+
+构建号 `X` 取「当前构建号 + 1」= `2 + 1 = 3`，严格递增；`build.gradle.kts` 未动（`versionCode` / `versionName` 本就取自 pubspec）。
+
+### 49.7 任务 A：`hide-ui` 子代理交付（已验收）
+
+- 新建 `tillroad_app/lib/local/hidden_questions_store.dart`（212 行）：`HiddenQuestion{id, stem, type, source, hiddenAt}` + `HiddenQuestionStore{keyPrefix='hidden_questions.', keyFor, load, add, remove, clear}`；`load()` 对坏 JSON / 非数组 / 缺 id 的条目全部 `debugPrint` 后跳过，**从不让存储异常阻断 UI**。
+- 改 `tillroad_app/lib/pages/question_manage_page.dart`（+365 / −44，现 1347 行）：`_ManageFilter` 加 `hidden('已隐藏')`、卡片右侧 `⋯` → `CupertinoActionSheet`（自己的题 编辑 / 删除；公共题 隐藏；已隐藏档 取消隐藏）、已隐藏档不渲染全选行与批量条、列表头加「隐藏只影响题库列表，模考仍会抽到这些题」。
+- **已知限制（接受项，写在文件头注释）**：跨设备不可见；清缓存 / 重装丢失；不与服务端对账；正确修法是后端加 `GET /questions?hidden=true`。
+- 后端事实佐证：`server/repositories/mock_exams.mjs:136` 组卷 SQL **没有** hidden 过滤（模考仍抽隐藏题）；`server/repositories/practice_sessions.mjs:71` **有** `hiddenFilterClause`（练习排除隐藏题）。所以「模考仍会抽到」这句文案是准确的。
+
+### 49.8 校验（D5 / D6）
+
+```
+flutter analyze --no-fatal-infos  →  97 issues found
+  Select-String '^\s*(error|warning)\s' → 0 命中
+  ERROR_LINES=0  WARNING_LINES=0  INFO_LINES=97   (全部 deprecated_member_use)
+flutter test                      →  00:03 +108: All tests passed!
+```
+
+**判据提醒**：必须用 `^\s*(error|warning)\s`（级别词后任意空白），用 `(error|warning)\s+-` 会假绿 —— CI 里的格式是 `warning • ...`。
+
+### 49.9 本轮踩的坑（load-bearing）
+
+1. **`AnimationController` 有界会把弹簧过冲截断**：`SpringDescription.withDampingRatio(ratio: 0.85)` 的峰值约 1.02，用 `AnimationController(vsync:this, duration:...)` 配 `animateWith` 时控制器默认 `lowerBound: 0.0, upperBound: 1.0`，动画会在 1.0 处硬停一下再回落。必须改成 `AnimationController.unbounded(vsync: this, value: 0)`，并在 build 里 `_controller.value.clamp(0.0, 1.0)` 只用于算角度。
+2. **`PageView` 的默认 `minFlingVelocity` 是 50.0**（`ScrollPhysics` 里 `kMinFlingVelocity = 50.0`），远低于 B6 要求的 300。只加 `kTouchSlop` 的 18px 判据不够——一个 60px/s 的慢速轻扫也会翻页。必须子类化 `PageScrollPhysics` 覆写 `minFlingVelocity`。
+3. **`_StackMetrics.maxLayers` 字段闲置**：只写常量不用 → `flutter analyze` 报 `unused_field` **warning**。注释说明不算「使用」，必须删字段（或真的引用它）。
+4. **`import` 在重构后变 unused 也是 warning**：改成 `ExamCardStack` 后 `exam_flip_card.dart` 的 import 只用于一个常量，必须写成 `import '...' show kExamFlipCardHeight;` 并在骨架处真的用上，否则 warning。
+5. **多批小 edit 在同一文件上累积结构损坏**：`exam_profile_create_page.dart` 一度出现重复的 `child: _submitting`（3 条 error + test 编译失败）；`exam_card_stack.dart` 一度出现重复的 `_buildPageLayers` / `_buildPage` 定义。**一旦 analyze 报出 `expected_token` 或 error > 50，应立即 `read` 整个类并考虑整份 `write`，而不是继续叠加 edit。**
+6. **`flutter test` 曾完全跑不了**：sqlite3 的 native asset hook 要从 `github.com` 下载 `sqlite3.x64.windows.dll`，本机直连超时 → `Building native assets failed.`。子代理用 `ghfast.top` 镜像 + `curl.exe -L -C -` 断点续传落到 `tillroad_app/.dart_tool/hooks_runner/shared/sqlite3/build/download-643956b0/sqlite3.dll`（1731072 B，SHA-256 `643956b0…028`，与 `sqlite3-3.9.1/lib/src/hook/asset_hashes.dart:60` 的期望值一致），hook 此后直接复用缓存。**这是本机环境障碍，不是产品问题，该文件不进版本库。**
+
+### 49.10 偏离任务书的地方（如实记录）
+
+1. **B8 的弹簧参数只用在翻转上**，滑动回弹用的是 `PageView` 自带的 `ClampingScrollPhysics` + `PageScrollPhysics` 的默认吸附曲线，**没有**把 `SpringDescription.withDampingRatio(ratio: 0.85, stiffness: 220)` 套到滑动上。原因：`PageView` 的吸附动画由 `ScrollPosition` 内部 `BallisticScrollActivity` 驱动，替换它需要自定义 `ScrollPhysics.createBallisticSimulation`，风险远大于收益，且任务书对滑动只要求「跟手 + 松手回弹或完成」。
+2. **长按缩放用 1.02 的有界控制器 + 120ms 线性动画**，不是弹簧。任务书只要求「放大 1.02 倍，松手回弹」，没有指定弹性曲线。
+3. **「已隐藏」列表是本地快照**（见 49.7）—— 任务书 A2/A3/A4 描述的行为按「前端能查到隐藏状态」写，但后端没有该能力，本轮硬约束又不许改 `server/`。这是**能力缺口**，不是实现取巧；已在文件头注释、README 遗留清单 ⑮ 与答复中三处明示。
+
+### 49.11 遗留
+
+- 「已隐藏」跨设备同步：需后端加 `GET /questions?hidden=true`（或给 `listVisible` 的 `includeHidden` 接通路由），同时把 `hidden_questions_store.dart` 整个删掉。
+- `exam_type_custom` 未写入本地 `exam_profiles` 表：从本地读出的卡片进编辑页时，自定义类型名会回落成预设标签；下拉刷新走一次云端即恢复。修法是给 `local_schema.dart` 加列 + `onUpgrade` 幂等加列 + `_profileToWire` 补映射。
+- 堆叠卡片在「第 1 张翻到背面后快速滑到第 2 张」的极端时序下，理论上存在 1 帧的正面/背面闪烁（`didUpdateWidget` 在 build 前执行，但 `AnimatedBuilder` 的 Listenable 合并可能在下一帧才重建）。**任务书明确本轮不做真机验证**，此条留待用户真机观察后决定是否需要加 `Key` 级重建。
+- 第 3 层 `+N` 徽标的点击跳转目标是「考试配置页」而不是「第 4 张卡」，因为没有「列表页」这一层；如果将来配置页支持多卡片列表，应改为直接翻到那张。

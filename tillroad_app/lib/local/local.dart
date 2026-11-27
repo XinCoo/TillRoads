@@ -67,6 +67,7 @@ export 'local_queries.dart'
         loadDefectStats,
         loadDefectTicketById,
         loadDefectTickets,
+        loadExamProfiles,
         loadFirstSubject,
         loadKnowledgeNodes,
         loadVerificationSummary,

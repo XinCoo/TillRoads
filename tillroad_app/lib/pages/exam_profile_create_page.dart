@@ -41,12 +41,30 @@ import '../theme/app_theme.dart';
 import '../widgets/form_field.dart' show FormFieldGroup, FormTextField;
 
 class ExamProfileCreatePage extends StatefulWidget {
-  const ExamProfileCreatePage({super.key});
+  const ExamProfileCreatePage({super.key, this.initial});
+
+  /// 编辑模式（m29656 任务 B5：首页卡片长按进入编辑）。
+  ///
+  /// 为 null = 新建；非 null = 用这条 profile 回填表单，提交时走
+  /// `PATCH /exam-profiles/:id` 而不是 `POST`。
+  ///
+  /// 为什么复用本页而不是新建一个 `ExamProfileEditPage`：
+  ///   两页的字段、校验、日期选择器完全一样，唯一差别是「提交到哪个端点」
+  ///   与「标题叫什么」。复制一份 600 行的页面会让以后的表单改动多一个
+  ///   必改点，而这类「改了一处忘了另一处」正是本工程反复踩过的坑。
+  ///
+  /// 注意：本地表 `exam_profiles` 没有 `exam_type_custom` 列（见
+  /// `local_schema.dart`），所以从本地读出来的初始值里没有这个字段。
+  /// 编辑时只在用户真的改了「自定义名称」才把该键带上去（`PATCH` 是部分
+  /// 更新，不传的键不会被覆盖）。
+  final Map<String, Object?>? initial;
+
+  /// 是否处于编辑模式。
+  bool get isEditing => initial != null;
 
   @override
   State<ExamProfileCreatePage> createState() => _ExamProfileCreatePageState();
 }
-
 class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
   final ExamApi _api = ExamApi();
 
@@ -75,6 +93,73 @@ class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
     _examDate = DateTime(now.year, now.month, now.day).add(
       const Duration(days: 90),
     );
+    _prefillFromInitial();
+  }
+
+  /// 编辑模式：把 [ExamProfileCreatePage.initial] 回填到各输入框。
+  ///
+  /// 逐字段读、逐字段判类型：后端/B 端返回的 map 值可能是 String / num / null，
+  /// 直接强转会在某个字段为空时抛类型错误，用户只会看到一片红屏。
+  void _prefillFromInitial() {
+    final Map<String, Object?>? initial = widget.initial;
+    if (initial == null) return;
+
+    final Object? label = initial['target_label'];
+    if (label is String) _labelCtrl.text = label;
+
+    final Object? custom = initial['exam_type_custom'];
+    if (custom is String) _customCtrl.text = custom;
+
+    final Object? type = initial['exam_type'];
+    if (type is String && kExamTypeLabels.containsKey(type)) {
+      _examType = type;
+    }
+
+    final Object? score = initial['target_score'];
+    if (score is num) {
+      // numeric(6,2) 回来可能是 130.00，直接 toString 会显示成 130.0。
+      _scoreCtrl.text = score == score.roundToDouble()
+          ? score.toInt().toString()
+          : score.toString();
+    } else if (score is String && score.trim().isNotEmpty) {
+      _scoreCtrl.text = score.trim();
+    }
+
+    final Object? minutes = initial['daily_minutes'];
+    if (minutes is int) {
+      _minutesCtrl.text = minutes.toString();
+    } else if (minutes is num) {
+      _minutesCtrl.text = minutes.toInt().toString();
+    }
+
+    // source_scope 是 jsonb：可能是 {'raw': '...'}，也可能是裸字符串。
+    final Object? scope = initial['source_scope'];
+    if (scope is Map) {
+      final Object? rawScope = scope['raw'];
+      if (rawScope is String) _scopeCtrl.text = rawScope;
+    } else if (scope is String) {
+      _scopeCtrl.text = scope;
+    }
+
+    final Object? date = initial['exam_date'];
+    if (date is String) {
+      final DateTime? parsed = DateTime.tryParse(date.trim());
+      if (parsed != null) {
+        _examDate = DateTime(parsed.year, parsed.month, parsed.day);
+      }
+    }
+  }
+
+  /// 从 profile 里取乐观锁版本号（取不到返回 null → 不允许提交）。
+  ///
+  /// 与 `exam_config_page.dart` 的 `_versionOf` 同一套容错：Pg 的 int8
+  /// 经 JSON 过来可能是 int / num / String，三种都得认。
+  static int? _versionOf(Map<String, Object?> profile) {
+    final Object? raw = profile['version'];
+    if (raw is int) return raw;
+    if (raw is num) return raw.toInt();
+    if (raw is String) return int.tryParse(raw.trim());
+    return null;
   }
 
   @override
@@ -147,31 +232,61 @@ class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
 
     setState(() => _submitting = true);
     try {
-      final Map<String, Object?> raw = await _api.createExamProfile(
-        userId: kDemoUserId,
-        examType: _examType,
-        targetLabel: label,
-        examDate: _examDateText,
-        targetScore: score,
-        dailyMinutes: minutes,
-        sourceScope: scope,
-        examTypeCustom: _isCustom ? custom : null,
-      );
+      final Map<String, Object?> initial = widget.initial ?? const <String, Object?>{};
+      final String? profileId = widget.initial == null
+          ? null
+          : (initial['id'] is String ? initial['id']! as String : null);
+      final int? baseVersion = widget.initial == null
+          ? null
+          : _versionOf(initial);
+      if (widget.initial != null && (profileId == null || baseVersion == null)) {
+        await _alert('无法保存', '这条考试目标缺少有效的 id 或版本号，请返回列表下拉刷新后重试。');
+        return;
+      }
+      final Map<String, Object?> raw = widget.initial == null
+          ? await _api.createExamProfile(
+              userId: kDemoUserId,
+              examType: _examType,
+              targetLabel: label,
+              examDate: _examDateText,
+              targetScore: score,
+              dailyMinutes: minutes,
+              sourceScope: scope,
+              examTypeCustom: _isCustom ? custom : null,
+            )
+          : await _api.updateExamProfile(
+              profileId!,
+              version: baseVersion!,
+              examType: _examType,
+              // 只有用户真的填了自定义名称才传：本地表没这列，回填时
+              // 拿不到原值，硬传空串会覆盖掉云端已有的自定义名称。
+              examTypeCustom: (_isCustom && custom.isNotEmpty) ? custom : null,
+              targetLabel: label,
+              examDate: _examDateText,
+              targetScore: score,
+              dailyMinutes: minutes,
+              sourceScope: scope,
+            );
       if (!mounted) return;
 
-      final int preset = _countSubjects(raw);
-      await _alert(
-        '创建成功',
-        preset > 0
-            ? '已为你预置 $preset 个科目，可以直接进入科目管理补充考点。'
-            : '请进入科目管理手动添加',
-      );
+      if (widget.initial != null) {
+        // 编辑模式：不报「预置科目」，只确认保存。
+        await _alert('已保存', '考试目标已更新，首页卡片会同步刷新。');
+      } else {
+        final int preset = _countSubjects(raw);
+        await _alert(
+          '创建成功',
+          preset > 0
+              ? '已为你预置 $preset 个科目，可以直接进入科目管理补充考点。'
+              : '请进入科目管理手动添加',
+        );
+      }
       if (!mounted) return;
       Navigator.of(context).pop(true);
     } catch (e) {
       if (!mounted) return;
       setState(() => _submitting = false);
-      await _alert('创建失败', _errorText(e));
+      await _alert(widget.initial == null ? '创建失败' : '保存失败', _errorText(e));
     }
   }
 
@@ -292,11 +407,11 @@ class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
           parent: AlwaysScrollableScrollPhysics(),
         ),
         slivers: <Widget>[
-          const CupertinoSliverNavigationBar(
+          CupertinoSliverNavigationBar(
             previousPageTitle: '返回',
             largeTitle: Text(
-              '新建考试目标',
-              style: TextStyle(
+              widget.initial == null ? '新建考试目标' : '编辑考试目标',
+              style: const TextStyle(
                 fontFamily: kFontFamily,
                 fontSize: 34,
                 fontWeight: FontWeight.w700,
@@ -547,9 +662,9 @@ class _ExamProfileCreatePageState extends State<ExamProfileCreatePage> {
         onPressed: _submitting ? null : _submit,
         child: _submitting
             ? const CupertinoActivityIndicator(radius: 10)
-            : const Text(
-                '创建考试目标',
-                style: TextStyle(
+            : Text(
+                widget.initial == null ? '创建考试目标' : '保存修改',
+                style: const TextStyle(
                   fontFamily: kFontFamily,
                   fontSize: 17,
                   fontWeight: FontWeight.w600,
