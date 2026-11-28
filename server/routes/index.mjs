@@ -50,7 +50,9 @@ import * as questionTypes from './question_types.mjs';
 //   （seg.length===2）；若 defect_tickets 先命中，它的 GET /defect-tickets/:id
 //   会把 'custom-reasons' 当成 id → uuid 铸型 22P02 → 500 internal。
 import * as defectQuestions from './defect_questions.mjs';
-
+// m31124：导入批次列表（GET /import-batches）。
+// 只认单段路径 'import-batches'，不与任何 questions / exam-profiles 路径交叉。
+import * as importBatches from './import_batches.mjs';
 /**
  * 挂载顺序即匹配优先级。长路径模块在前，短路径在后。
  * @type {Array<{name: string, match: Function}>}
@@ -60,6 +62,8 @@ export const ROUTE_MODULES = Object.freeze([
   { name: 'exam_progress', match: examProgress.match },
   // m27163 A2②：题型词表（只认单段路径，不遮蔽任何已有路径）。
   { name: 'question_types', match: questionTypes.match },
+  // m31124：导入批次列表（单段路径，不遮蔽任何已有路径）。
+  { name: 'import_batches', match: importBatches.match },
   // m27163 C4：缺陷单↔题目关联 + 历史自定义错因。★ 必须排在 defect_tickets 之前，
   // 否则 GET /defect-tickets/custom-reasons 会被 GET /defect-tickets/:id 抢走。
   { name: 'defect_questions', match: defectQuestions.match },

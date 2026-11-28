@@ -77,3 +77,37 @@ export function masteryFilterClause({ userId, mastered, tableAlias = 'questions'
   return { clause, params: [userId] };
 }
 
+/**
+ * ★ m31635：三态掌握度过滤（题库多条件组合筛选）。
+ *
+ * 与 [masteryFilterClause] 的区别只有一个，但很重要：多了 `unmarked`。
+ *   * `mastered`   → EXISTS(... AND mastered = true)
+ *   * `unmastered` → EXISTS(... AND mastered = false)
+ *   * `unmarked`   → **NOT** EXISTS(...) —— 一行标记都没有
+ *
+ * `unmarked` 不能写成 `NOT EXISTS(... AND mastered = false)`：那样会把
+ * 「标为已掌握」的题也算成未标记。必须整个子查询取反。
+ *
+ * 注意：`unmarked` 语义依赖 token 用户，只有 `userId` 存在时才成立
+ * （公共只读账号没有自己的标记，一律走参数为空不筛分支）。
+ *
+ * @returns {{clause: string, params: Array<string>}|null}
+ */
+export function masteryStateFilterClause({ userId, state, tableAlias = 'questions', paramIndex = 1 }) {
+  if (!userId) return null;
+  if (state === 'mastered' || state === 'unmastered') {
+    return masteryFilterClause({
+      userId,
+      mastered: state === 'mastered',
+      tableAlias,
+      paramIndex,
+    });
+  }
+  if (state === 'unmarked') {
+    const clause = `NOT EXISTS (SELECT 1 FROM ${MASTERY_TABLE} qm
+      WHERE qm.question_id = ${tableAlias}.id AND qm.user_id = $${paramIndex})`;
+    return { clause, params: [userId] };
+  }
+  return null;
+}
+

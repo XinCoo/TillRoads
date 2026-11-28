@@ -3026,3 +3026,381 @@ flutter test                      →  00:03 +108: All tests passed!
 - `exam_type_custom` 未写入本地 `exam_profiles` 表：从本地读出的卡片进编辑页时，自定义类型名会回落成预设标签；下拉刷新走一次云端即恢复。修法是给 `local_schema.dart` 加列 + `onUpgrade` 幂等加列 + `_profileToWire` 补映射。
 - 堆叠卡片在「第 1 张翻到背面后快速滑到第 2 张」的极端时序下，理论上存在 1 帧的正面/背面闪烁（`didUpdateWidget` 在 build 前执行，但 `AnimatedBuilder` 的 Listenable 合并可能在下一帧才重建）。**任务书明确本轮不做真机验证**，此条留待用户真机观察后决定是否需要加 `Key` 级重建。
 - 第 3 层 `+N` 徽标的点击跳转目标是「考试配置页」而不是「第 4 张卡」，因为没有「列表页」这一层；如果将来配置页支持多卡片列表，应改为直接翻到那张。
+
+---
+
+## 50. m30197 归档（题库导入科目自动匹配 + 考点自动创建 + 批量重新分配）
+
+### 50.1 范围与拍板
+
+用户（m30197）要求：「题库生成提示词已扩展，每题带 subject（用户填的科目名）和 node（AI 分析的考点路径，"/" 分隔）。导入时后端按 subject 匹配已有科目，按 node 匹配或创建考点树。」
+
+硬约束（照抄）：不改 `schema.sql`；不改 `core/`、不改状态机；不改练习/模考抽题逻辑；不引新依赖；自动创建考点**只在导入时开启**；subject 匹配失败**不自动建科目**；不截图、不跑 adb；不执行 git 命令。
+
+三个关键判断：
+
+1. **subject/node 只能从 JSON 进来。** md/txt/csv/pdf/xlsx 经 `splitter.parseBlock` 只产出 `{stem, options, answer, analysis, separator, startLine, endLine}`，结构上没有科目/考点字段。所以「识别 subject/node」的前提是「能接收 JSON」——而 `extract.mjs` 原本 `MIME_ALIASES` / `EXT_KINDS` **都没有 json 条目**。这构成任务 A 的前置：必须先开 json 通道。
+2. **匹配失败返回 null 而不是降级到模糊最近邻。** `pickBest` 三档命中即停（exact → contains → contained），全不中返回 null、绝不建科目。理由：自动建科目会让用户科目表长出误建项，而科目是低频手工维护的实体，宁可让用户批量移动。
+3. **考点自动创建必须在事务内。** 它会写 `knowledge_nodes`；如果放到事务外，一旦题目插入阶段回滚就会出现「题目没了但考点还在库里」的孤儿。
+
+### 50.2 文件表
+
+| 文件 | 变动 | 职责 |
+| --- | --- | --- |
+| `server/import/resolve_subject.mjs` | 新建 155 行 | `resolveSubject` + 带缓存的 `createSubjectResolver`；三档匹配；**不建科目** |
+| `server/import/resolve_node.mjs` | 新建 138 行 | `splitNodePath` / `resolveNode` / `createNodeResolver`；逐级匹配 + 缺级建 |
+| `server/import/json_import.mjs` | 新建 235 行 | `parseQuestionJson` / `hasAnySubject`；题型与选项归一 |
+| `server/import/extract.mjs` | 改 | 新增 `json` kind（`application/json` / `text/json` / `.json`）；415 文案含 JSON |
+| `server/routes/questions_import.mjs` | 改 | `subject_mode` 分流、逐题解析、响应新增两个字段、`errors` 改解析问题 |
+| `server/repositories/questions.mjs` | 改 | 新增 `updateAssignmentBatch` |
+| `server/routes/questions.mjs` | 改 | 新增 `updateQuestionsAssignmentBatch` + `PATCH /questions/batch` 分支 |
+| `server/import/import.integration.test.mjs` | 改 | 12 → 17 用例（新增 5 条） |
+| `tests/fixtures/questions/sample-04-ai-json.json` | 新建 | 3 行测 + 2 公基，含两级考点 |
+| `tillroad_app/lib/api/question_api.dart` | 改 | `ImportSubjectMatch` / `ImportNodeCreated` / `updateQuestionsBatch` |
+| `tillroad_app/lib/pages/question_import_page.dart` | 改 | 两模式切换 + 结果页两块 |
+| `tillroad_app/lib/pages/question_manage_page.dart` | 改 | 批量「移动到科目」「设置考点」 |
+| `docs/question-recognition-prompt.md` | 改 | 第五节重写；输出格式示例补 subject/node |
+
+### 50.3 关键实现
+
+**resolve_subject 的候选 SQL**（`subjects` 表没有 `user_id` 列，必须 JOIN）：
+
+```sql
+SELECT s.id, s.name, s.exam_profile_id
+  FROM subjects s
+  JOIN exam_profiles ep ON ep.id = s.exam_profile_id
+ WHERE ep.user_id = $1 AND ep.deleted_at IS NULL AND ep.status = 'active' AND s.deleted_at IS NULL
+ ORDER BY s.created_at ASC, s.id ASC
+ LIMIT 500
+```
+
+`normalize(text)` = `String(text).replace(/\s+/g, ' ').trim().toLowerCase()`（全角空格、多余空格先归一再比）；`pickBest` 同档命中多个时取**名字最短**者（短名更泛，更少误配）。
+
+**resolve_node 的根层匹配必须用 `IS NOT DISTINCT FROM`**：
+
+```sql
+SELECT id, title, parent_id FROM knowledge_nodes
+ WHERE subject_id = $1 AND parent_id IS NOT DISTINCT FROM $2
+   AND title = $3 AND deleted_at IS NULL LIMIT 1
+```
+
+用 `parent_id = $2` 在根层（parent 为 NULL）永远不命中，因为 `NULL = NULL` 是 NULL 而不是 true。
+
+**导入管线的逐题循环**（`from_file`）：
+
+```js
+let subjectId = createCtx.subject_id;   // 兜底科目
+let nodeId = createCtx.knowledge_node_id;
+let subjectResolved = true;             // 初值 true：文件没写 subject，兜底科目可信
+if (subjectText !== '') {
+  const hit = await subjectResolver(subjectText);
+  if (hit) { subjectId = hit.subject_id; subjectResolved = true; matchedCount += 1; ... }
+  else { subjectResolved = false; unmatchedCount += 1; ... }
+}
+const subjectUsable = subjectResolved;
+if (nodeText !== '' && subjectUsable) { ... }
+```
+
+**`PATCH /questions/batch` 的语义边界**（`updateAssignmentBatch`）：
+
+- 只改 `owner_user_id = $2` 的题，公共题与别人的题静默跳过（返回 `skipped` 计数），与 `updateTagsBatch` 同口径。
+- `clearKnowledgeNode: true` → `knowledge_node_id = NULL`；科目**不能**置空。
+- **只换科目、没给考点时，一并把 `knowledge_node_id` 置 NULL**。否则会出现「题在科目 A、考点却挂在科目 B 的子树下」——外键只保证 node 存在，不保证 node 属于该 subject。
+- 不带 `version`（批量操作对每行的乐观锁无意义，用户已经在多选时确认了意图）。
+
+### 50.4 本轮定位到的两个真 bug
+
+1. **未匹配科目的题仍被写入了考点。** 初版 `if (nodeText !== '')` 无条件解析 node，即使该题文件里的 subject 匹配失败（此时 `subjectId` 只是兜底科目）。后果：把**别的科目的考点路径**建到兜底科目树下，用户会看到莫名其妙的考点，且这些考点会污染后续的 node 匹配。修法见 50.3 的 `subjectResolved` flag。
+   初版用 `subjectId !== createCtx.subject_id` 判断「匹配成功」是错的 —— **当匹配到的科目恰好就是兜底科目时会误判成未匹配**。必须用独立 flag。
+2. **`matchedCount` / `unmatchedCount` 被 edit 连带删掉。** 症状很迷惑：`subject_matched.matched_subjects` 里 `行测 count=3`、`公基 count=2` 完全正确，但 `matched_count` 恒 0。原因是插入 `subjectResolved = true;` 时，紧随其后的 `matchedCount += 1;` 被同一次 edit 覆盖。**是靠 PGlite 探针直接打 `runImport` 打印出来「两个字段互相矛盾」才发现的**——如果只看 HTTP 响应，只会以为「匹配没生效」。
+
+### 50.5 测试与验证
+
+**新增 fixture**：`tests/fixtures/questions/sample-04-ai-json.json` 5 题（3 道 `subject:"行测"` 其中 2 道 `node:"资料分析/增长率"`、1 道「判断推理/图形推理」；2 道 `subject:"公基"` 其中 1 道「法律/宪法」）。
+
+**新增 5 个集成用例**（`server/import/import.integration.test.mjs`，文件 12 → 17）：
+
+1. `from_file`：3 行测 + 2 公基分别归入对应科目，两级考点自动创建（断言 `imported=5`、`matched_count=5`、按名字分组的 3/2、`created_count=3`、`created_paths` 排序后等于三条路径、行测考点标题集合）。
+2. `from_file`：subject 写「科技常识」而库里叫「科技常识-物理」→ 模糊匹配成功。
+3. `from_file`：subject 匹配不到 → **不自动建科目**，回落请求里的兜底科目（并断言 subjects 表里没有那个名字）。
+4. `uniform`（默认）：文件里的 subject/node 被忽略，全部进请求指定的科目。
+5. `PATCH /questions/batch`：批量改科目会清空旧考点，批量设考点可单改；含 `NOTHING_TO_UPDATE` / `EMPTY_IDS` / 别人的题 `skipped=1` 三个负例。
+
+**PGlite 真库 17/17 全过**（本机无 PG）。本机 `npm test` 因无 PG 会 skip 集成，只证明非集成部分不回归：
+
+```
+npm test                          →  tests 408 / pass 215 / fail 0 / skipped 193
+PGlite import.integration (真库)  →  tests 17 / pass 17 / fail 0
+flutter analyze --no-fatal-infos  →  97 issues, ERROR=0 WARNING=0 (全 deprecated_member_use)
+flutter test                      →  00:07 +108: All tests passed!
+```
+
+**D4 专项证据**（`.tmp-d4.mjs`，PGlite 真库直调 `runImport`，用后已删）：
+
+```
+=== D4-1 imported = 3
+=== D4-2 subject_matched.matched_count = 3
+=== D4-3 matched_subjects = [{..."name":"行测","count":3}]
+=== D4-4 questions in 行测 = 3
+=== D4-5 node_created = {"created_count":2,"created_paths":["资料分析/增长率","资料分析/基期量"]}
+=== D4-6 一级考点 1 个 / 二级考点 2 个
+```
+
+即：3 道 subject=行测 的题 `matched_count=3`；`资料分析/增长率` 这条路径在 `knowledge_nodes` 里确实存在**两级**记录（根 `资料分析` + 子 `增长率`），证明逐级自动创建生效。
+
+### 50.6 本轮踩的坑（load-bearing）
+
+1. **`edit` 锚点必须唯一。** `  return {` 与 `    return {` 在两个不同函数里哈希相同 → `E_STALE_ANCHOR ambiguous anchor: Hash "FHA" matches lines 130, 359`。解法是选一段**只出现一次**的多行范围，而不是靠「这段代码看起来一样」去猜。
+2. **小范围 edit 会连带吞掉相邻行。** 本轮第 3 次出现同类事故（前两次：`extract.mjs` 重复 `.heic` 行、`updateAssignmentBatch` 重复 `return rows.length`）。规矩：**每次 edit 之后必须 `read` 回读整个被改的分支块**，不要只看 diff 摘要。
+3. **对象字面量漏 `});` 是语法级事故。** `extract.mjs` 的 `EXT_KINDS` 加 `.json: 'json',` 后忘了闭合，报 `SyntaxError: Unexpected token 'function'` at `export function importError` —— 错误位置指向下一个函数，容易误判为「那个函数坏了」。加完新键必须 `node --check`。
+4. **集成测试忘了设 `process.env.TOKENS` 会静默降级成 401。** `createApp()` 在**创建时**就把 `parseTokens()` 读进闭包，之后改环境变量无效；`tokens` 为空数组时不走鉴权 → `ctx.authUserId === undefined` → 所有要求 token 的端点返回 401。`server/import/import.integration.test.mjs` 原本完全没有 token（它测的是导入），本轮加了批量端点测例才暴露。
+5. **PGlite 是唯一能在本机验证 plpgsql / 触发器的办法。** 适配器 `createPool()` 必须**同步**返回（测试里 `pool = createPool()` 之后立刻用，async 会拿到 Promise）；`exec` 里「无参数且 `/;\s*\S/` 命中」→ `db.exec(text)`，否则 `db.query(text, params)`（否则多语句报 42601）；`rowCount` 取 `rows.length > 0 ? rows.length : res.affectedRows`。探针脚本必须先 `client.query(FULL_SCHEMA_SQL)`，否则报 `relation "users" does not exist`。
+
+### 50.7 偏离任务书的地方（如实记录）
+
+1. **B4 预览未做。** 任务书写「可选，若工作量允许」。本轮直接做了结果页展示（匹配题数 / 归入科目 / 未匹配科目 / 新建考点路径），没做「提交前预览 N 题 / M 科目 / K 考点」——因为预览需要在前端完整解析文件（PDF/XLSX 解析逻辑都在后端），要么复刻一套解析器、要么加一个 dry-run 端点，两者都超出「可选」的性价比。
+2. **`PATCH /questions/batch` 不允许清空科目。** 任务书只要求 `subject_id?` / `knowledge_node_id?` 两个字段。本轮实现里「不给 subject_id」等于「不碰科目」，不提供把题目改成未分类的能力 —— 那样会让题从所有科目里消失、且没有 UI 入口改回来。
+3. **科目/考点批量移动只对「自己的题」生效。** 任务书没写公共题怎么办。参照 `updateTagsBatch` 的既有口径（`owner_user_id = $2`），公共题与别人的题静默跳过并在 `skipped` 里计数 —— 公共题属于所有人，单个用户不该能改它的归属。
+
+### 50.8 遗留
+
+- **科目匹配是启发式**：文件写简称（「公基」）而库里叫全称（「公共基础知识」）时不会命中（`contains` 要求库里的名字**包含**文件里的词，反向不成立），只能靠兜底科目 + 题库管理页批量移动。改进方向：加同义词/别名表，或允许用户在导入页为未匹配项手工指定映射。
+- **跨多个 active 考试目标时同名科目会取「名字最短」那个**，归属不确定。当前用户模型下 active 目标通常只有 1 个，暂不处理；若将来支持并行目标，应让用户在导入页选目标。
+- **`GET /questions` 仍无 `hidden=` 参数**（接 49.11 第 1 条），与本轮无关但同一块题库能力。
+- **导入的 `errors` 只覆盖 JSON 解析层**（缺 stem / 非对象）；`knowledge_nodes` 创建失败（非 409 的其他异常）只 `console.warn` 不回流给用户，导入结果里看不到「哪道题的考点没建成」。改进方向：把 `resolve_node` 的失败也塞进 `errors`。
+
+## 51. m31124 归档（题库导入批次 + 批次筛选 + 整批删除）
+
+### 51.1 范围与三个关键判断
+
+用户反馈「导入多次后题库很乱，不知道哪些题是哪次导的，删错题要逐题勾」。任务书给的是 A 迁移 / B 后端 / C 前端 / D 验证四块。
+
+三个自己拍的点（任务书没写死，会影响后面所有实现）：
+
+1. **批次号冗余在 `questions` 上，不做关联表**。理由：主路径是「按批次查题」，`idx_q_batch` 直接命中，不必为一次列表查询 JOIN 一张账本表；`import_filename` / `imported_at` 本来就是「这道题从哪来」的档案属性，跟着题走比跟账本走更自然。
+2. **`import_batches` 存 `question_count`，不做实时 `count(*)`**。下拉要显示「文件名（N 题）」，如果每次进页面都全表 count 一遍，批次一多就是每条一次聚合查询。代价是这个数字是**历史快照**而不是当前值 —— 见 51.3 的口径提醒。
+3. **`batch_id` 刻意不建外键**。批次是账本、题是数据：删题（软删或将来物理删）不该被批次行挡住，删批次行也不该级联删题。归属一致性由应用层保证（`archiveByBatch` / `countByBatch` 都带 `owner_user_id` 条件）。
+
+### 51.2 文件表
+
+| 文件 | 变化 |
+|---|---|
+| `migrations/0007_import_batch.sql` | **新建**。三列 `ALTER ... ADD COLUMN IF NOT EXISTS` + 部分索引 `idx_q_batch` + `import_batches` 表 + `idx_ib_user_time` + 四条 `COMMENT ON` |
+| `migrations/0007_import_batch_down.sql` | **新建**。按依赖反序 DROP（先 `idx_ib_user_time` → 表 → `idx_q_batch` → 三列） |
+| `scripts/migrate.mjs` | `UP_MIGRATIONS` 末尾追加；`DOWN_MIGRATIONS` **开头**插入（反序数组） |
+| `server/db/test_schema.mjs` | `MIGRATION_FILES` 末尾追加（集成测试靠它建全库，漏了 CI 就 42P01） |
+| `server/repositories/import_batches.mjs` | **新建**。`create` / `updateQuestionCount` / `listByUser` / `getById` |
+| `server/routes/import_batches.mjs` | **新建**。`GET /import-batches` 单段路径 |
+| `server/routes/index.mjs` | `ROUTE_MODULES` 插在 `question_types` 之后（单段路径不遮蔽任何已有路径） |
+| `server/repositories/questions.mjs` | `WRITABLE_COLUMNS` 加三列；新增 `BATCH_COLUMNS` 并从 `UPDATE_COLUMNS` 排除；`create` values 尾部补三值；`listVisible` 加 `batchId`；新增 `archiveByBatch` / `countByBatch` |
+| `server/routes/questions.mjs` | `listQuestions` 读 `batch_id` 查询参数；`deleteQuestionsBatch` 改成分流（`batch_id` 优先，否则 `ids`） |
+| `server/routes/questions_import.mjs` | 事务内建批次 → 逐题带三列 → 插完回填；响应加 `batch_id` / `import_filename` |
+| `server/import/import.integration.test.mjs` | `after()` 加 `DELETE FROM import_batches`；末尾追加 3 用例 + 3 helper |
+| `tillroad_app/lib/api/question_api.dart` | 新增 `ImportBatch` 模型与 `relativeTimeLabel`；`fetchQuestions` 加 `batchId`；新增 `fetchImportBatches` / `deleteQuestionsByBatch` |
+| `tillroad_app/lib/pages/question_manage_page.dart` | 新增 `_batches` / `_batchId` / `_batchBusy`、`_loadBatches`、`_pickBatch`、`_deleteBatch`、`_batchById`、`_buildBatchRow`；`_confirm` 加 `destructive` 参数 |
+
+### 51.3 关键实现与两条口径
+
+**导入双写时序**（`questions_import.mjs` 事务内）：
+
+```js
+let batchId = null;
+if (ownerUserId) {
+  const batchRow = await importBatchesRep.create(client, { userId: ownerUserId, filename });
+  batchId = batchRow.id;
+}
+const batchCtx = { ...createCtx, batch_id: batchId, import_filename: batchId ? filename : null, imported_at: batchId ? new Date() : null };
+// ...逐题 candidates.push(toCreateInput(q, { ...batchCtx, ... }))
+// ...插入循环结束后：
+if (batchId && ownerUserId) {
+  await importBatchesRep.updateQuestionCount(client, { batchId, userId: ownerUserId, questionCount: imported.length });
+}
+```
+
+三步必须同在 `withTransaction` 里：抽到事务外会出现「题目回滚了但批次行还在 / 批次行回滚了但题带上了野 batch_id」。回填用 `imported.length` 而不是 `candidates.length` —— 判重跳过的题**没有**真的入库，算进去会让下拉显示「5 题」而列表只有 3 条。
+
+**两个数字必须分清**（这是本轮最容易出错的口径）：
+
+- `import_batches.question_count` = **导入当时入库了几道**（历史值，删题后不变）。
+- `DELETE /questions/batch` 返回的 `requested` = **删除那一刻该批还剩几道**（实时值）。
+
+确认弹窗里用前者（那时还没删，两者通常相等），结果提示里用后者（`deleted` 才是真的删了几条）。所以 `countByBatch` 必须在 `archiveByBatch` **之前**调用 —— 写反了 `requested` 恒为 0，用户会看到「将删除 3 道」但结果提示「共删除 0 道」。
+
+**`batch_id` 筛选天然满足需求 C3**：`WHERE batch_id = $n` 不会命中 `batch_id IS NULL` 的行，所以手动建的题只在「全部批次」下出现，不需要额外写 `AND batch_id IS NOT NULL` 之类的判断。
+
+### 51.4 偏离任务书的地方
+
+1. **迁移编号 0006 → 0007**。任务书要 `0006_import_batch.sql`，但 `migrations/0006_exam_custom_defect_questions.sql` 已被 m27163（自定义考试类型 + 缺陷单多题关联）占用。占用是既成事实，重命名会让**已经跑过 0006 的 Neon 库**永远漏掉那批变更（migrate.mjs 是全量重放式，但运维记录与文档都在说 0006 是那个迁移）。所以新建 0007，两边编号并存。
+2. **`GET /import-batches` 不收 `user_id` 查询参数**。任务书写的是 `GET /import-batches?user_id=`，实际实现只认 token 里的 user。原因：`server/index.mjs` 在带 token 时会把 `searchParams.set('user_id', authUserId)` **覆盖**掉调用方传的值 —— 收参数要么形同虚设、要么得为它开一条「信任 query」的例外，两者都不如直接说明「user 只从 token 来」。
+3. **前端批次下拉只在三档显示**。「已删除」走 `/questions/deleted`、「已隐藏」走本机 `HiddenQuestionStore`，这两个数据源都不带批次语义（前者后端没实现该参数、后者只是本地快照）。硬塞一个查不到东西的下拉只会误导。切到这两档时 `_batchId` 一并清空，切回来是「全部批次」而不是莫名其妙只剩一个批次。
+
+### 51.5 测试与验证
+
+新增 3 个集成用例（`import.integration.test.mjs`）+ 3 个 helper（`batchPayload` / `countQuestionsInBatch` / `readBatchRow`）：
+
+1. **导两次得到两个批次，删第一批不影响第二批** —— 覆盖 `imported` / `batch_id` 回显、3 行题目带的三个档案列、`question_count` 回填、`GET /import-batches` 的 DESC 排序与**四列白名单**（`Object.keys(...).sort()` 严格等于 `['created_at','filename','id','question_count']`，防以后不小心把 `user_id` 漏出去）、`GET /questions?batch_id=` 只返回该批、`DELETE` 的 `deleted/requested/skipped`、第二批毫发无伤、**软删而非物理删**（3 行都在且 `deleted_at` 非空）、批次行不随题删、**再删一次幂等**（`deleted=0, requested=0`）。
+2. **手动建题 batch_id 为 null** —— 三列全 null。
+3. **参数校验** —— `{}` → `400 EMPTY_IDS`；`{batch_id: 123}` → `400 INVALID_BATCH_ID`；不存在的 uuid → `200` 且 `deleted=0`（幂等，不报错）。
+
+数字：
+
+- `npm test` → **tests 411 / pass 215 / fail 0 / cancelled 0 / skipped 196**（上轮 408；本机无 PG 所以集成仍 skip）。
+- **PGlite 真库 → tests 20 / pass 20 / fail 0 / skipped 0**（17 原有 + 3 新增），日志可见 `[IMPORT] 完成：插入 3 条` / `插入 2 条`。
+- `flutter analyze --no-fatal-infos` → **0 error / 0 warning / 98 info**（全 `deprecated_member_use`）。
+- `flutter test` → **108/108 All tests passed**。
+
+### 51.6 踩坑（5 条，全是 edit 工具层面的）
+
+1. **`listVisible` 形参表补 `batchId,` 时把行尾 `),` 写丢** → `SyntaxError: Unexpected token ')'` at `server/repositories/questions.mjs`。补 `},
+) {` 才恢复。
+2. **`listQuestions` 里 `repo.listVisible` 的参数补完多出一行 `});`** → 双闭合。多行 edit 后再补一行，最容易在「原行已被改动」的位置叠出重复。
+3. **`deleteQuestionsBatch` 重写时旧函数体残留**（旧的 `if (!ctx.authUserId)` 与 `const body` 两段）→ 一次 edit 删 5 行。
+4. **`ROUTE_MODULES` 插入时把注释当锚点替换掉** —— 恢复时要同时补回「m27163 C4 必须排在 defect_tickets 之前」那两行注释，否则后来人不知道为什么顺序重要。
+5. **前端 `firstOrNull` 不可用**：本工程没依赖 `package:collection` 的 `IterableExtension`，Dart 核心库没有这个 getter。改写成 `_batchById` 手写 for 循环（先在 `_buildBatchRow` 里误用了 `_batches.where(...).firstOrNull`，analyze 直接 `undefined_getter`）。
+
+另外一次目录级事故：`question_manage_page.dart` 插入批次行时把 `_buildFilterRow()` 的函数体整段吃了（sliver 列表里多出一个 `),`、函数只剩签名），`analyze` 报 14 条 error。恢复方式是 read 出上下文后一次性写回完整函数体 —— 这类「函数体被吞」只能靠整段重写，逐行补会越补越乱。
+
+### 51.7 遗留
+
+1. **`import_batches` 只增不删**：本轮没有任何清理/归档机制，长期使用下拉会越来越长。需要时加「只显示最近 N 条」或过期清理（`created_at < now() - interval 'N days'`）。
+2. **批次筛选不作用于「已删除」「已隐藏」两档**（见 51.4 第 3 条）。要按批次恢复题，得先切回「全部批次」再在列表里逐题找。
+3. **`/questions/deleted` 不支持 `batch_id`**：后端没实现该参数，所以「整批删除后按批次查看被删的题」做不到。改动很小（`listDeleted` 加一个 where 条件），但会动到已冻结的删除路径，本轮没做。
+4. **批次名字段没做唯一性/去重**：同一个文件名导入两次就是两条批次（这是对的），但下拉里会看到两条一模一样的「exam.json（3 题）· 2 分钟前 / 5 天前」—— 靠相对时间区分。将来可以加「第 N 次导入」序号。
+
+## 52. m31635 归档（题库多条件组合筛选：科目 + 题型 + 掌握状态 + 批次）
+
+### 52.1 范围与三个判断
+
+本轮把「一次只能选一档」的筛选器改成**多维度叠加（AND）**。三个判断：
+
+1. **过滤全部下推到 SQL，不在客户端二次过滤**。四个维度（科目 / 题型 / 掌握状态 / 批次）都在同一次 `GET /questions` 请求里表达成 WHERE 条件。若在客户端 `where()` 过滤已分页的结果，会出现「第 1 页 20 条过滤剩 3 条，但总数还是 20」的错位。
+2. **`mastery` 三态用新参数，不复用旧 `mastered`**。旧参数只有布尔两态，表达不了「未标记」。新参数 `mastery=mastered|unmastered|unmarked` 与旧 `mastered=true|false` **并存**，`masteryState` 优先；参数全空时行为与改动前完全一致（老客户端不受影响）。
+3. **题型多值走数组参数，不拼字符串**。`type=choice,multi` 在路由层拆成数组，SQL 用 `type = ANY($n::text[])`；拼 `type = 'a' OR type = 'b'` 既容易注入也难去重。
+
+### 52.2 文件与改动量
+
+| 文件 | 改动 |
+| --- | --- |
+| `server/repositories/question_mastery.mjs` | 新增 `masteryStateFilterClause`（+26 行） |
+| `server/repositories/questions.mjs` | `listVisible` 加 `masteryState` / `types` 两个形参 + types 条件 + 掌握度三态优先（+25 行） |
+| `server/routes/questions.mjs` | `listQuestions` 解析 `type` / `mastery`；新增 `parseTypeFilter` / `parseMasteryFilter`（+40 行） |
+| `server/_fake_repos.mjs` | `questionPool.listVisible` 同步 types / masteryState（+18 行） |
+| `server/routes/question_filter.integration.test.mjs` | 新建，8 个用例（约 460 行） |
+| `package.json` | `test:integration` 追加该新文件 |
+| `tillroad_app/lib/api/question_api.dart` | `fetchQuestions` 加 `type` 参数 |
+| `tillroad_app/lib/pages/question_manage_page.dart` | 三维度 State + `_pickSubject` / `_pickType` / `_buildDimensionRow` / `_buildActiveFilterTags` / 空态改造（约 +200 行） |
+| `server/routes/questions.integration.test.mjs` | 修 `after()` 漏删 `import_batches` 的真回归 |
+
+### 52.3 关键实现
+
+**三态掌握度的 SQL 差别（本轮最容易写错的一行）**：
+
+```js
+// mastered / unmastered：行存在且值匹配
+export function masteryFilterClause({ userId, mastered, tableAlias = 'questions', paramIndex = 1 }) {
+  if (!userId || typeof mastered !== 'boolean') return null;
+  return {
+    clause: `EXISTS (SELECT 1 FROM ${MASTERY_TABLE} qm WHERE qm.question_id = ${tableAlias}.id AND qm.user_id = $${paramIndex} AND qm.mastered = ${mastered})`,
+    params: [userId],
+  };
+}
+
+// unmarked：NOT EXISTS 必须包住整个子查询
+export function masteryStateFilterClause({ userId, state, tableAlias = 'questions', paramIndex = 1 }) {
+  if (!userId) return null;
+  if (state === 'mastered') return masteryFilterClause({ userId, mastered: true, tableAlias, paramIndex });
+  if (state === 'unmastered') return masteryFilterClause({ userId, mastered: false, tableAlias, paramIndex });
+  if (state === 'unmarked') {
+    return {
+      clause: `NOT EXISTS (SELECT 1 FROM ${MASTERY_TABLE} qm WHERE qm.question_id = ${tableAlias}.id AND qm.user_id = $${paramIndex})`,
+      params: [userId],
+    };
+  }
+  return null;
+}
+```
+
+写成 `NOT EXISTS (... AND qm.mastered = false)` 会把「已掌握」的题也算成「未标记」—— 因为已掌握的题同样没有 `mastered = false` 的行。**三态由「行存在与否」承载，不是由布尔值承载**。
+
+**路由层参数解析（非法值静默忽略）**：
+
+```js
+function parseTypeFilter(raw) {
+  if (!raw) return [];
+  const seen = new Set();
+  for (const part of String(raw).split(',')) {
+    const t = part.trim();
+    if (t && QUESTION_TYPES.includes(t)) seen.add(t);   // 非法题型直接丢，不报 400
+  }
+  return [...seen];
+}
+
+function parseMasteryFilter(raw) {
+  const s = raw == null ? '' : String(raw).trim();
+  return s === 'mastered' || s === 'unmastered' || s === 'unmarked' ? s : undefined;
+}
+```
+
+不报 400 的理由：筛选是纯读操作，脏参数最坏结果是「没过滤」，让整页变错误页反而更糟。
+
+**前端不在客户端二次过滤**：
+
+```dart
+Future<void> _load() async {
+  ...
+  final List<BankQuestion> items = _filter.isDeleted
+      ? await _api.fetchDeletedQuestions(limit: 100, currentUserId: kDemoUserId)
+      : await _api.fetchQuestions(
+          limit: 100,
+          mastered: _filter.masteredParam,
+          subjectId: _subjectId,      // ★ 三维度与 mastered 是 AND，同一次请求
+          type: _typeParam,
+          currentUserId: kDemoUserId,
+          batchId: _batchId,
+        );
+}
+```
+
+**题型多选用 `StatefulBuilder` + 草稿集合**：弹窗内点击先改 `draft`，点「完成」才提交 —— 否则点开弹窗随手点两下就已经触发两轮请求。
+
+### 52.4 两个真问题
+
+1. **`masteryStateFilterClause` 首次编辑造成 AST 双定义**：把原 `masteryFilterClause` 整段重复插入，两个同名函数并存。`node --check` 不报（JS 允许重复声明 `function`），但后一个会静默覆盖前一个。发现方式是回读文件确认行号（现两个导出分别在 `:73` 与 `:96`）。
+2. **`questions.integration.test.mjs` 的 `after()` 漏删 `import_batches`**（m31124 引入的真回归）：该文件有用例调 `POST /questions/import`，从 m31124 起会建批次行；`import_batches.user_id` 有外键但无 `ON DELETE CASCADE`，于是 `DELETE FROM users` 报 `update or delete on table "users" violates foreign key constraint "import_batches_user_id_fkey"`。修法：在 `DELETE FROM exam_profiles` 之前插一条 `DELETE FROM import_batches WHERE user_id IN ($1, $2)`。**这个 bug 只有在真库（PGlite）跑才会暴露，本机 `npm test` 里该文件整段 skip。**
+
+### 52.5 测试与验证
+
+- 新增 `server/routes/question_filter.integration.test.mjs`，8 个用例：无筛选基线 / type 单选与多选 / mastery 三态 / type+mastery / 科目+题型+掌握度 / 四维全参数 / 旧 `mastered` 兼容 / owner 隔离。
+- 数据矩阵（A 的 5 道私有 + 1 道公共，B 的 1 道私有）：科目一 `choice 已掌握` / `choice 未掌握`（挂批次） / `multi 未标记` / 公共 `choice 未标记`；科目二 `choice 未标记` / `fill 已掌握`。
+- **PGlite 真库 8/8 pass**；关联回归 `questions` 20/20、`practice`+`user_data`+`defect_question_links` 22/22、`index` 11/11。
+- `npm test` → **419 tests / 215 pass / 0 fail / 204 skipped**。
+- `flutter analyze --no-fatal-infos` → **0 error / 0 warning / 98 info**；`flutter test` → **108/108**。
+- 判据仍是 `Select-String '^\s*(error|warning)\s'`（级别词后任意空白），不是 `\s+-`。
+
+D4 证据（真库）：选「科目一 + 题型 choice + 未掌握」→ 只剩 1 道（q2）；清除「未掌握」→ 变成 2 道（q1 已掌握 + q2 未掌握）。
+
+### 52.6 踩坑
+
+1. **`NOT EXISTS` 的括号范围**：写成 `NOT EXISTS (... AND mastered = false)` 语义完全错。凡是「行不存在」类语义（未标记、未隐藏、无标签），取反必须包整个子查询。
+2. **`ambiguous_import`**：`question_edit_page.dart:41` 也声明了 `const Map<String,String> kQuestionTypeLabels`，与本文件从 `question_api.dart` 导入的同名常量冲突。修法是 `import 'question_edit_page.dart' show QuestionEditPage;`。这类错误只报在常量**使用点**，编译时才炸，`flutter analyze` 能直接指出行号。
+3. **`setEquals` 不可用**：本文件没 import `package:flutter/foundation.dart`，只能手写 `_sameTypes`。`firstOrNull` 同理（无 `package:collection`）。
+4. **五个 chip 在 iPhone 宽度上溢出**：`_buildFilterRow()` 必须包 `SingleChildScrollView(scrollDirection: Axis.horizontal)`。
+5. **`edit` 吃掉 `if (_questions.isEmpty)` 块的收尾 `}`**：manifest 是 `Sti│      ];` 之后直接接下一个 sliver，`}` 丢了 → `expected_token`。单行补回即可，但要在回读时确认那一层 `if` 还剩几个花括号。
+6. **锚点必须带上下文行**：本文件里 `    }` / `  };` / `xmark` 这类短行在多个函数重复出现，单独做锚点会 `E_STALE_ANCHOR ambiguous`。
+
+### 52.7 偏离任务书
+
+1. **没有做「题型」的服务端白名单端点**：任务书说「题型下拉」，直接用本地 `kQuestionTypeLabels`（九个固定题型）而不是请求 `/question-types?scope=imported`。理由：`/question-types` 是统计「已导入题库里出现过哪些题型」，在还没有该题型的题时下拉会是空的，反而不如固定枚举。
+2. **`mastery` 与旧 `mastered` 并存**：任务书没要求保留旧参数，但向后兼容成本极低（几行），且 `server/index.test.mjs` 的 fake 路径用例仍在用旧参数。
+3. **筛选状态不持久化**：任务书 B6 明确要求「存在页面 State 里，不持久化」，已照做；相应地，从「我的」页退出再进题库管理页，筛选会回到「全部」。
+
+### 52.8 遗留
+
+1. **没有「科目 → 考点」级联筛选**：科目选中后，考点下拉没有跟着列出该科目的考点树。当前可以按科目过滤，但不能按考点过滤（`knowledge_node_id` 后端早已支持且有集成测试，缺的是 UI）。
+2. **筛选条件不参与分页**：`limit` 固定 100，超过 100 条时没有「加载更多」。四个维度叠加后很容易筛出不到 100 条，但如果只有一个维度，100 上限会咬到。
+3. **「已删除」「已隐藏」两档不支持任何维度叠加**：前者走 `/questions/deleted`、后者走本机快照，接口都不带这些参数。要恢复某批题，得先切回「全部批次」。
+4. **`type` 参数不做别名归一**：前端传的是 `kQuestionTypeLabels` 的 key（`choice` / `multi` …），但如果有人手工调 API 传 `选择题`，会被 `parseTypeFilter` 静默丢弃（返回空数组 = 不过滤）。
+
+---
+
+> 文档 v1.1 结束（m31635 多条件组合筛选归档）

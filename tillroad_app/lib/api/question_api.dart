@@ -152,6 +152,8 @@ class ImportResult {
     required this.duplicates,
     required this.errors,
     this.stats = const <String, Object?>{},
+    this.subjectMatched = const ImportSubjectMatch(),
+    this.nodeCreated = const ImportNodeCreated(),
   });
 
   /// 成功入库的题数。
@@ -166,6 +168,15 @@ class ImportResult {
   /// 后端统计（kind/mime/pages/total/bytes…）。
   final Map<String, Object?> stats;
 
+  /// 按科目匹配结果（`subject_matched`）。
+  ///
+  /// 旧后端没有这个字段 —— [ImportSubjectMatch.fromJson] 容错成全 0，
+  /// 界面据此整块不显示（不能拿 0 冒充「一道都没匹配上」）。
+  final ImportSubjectMatch subjectMatched;
+
+  /// 导入过程中自动创建的考点（`node_created`），同样是旧后端可缺失的字段。
+  final ImportNodeCreated nodeCreated;
+
   bool get isSuccess => imported > 0;
 
   factory ImportResult.fromJson(Map<String, Object?> json) {
@@ -179,6 +190,8 @@ class ImportResult {
           .toList(growable: false),
       errors: rawErrors.map((Object? e) => e is Map ? _str(e['message']) : '$e').toList(growable: false),
       stats: _asMap(json['stats']),
+      subjectMatched: ImportSubjectMatch.fromJson(_asMap(json['subject_matched'])),
+      nodeCreated: ImportNodeCreated.fromJson(_asMap(json['node_created'])),
     );
   }
 }
@@ -197,6 +210,107 @@ class ImportDuplicate {
     return ImportDuplicate(
       stem: _str(json['stem']),
       existingId: _str(json['existing_id']),
+    );
+  }
+}
+
+/// 一个科目的匹配计数（`subject_matched.matched_subjects[i]`）。
+class ImportSubjectCount {
+  const ImportSubjectCount({
+    this.subjectId = '',
+    this.name = '',
+    this.count = 0,
+  });
+
+  final String subjectId;
+  final String name;
+  final int count;
+
+  factory ImportSubjectCount.fromJson(Map<String, Object?> json) {
+    return ImportSubjectCount(
+      subjectId: _str(json['subject_id']),
+      name: _str(json['name']),
+      count: _int(json['count'], 0),
+    );
+  }
+}
+
+/// 导入时的按科目匹配结果（`subject_matched`）。
+///
+/// 旧后端（以及只传了 subject_id 的 uniform 导入）可能整段缺失，
+/// 此时 fromJson 全部归零 —— 界面用 [isEmpty] 判断要不要显示这个区块。
+class ImportSubjectMatch {
+  const ImportSubjectMatch({
+    this.matchedCount = 0,
+    this.unmatchedCount = 0,
+    this.unmatchedSubjects = const <String>[],
+    this.matchedSubjects = const <ImportSubjectCount>[],
+  });
+
+  /// 按文件里的 `subject` 文本匹配上的题数。
+  final int matchedCount;
+
+  /// 没匹配上、落进兜底科目的题数。
+  final int unmatchedCount;
+
+  /// 没匹配上的科目名（文件里写的原始文本）。
+  final List<String> unmatchedSubjects;
+
+  /// 匹配上的科目及各自题数。
+  final List<ImportSubjectCount> matchedSubjects;
+
+  /// 完全没有匹配信息（旧后端）。
+  bool get isEmpty =>
+      matchedCount == 0 &&
+      unmatchedCount == 0 &&
+      unmatchedSubjects.isEmpty &&
+      matchedSubjects.isEmpty;
+
+  factory ImportSubjectMatch.fromJson(Map<String, Object?> json) {
+    if (json.isEmpty) return const ImportSubjectMatch();
+    final List<Object?> rawMatched =
+        json['matched_subjects'] is List ? json['matched_subjects']! as List<Object?> : const <Object?>[];
+    return ImportSubjectMatch(
+      matchedCount: _int(json['matched_count'], 0),
+      unmatchedCount: _int(json['unmatched_count'], 0),
+      unmatchedSubjects: json['unmatched_subjects'] is List
+          ? (json['unmatched_subjects']! as List<Object?>)
+              .map((Object? e) => _str(e).trim())
+              .where((String e) => e.isNotEmpty)
+              .toList(growable: false)
+          : const <String>[],
+      matchedSubjects: rawMatched
+          .whereType<Map>()
+          .map((Map m) => ImportSubjectCount.fromJson(m.cast<String, Object?>()))
+          .toList(growable: false),
+    );
+  }
+}
+
+/// 导入时自动创建的考点（`node_created`）。旧后端同样可能缺失。
+class ImportNodeCreated {
+  const ImportNodeCreated({
+    this.createdCount = 0,
+    this.createdPaths = const <String>[],
+  });
+
+  final int createdCount;
+
+  /// 新建考点的路径，形如 `资料分析/增长率`。
+  final List<String> createdPaths;
+
+  bool get isEmpty => createdCount == 0 && createdPaths.isEmpty;
+
+  factory ImportNodeCreated.fromJson(Map<String, Object?> json) {
+    if (json.isEmpty) return const ImportNodeCreated();
+    return ImportNodeCreated(
+      createdCount: _int(json['created_count'], 0),
+      createdPaths: json['created_paths'] is List
+          ? (json['created_paths']! as List<Object?>)
+              .map((Object? e) => _str(e).trim())
+              .where((String e) => e.isNotEmpty)
+              .toList(growable: false)
+          : const <String>[],
     );
   }
 }
@@ -316,6 +430,70 @@ class BatchResult {
   @override
   String toString() => 'requested=$requested deleted=$deleted skipped=$skipped';
 }
+/// ★ m31124：一次导入的批次档案（`GET /import-batches` 的一项）。
+///
+/// 后端实际返回 4 列白名单：`id` / `filename` / `question_count` / `created_at`。
+/// [questionCount] 是「那次导入真正入库的题数」—— 不是当前还剩多少道，
+/// 所以即使整批被删掉，它仍然显示当初导入的数量（账本语义）。
+class ImportBatch {
+  const ImportBatch({
+    required this.id,
+    required this.filename,
+    this.questionCount = 0,
+    this.createdAt,
+  });
+
+  final String id;
+  final String filename;
+  final int questionCount;
+  final DateTime? createdAt;
+
+  /// 下拉里显示的文案：`文件名（N 题）· 3 分钟前`。
+  ///
+  /// 文件名可能很长（用户传的原始文件名），截断到 24 个字符并保留扩展名，
+  /// 免得下拉被一个超长文件名挤成两三行。
+  String get label {
+    final String name = filename.trim().isEmpty ? '未命名文件' : filename.trim();
+    return '${_shortenFileName(name)}（$questionCount 题）· ${relativeTimeLabel(createdAt)}';
+  }
+
+  factory ImportBatch.fromJson(Map<String, Object?> json) {
+    return ImportBatch(
+      id: _str(json['id']),
+      filename: _str(json['filename']),
+      questionCount: _int(json['question_count'], 0),
+      createdAt: _dateOrNull(json['created_at']),
+    );
+  }
+
+  @override
+  String toString() => 'ImportBatch($id, $filename, $questionCount)';
+}
+
+/// 文件名截断：保留扩展名，主体截到 18 个字符。
+String _shortenFileName(String name) {
+  if (name.length <= 24) return name;
+  final int dot = name.lastIndexOf('.');
+  final String ext = dot > 0 && name.length - dot <= 6 ? name.substring(dot) : '';
+  final String body = ext.isEmpty ? name : name.substring(0, dot);
+  final String head = body.length <= 18 ? body : '${body.substring(0, 18)}…';
+  return '$head$ext';
+}
+
+/// 相对时间：下拉里不需要精确到秒，只要「刚才 / N 分钟前 / N 小时前 / N 天前」。
+///
+/// [when] 为 null（后端没给或解析失败）时回「刚刚」，不用「未知时间」这种噪音文案。
+String relativeTimeLabel(DateTime? when) {
+  if (when == null) return '刚刚';
+  final Duration diff = DateTime.now().difference(when);
+  if (diff.inSeconds < 60) return '刚刚';
+  if (diff.inMinutes < 60) return '${diff.inMinutes} 分钟前';
+  if (diff.inHours < 24) return '${diff.inHours} 小时前';
+  if (diff.inDays < 30) return '${diff.inDays} 天前';
+  final DateTime local = when.toLocal();
+  return '${local.year}-${local.month.toString().padLeft(2, '0')}-${local.day.toString().padLeft(2, '0')}';
+}
+
 /// 一种题型的统计（`GET /question-types` 的一项）。
 class QuestionTypeCount {
   const QuestionTypeCount({required this.type, required this.count});
@@ -359,6 +537,16 @@ class QuestionApi {
     int offset = 0,
     bool? mastered,
     String? currentUserId,
+    /// ★ m31124：按导入批次筛选（`GET /questions?batch_id=...`）。
+    ///
+    /// null / 空串 = 全部批次。手动建的题 `batch_id` 是 NULL，
+    /// 所以选具体批次时它们不会出现在列表里（需求 C3）。
+    String? batchId,
+    /// ★ m31635：题型过滤（`GET /questions?type=choice,multi`）。
+    ///
+    /// 后端接受逗号分隔的多值；这里保持 string，便于后续做多选
+    /// 而不用改调用方签名。null / 空串 = 不按题型过滤。
+    String? type,
   }) async {
     final Object? raw = await _client.get(
       '/questions',
@@ -372,6 +560,11 @@ class QuestionApi {
         // 练习 R2：掌握度过滤。后端只认字符串 'true'/'false'，
         // 所以这里传字符串而不是 bool（null = 不筛选）。
         if (mastered != null) 'mastered': mastered ? 'true' : 'false',
+        // m31124：批次筛选。空串不传，免得后端把 `batch_id=` 当成有效值（它会 trim 后判空，
+        // 但请求里多一个空参数没有意义，日志里也不好读）。
+        if (batchId != null && batchId.trim().isNotEmpty) 'batch_id': batchId.trim(),
+        // ★ m31635：题型过滤。多值由调用方用逗号拼好（后端按数组比较）。
+        if (type != null && type.trim().isNotEmpty) 'type': type.trim(),
         'limit': '$limit',
         'offset': '$offset',
       },
@@ -396,6 +589,10 @@ class QuestionApi {
     String? mime,
     String? subjectId,
     String? knowledgeNodeId,
+    /// 科目归属模式：`from_file`（按每题自带的 subject 文本匹配，
+    /// subject_id 降级为匹配失败时的兜底科目）或 `uniform`
+    /// （现有行为：全部题进 subject_id，缺省）。
+    String subjectMode = 'uniform',
   }) async {
     final Map<String, Object?> body = <String, Object?>{
       'filename': filename,
@@ -403,6 +600,7 @@ class QuestionApi {
       if (mime != null && mime.isNotEmpty) 'mime': mime,
       if (subjectId != null && subjectId.isNotEmpty) 'subject_id': subjectId,
       if (knowledgeNodeId != null && knowledgeNodeId.isNotEmpty) 'knowledge_node_id': knowledgeNodeId,
+      if (subjectMode.isNotEmpty) 'subject_mode': subjectMode,
     };
     final Object? raw = await _client.post('/questions/import', body: body);
     if (raw is! Map) throw ApiException('导入响应不是 JSON 对象', body: raw);
@@ -543,6 +741,39 @@ class QuestionApi {
     return BatchResult.fromJson(raw.cast<String, Object?>());
   }
 
+  /// ★ m31124：整批删除：`DELETE /questions/batch` body `{batch_id}`。
+  ///
+  /// 与 [deleteQuestionsBatch]（按 id 数组）走同一个端点，后端按 body 里有没有
+  /// `batch_id` 分流。返回的 `requested` 是「删除前该批还剩多少道」——
+  /// 确认弹窗里的 N 就用这个值（不要用 [ImportBatch.questionCount]，那是导入时的历史数量）。
+  Future<BatchResult> deleteQuestionsByBatch(String batchId) async {
+    final String id = batchId.trim();
+    if (id.isEmpty) throw ApiException('batch_id 不能为空');
+    final Object? raw = await _client.delete(
+      '/questions/batch',
+      body: <String, Object?>{'batch_id': id},
+    );
+    if (raw is! Map) throw ApiException('整批删除响应不是 JSON 对象', body: raw);
+    return BatchResult.fromJson(raw.cast<String, Object?>());
+  }
+
+  /// ★ m31124：导入批次列表：`GET /import-batches`。
+  ///
+  /// user_id 由后端从 token 取（不传参，也不该传）。按 created_at DESC，最近的在前。
+  Future<List<ImportBatch>> fetchImportBatches({int limit = 50}) async {
+    final Object? raw = await _client.get(
+      '/import-batches',
+      query: <String, String>{'limit': '$limit'},
+    );
+    if (raw is! Map) throw ApiException('批次列表响应不是 JSON 对象', body: raw);
+    final Object? items = raw.cast<String, Object?>()['items'];
+    if (items is! List) return const <ImportBatch>[];
+    return items
+        .whereType<Map>()
+        .map((Map m) => ImportBatch.fromJson(m.cast<String, Object?>()))
+        .toList(growable: false);
+  }
+
   /// ★ m26090（R3）：批量恢复：`PATCH /questions/batch/restore`。
   Future<BatchResult> restoreQuestionsBatch(List<String> ids) async {
     final Object? raw = await _client.patch(
@@ -590,6 +821,31 @@ class QuestionApi {
       },
     );
     if (raw is! Map) throw ApiException('批量标签响应不是 JSON 对象', body: raw);
+    return BatchResult.fromJson(raw.cast<String, Object?>());
+  }
+
+  /// 批量改归属：`PATCH /questions/batch`（m26090 批量重新分配）。
+  ///
+  /// [subjectId] 把选中的题移到目标科目；[knowledgeNodeId] 改考点；
+  /// [clearKnowledgeNode] 为 true 时传 `knowledge_node_id: null` 清空考点
+  /// （后端要求 subject_id / knowledge_node_id 至少给一个，否则 400 EMPTY_PATCH）。
+  /// 只能改自己的题，公共题 / 别人的题静默跳过，计入 [BatchResult.skipped]。
+  Future<BatchResult> updateQuestionsBatch(
+    List<String> ids, {
+    String? subjectId,
+    String? knowledgeNodeId,
+    bool clearKnowledgeNode = false,
+  }) async {
+    final Map<String, Object?> body = <String, Object?>{
+      'ids': ids,
+      if (subjectId != null && subjectId.isNotEmpty) 'subject_id': subjectId,
+      if (clearKnowledgeNode)
+        'knowledge_node_id': null
+      else if (knowledgeNodeId != null && knowledgeNodeId.isNotEmpty)
+        'knowledge_node_id': knowledgeNodeId,
+    };
+    final Object? raw = await _client.patch('/questions/batch', body: body);
+    if (raw is! Map) throw ApiException('批量移动响应不是 JSON 对象', body: raw);
     return BatchResult.fromJson(raw.cast<String, Object?>());
   }
 

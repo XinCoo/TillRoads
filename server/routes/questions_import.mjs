@@ -54,8 +54,12 @@
 
 import { withTransaction } from '../repositories/base.mjs';
 import * as questionsRep from '../repositories/questions.mjs';
+import * as importBatchesRep from '../repositories/import_batches.mjs';
 import { extractText, importError } from '../import/extract.mjs';
 import { splitQuestions } from '../import/splitter.mjs';
+import { parseQuestionJson, hasAnySubject } from '../import/json_import.mjs';
+import { createSubjectResolver } from '../import/resolve_subject.mjs';
+import { createNodeResolver, splitNodePath } from '../import/resolve_node.mjs';
 import { dedupe } from '../import/dedupe.mjs';
 import { separateAssets } from '../import/separate.mjs';
 import { fail, ok } from './_http.mjs';
@@ -64,6 +68,13 @@ import { sanitizeQuestionText } from '../../core/index.mjs';
 
 const DEFAULT_SOURCE = 'import';
 const DEFAULT_TYPE = 'choice';
+
+// m30197：科目归属的两种模式。
+//   from_file —— 每题用文件里的 subject 文本去 match（推荐，AI 生成的 JSON 走这条）；
+//   uniform   —— 所有题都进前端选定的那一个科目（旧行为，缺省）。
+// 不传 subject_mode 时按 uniform 走，保证老客户端和新客户端的默认行为不变。
+const SUBJECT_MODE_FROM_FILE = 'from_file';
+const SUBJECT_MODE_UNIFORM = 'uniform';
 
 // 主观类题型：这些题型的 is_subjective 必须为 true。
 // 取值口径见 tillroad_app/lib/api/question_api.dart 的 BankQuestion.typeLabel。
@@ -141,6 +152,11 @@ function toCreateInput(question, ctx) {
     asset_refs: assets.asset_refs.length > 0 ? assets.asset_refs : null,
     is_subjective: SUBJECTIVE_TYPES.has(type),
     generation_meta,
+    // ★ m31124：导入批次档案。ctx.batch_id 由 runImport 在事务内先建批次再注入；
+    //   手动建题（POST /questions）不经过这里，三列为 NULL。
+    batch_id: ctx.batch_id ?? null,
+    import_filename: ctx.batch_id ? (ctx.import_filename ?? null) : null,
+    imported_at: ctx.batch_id ? (ctx.imported_at ?? null) : null,
   };
 }
 
@@ -159,20 +175,35 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
   // 阶段 1：文本抽取（内部负责 10MB / 100 页 / 扫描版判定，抛 413/422/415）
   const extracted = await extractText({ buffer, mime: body.mime, filename });
 
-  // 阶段 2：规则切题（纯函数，无需事务）
-  const split = splitQuestions(extracted.text);
+  // 阶段 2：切题（纯函数，无需事务）
+  //
+  // ★ m30197：JSON 题库（AI 按 docs/question-recognition-prompt.md 产出）走另一条路。
+  //   原因：subject / node 是**结构化的每题字段**，纯文本切题拿不到它们。
+  //   两者的产出形状刻意对齐（stem/options/answer/analysis/detected_type），
+  //   所以后面的清洗 / 判重 / 入库一行都不用改。
+  const isJson = extracted.kind === 'json';
+  const split = isJson
+    ? parseQuestionJson(extracted.text)
+    : splitQuestions(extracted.text);
+
+  // 单题级的解析问题（只可能来自 JSON）：不整份失败，先收集起来随结果返回，
+  // 让用户看得见「哪几条没进来」，而不是莫名其妙少了几题。
+  const parseProblems = (split.errors ?? []).map((e) => ({
+    message:
+      e.index >= 0
+        ? `第 ${e.index + 1} 条未导入：${e.reason}`
+        : `文件解析失败：${e.reason}`,
+  }));
 
   if (split.questions.length === 0) {
-    // 抽到文字但一条题都没切出来：多半是分隔符不在四类里。
-    // 明确告诉用户「支持哪四类」，而不是含糊地说「没有可用内容」。
+    // 抽到文字但一条题都没切出来：多半是分隔符不在四类里 / JSON 形状不对。
     // 用 importError 而不是裸 Error：message 必须进 body，否则 httpError 的
     // 「有 code 的普通 Error -> 400 {error:code}」分支会把提示文案丢弃，
     // 用户只看到一个没有下文的 EMPTY_CONTENT（CI 实际踩过）。
-    throw importError(
-      'EMPTY_CONTENT',
-      400,
-      '未识别到任何题目：请确认题号以「1.」「（1）」「一、」「第1题」开头，或手动录入',
-    );
+    const hint = parseProblems.length > 0
+      ? parseProblems[0].message
+      : '请确认题号以「1.」「（1）」「一、」「第1题」开头，或手动录入';
+    throw importError('EMPTY_CONTENT', 400, `未识别到任何题目：${hint}`);
   }
 
   // ★ m18680 A3：导入进度日志。50 题在 Neon 冷启动下实测 20s+，
@@ -208,22 +239,127 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
     return { ...q, stem: cleaned };
   });
 
-  const candidates = cleanedQuestions.map((q) => toCreateInput(q, createCtx));
-
-  // 题型识别统计：自动识别成功 / 需要人工确认。
-  const typeDetected = candidates.filter((c) => c.generation_meta.type_source === 'auto').length;
-  const typeNeedsReview = candidates.filter((c) => c.generation_meta.needs_review === true).length;
-
-  // 题干/选项里的图片占位：MVP 不落存储，但要把数量告诉用户，
-  // 否则「我的题图去哪了」会成为最常见的支持问题。
-  const imageCount = candidates.reduce(
-    (n, item) => n + separateAssets({ stem: item.stem, options: item.options, analysis: item.analysis }).placeholders.length,
-    0,
-  );
-
   // 阶段 3 + 4：去重与入库必须在同一事务内 —— 否则两个并发导入同一份文件时，
   // 双方都能通过 dedupe（此时还都没写），然后双双插入同 hash 的两行。
+  //
+  // ★ m30197：subject / node 解析也放在事务内 —— 它会**自动创建考点**（写库），
+  //   必须与题目入库同生共死；抽到事务外会出现「题目回滚了但考点留在库里」。
   return withTransaction(pool, async (client) => {
+    // ── m30197 A3：逐题解析 subject / node ──────────────────────────────────
+    // 只有 from_file 模式才看文件里的 subject/node：uniform 模式要保证
+    // 「所有题都进界面选的那个科目」的旧行为，不能被文件里的字段意外带跑。
+    const fromFile = String(body.subject_mode ?? '').trim() === SUBJECT_MODE_FROM_FILE;
+
+    // ── m31124：先建导入批次，再入库题目 ────────────────────────────────
+    // 为什么在事务里「先占位后回填」：题目行必须在本轮 INSERT 时就带上 batch_id，
+    // 而 batch_id 由 DB 生成（gen_random_uuid），所以得先插批次行拿到 id。
+    // question_count 先写 0，题目全部插完后回填成真实条数。
+    // 整段在同一个 withTransaction 里 —— 导入失败就整体回滚，不会留「空批次」。
+    // 公共题（ownerUserId 为空）没有归属用户，不建批次（三列恒为 NULL）。
+    let batchId = null;
+    if (ownerUserId) {
+      const batchRow = await importBatchesRep.create(client, {
+        userId: ownerUserId,
+        filename,
+      });
+      batchId = batchRow.id;
+    }
+    // 注入了 batch_id 的 createCtx；后续逐题 toCreateInput 用这个而不是外层 createCtx。
+    const batchCtx = {
+      ...createCtx,
+      batch_id: batchId,
+      import_filename: batchId ? filename : null,
+      imported_at: batchId ? new Date() : null,
+    };
+    // 同一科目文本只查一次库；同一科目下的同一路径也只解析一次（含只建一次的考点）。
+    const subjectResolver = createSubjectResolver(client, ownerUserId ?? '');
+    const nodeResolvers = new Map();
+    const nodeResolverFor = (subjectId) => {
+      let r = nodeResolvers.get(subjectId);
+      if (!r) {
+        r = createNodeResolver(client, subjectId);
+        nodeResolvers.set(subjectId, r);
+      }
+      return r;
+    };
+
+    const matchedBySubject = new Map(); // subject_id -> {subject_id, name, count}
+    const unmatchedSubjects = new Map(); // 文件里的原文 -> 出现次数
+    let matchedCount = 0;
+    let unmatchedCount = 0;
+    const createdPaths = [];
+    const createdSeen = new Set();
+
+    const candidates = [];
+    for (const q of cleanedQuestions) {
+      let subjectId = createCtx.subject_id;
+      let nodeId = createCtx.knowledge_node_id;
+      // subject 是否「可信」（用于决定能否解析 node）：文件没写 subject、或写且匹配成功。
+      // 不能用 subjectId !== 默认值 判断 —— 匹配到的科目恰好等于默认科目时会误判。
+      let subjectResolved = true;
+
+      if (fromFile) {
+        const subjectText = String(q.subject ?? '').trim();
+        const nodeText = String(q.node ?? '').trim();
+
+        if (subjectText !== '') {
+          const hit = await subjectResolver(subjectText);
+          if (hit) {
+            subjectId = hit.subject_id;
+            subjectResolved = true;
+            matchedCount += 1;
+            const prev = matchedBySubject.get(hit.subject_id);
+            if (prev) prev.count += 1;
+            else matchedBySubject.set(hit.subject_id, { subject_id: hit.subject_id, name: hit.name, count: 1 });
+          } else {
+            // ★ 硬约束：subject 匹配失败不自动建科目，只记下来让用户手动分配。
+            //   此时 subjectId 仍是请求里的默认值（可能为 null = 未分类）。
+            subjectResolved = false;
+            unmatchedCount += 1;
+            unmatchedSubjects.set(subjectText, (unmatchedSubjects.get(subjectText) ?? 0) + 1);
+          }
+        }
+
+        // ★ 只有「文件里的 subject 为空（走兜底科目）」或「subject 匹配成功」时才解析 node。
+        //   文件写了 subject 但库里匹配不到时，这条 node 路径属于一个我们并不掌握的科目树；
+        //   若把它挂在兜底科目下，会把别的科目的考点污染进来（用户看到莫名其妙的考点）。
+        const subjectUsable = subjectResolved;
+        if (nodeText !== '' && subjectUsable) {
+          // 没有科目就没有考点树可挂（knowledge_node 必须属于某个 subject）。
+          const nodeHit = subjectId ? await nodeResolverFor(subjectId)(nodeText) : null;
+          nodeId = nodeHit ? nodeHit.knowledge_node_id : null;
+          if (nodeHit && nodeHit.created.length > 0) {
+            const path = splitNodePath(nodeText).join('/');
+            if (!createdSeen.has(path)) {
+              createdSeen.add(path);
+              createdPaths.push(path);
+            }
+          }
+        }
+      }
+
+      candidates.push(
+        toCreateInput(q, { ...batchCtx, subject_id: subjectId, knowledge_node_id: nodeId }),
+      );
+    }
+
+    if (fromFile) {
+      console.log(
+        `[IMPORT] 科目匹配：命中 ${matchedCount} 题 / 未命中 ${unmatchedCount} 题，自动新建考点 ${createdPaths.length} 条`,
+      );
+    }
+
+    // 题型识别统计：自动识别成功 / 需要人工确认。
+    const typeDetected = candidates.filter((c) => c.generation_meta.type_source === 'auto').length;
+    const typeNeedsReview = candidates.filter((c) => c.generation_meta.needs_review === true).length;
+
+    // 题干/选项里的图片占位：MVP 不落存储，但要把数量告诉用户，
+    // 否则「我的题图去哪了」会成为最常见的支持问题。
+    const imageCount = candidates.reduce(
+      (n, item) => n + separateAssets({ stem: item.stem, options: item.options, analysis: item.analysis }).placeholders.length,
+      0,
+    );
+
     const { newQuestions, duplicates } = await dedupe(
       candidates,
       client,
@@ -259,26 +395,62 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
         throw err;
       }
     }
+    // ★ m31124：把批次行上的 question_count 回填成**实际插入成功**的条数
+    //   （不是 candidates.length —— 判重跳过的题不属本批新增）。
+    //   UPDATE 走 (id, user_id) 双条件，仓储层已保证只改自己的批次。
+    if (batchId && ownerUserId) {
+      try {
+        await importBatchesRep.updateQuestionCount(client, {
+          batchId,
+          userId: ownerUserId,
+          questionCount: imported.length,
+        });
+      } catch (err) {
+        // 回填失败不该让整批导入回滚：题已经插好了，批次只是少了统计数字。
+        // 批次下拉会显示「N 题」为 0，用户仍能看到批次并删除。
+        console.warn(`[IMPORT] 批次统计回填失败（batch=${batchId}）：${err && err.message}`);
+      }
+    }
 
     console.log(
       `[IMPORT] 完成：插入 ${imported.length} 条，重复 ${duplicates.length} 条，耗时见上游`,
     );
     return {
       imported: imported.length,
+      // ★ m31124：本次导入的批次 id。前端拿它刷批次下拉，手动建题时没有批次。
+      //   公共题（无 token）导入时恒为 null。
+      batch_id: batchId,
+      import_filename: batchId ? filename : null,
       duplicates,
-      errors: [],
+      // 单题级的解析问题（JSON 里某条形状不对）也走 errors，前端已有展示位。
+      errors: parseProblems,
+      // ★ m30197 A4：按科目匹配与考点自动创建的统计（旧字段一个都没删）。
+      subject_matched: {
+        matched_count: matchedCount,
+        unmatched_count: unmatchedCount,
+        unmatched_subjects: [...unmatchedSubjects.keys()],
+        matched_subjects: [...matchedBySubject.values()],
+      },
+      node_created: {
+        created_count: createdPaths.length,
+        created_paths: createdPaths,
+      },
       stats: {
         kind: extracted.kind,
         mime: extracted.mime,
         pages: extracted.pages ?? null,
-        total: split.questions.length,
-        preamble_lines: split.preamble.length,
+        // JSON 的总条数以文件里声明的条数为准（含形状不对、没进来的），
+        // 文本类则等于切出来的题数 —— 两者都是「用户以为文件里有多少题」。
+        total: split.total ?? split.questions.length,
+        preamble_lines: split.preamble ? split.preamble.length : 0,
         bytes: buffer.length,
         image_placeholders: imageCount,
         // 本轮新增：清洗与题型识别的统计（原有字段一个都没删）
         sanitized: sanitizedCount,
         type_detected: typeDetected,
         type_needs_review: typeNeedsReview,
+        subject_mode: fromFile ? SUBJECT_MODE_FROM_FILE : SUBJECT_MODE_UNIFORM,
+        subject_from_file_available: isJson && hasAnySubject(split.questions),
       },
     };
   });

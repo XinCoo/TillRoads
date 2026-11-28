@@ -1,0 +1,65 @@
+{
+  "questions": [
+    {
+      "type": "choice",
+      "subject": "行测",
+      "node": "资料分析/增长率",
+      "stem": "某地 2020 年 GDP 为 100 亿元，2021 年增长到 112 亿元，增长率是多少？",
+      "options": [
+        { "key": "A", "text": "10%" },
+        { "key": "B", "text": "12%" },
+        { "key": "C", "text": "14%" },
+        { "key": "D", "text": "16%" }
+      ],
+      "answer": "B",
+      "analysis": "增长率 = (112 - 100) / 100 = 12%。",
+      "difficulty": "easy",
+      "tags": ["增长率", "资料分析"]
+    },
+    {
+      "type": "choice",
+      "subject": "行测",
+      "node": "资料分析/增长率",
+      "stem": "某产品销量从 200 件增长到 250 件，增长率是多少？",
+      "options": [
+        { "key": "A", "text": "20%" },
+        { "key": "B", "text": "25%" },
+        { "key": "C", "text": "30%" },
+        { "key": "D", "text": "50%" }
+      ],
+      "answer": "B",
+      "analysis": "增长率 = (250 - 200) / 200 = 25%。",
+      "difficulty": "easy",
+      "tags": ["增长率"]
+    },
+    {
+      "type": "judge",
+      "subject": "行测",
+      "node": "判断推理/图形推理",
+      "stem": "图形推理中，旋转与翻转都可以通过一次镜像变换互相转化。",
+      "answer": "错误",
+      "analysis": "旋转保持手性，翻转改变手性，二者不能由一次镜像互相转化。",
+      "difficulty": "medium",
+      "tags": ["图形推理"]
+    },
+    {
+      "type": "fill",
+      "subject": "公基",
+      "node": "法律/宪法",
+      "stem": "我国的根本政治制度是____。",
+      "answer": "人民代表大会制度",
+      "difficulty": "easy",
+      "tags": ["宪法"]
+    },
+    {
+      "type": "short_answer",
+      "subject": "公基",
+      "node": "法律/宪法",
+      "stem": "简述宪法在我国法律体系中的地位。",
+      "answer": "宪法是国家的根本法，具有最高的法律效力。",
+      "analysis": "要点：根本法、最高效力、制定与修改程序更严格。",
+      "difficulty": "medium",
+      "tags": ["宪法", "简答"]
+    }
+  ]
+}

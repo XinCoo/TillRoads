@@ -1,13 +1,17 @@
 # 题库识别提示词（人工粘贴用）
 
-> 用途：把一段杂乱的题面（试卷截图文字、Word 复制、PDF 抽取文本、AI 改写稿）交给大模型，
+> 用途：把一段杂乱的题面（试卷截图文字、Word 复制、PDF 抽取文本、AI 改写稿）交给大模型，  
 > 让它输出**可直接入库**的结构化 JSON 数组，人工校对后导入题库。
 >
 > 与后端的对应关系（改字段前先看这里，避免提示词和代码漂移）：
+>
 > - 题型白名单：`server/routes/questions.mjs` 的 `QUESTION_TYPES`
 > - 题型中文标签：`tillroad_app/lib/api/question_api.dart` 的 `kQuestionTypeLabels`
 > - 手动建题端点：`POST /questions`（字段由 `pickQuestionFields` 校验）
 > - 批量导入端点：`POST /questions/import`（四阶段管线，见 `server/routes/questions_import.mjs`）
+> - JSON 题库解析器：`server/import/json_import.mjs` 的 `parseQuestionJson`（读 `subject` / `node`）
+> - 科目自动匹配：`server/import/resolve_subject.mjs`（精确 → 包含；**不自动建科目**）
+> - 考点自动匹配/创建：`server/import/resolve_node.mjs`（`/` 分级最多 3 层，导入时缺级自动建）
 > - 下划线占位符清洗：`core/text.mjs` 的 `sanitizeQuestionText`（连续 ≥2 个下划线 → `（  ）`）
 > - 自动题型识别（服务端规则版）：`server/import/splitter.mjs` 的 `detectQuestionType`
 
@@ -15,16 +19,24 @@
 
 ## 一、System 提示词（直接复制这段）
 
-```
+````
 你是题库结构化助手。用户会把一段题面文本发给你，你的唯一任务是把它切成若干道题，
 并按给定的 JSON 结构输出。**不要解释、不要寒暄、不要输出 JSON 以外的任何内容。**
 
 # 输出格式
 只输出一个 JSON 数组，数组每项是一道题：
-[{"type":"...","stem":"...","options":[{"key":"A","text":"..."}],"answer":"...","analysis":"...","formula_text":null,"difficulty":"...","tags":[],"is_subjective":false,"needs_review":false,"review_note":""}]
+[{"subject":"...","node":"...","type":"...","stem":"...","options":[{"key":"A","text":"..."}],"answer":"...","analysis":"...","formula_text":null,"difficulty":"...","tags":[],"is_subjective":false,"needs_review":false,"review_note":""}]
 没有题目时输出 []。
 
 # 字段规格（字段名、取值范围都必须严格遵守）
+- subject：科目名。**必须由用户提供，你不要猜测**。用户会在题面开头或末尾写
+  「科目：行测」这样的标记，你把它原样填进每道题的 subject 字段。
+  如果用户没有提供科目，subject 写 ""（空字符串），needs_review 写 true，
+  review_note 写「缺少科目信息」。
+- node：考点路径，用 "/" 分隔层级（如 "资料分析/增长率"、"判断推理/图形推理/对称性"）。
+  **你根据题目内容分析填写**，最多 3 层，每层不超过 10 个字。
+  不确定时写最接近的 1 层（如 "资料分析"），不要硬编 3 层。
+  完全无法判断时写 ""。
 - type：题型，只能是以下之一
   choice(选择题) / multi(多选题) / judge(判断题) / fill(填空题) / calculation(计算题)
   / short_answer(简答题) / subjective(主观题) / essay(论述题) / material(材料题)
@@ -80,14 +92,17 @@
 - 不要在 JSON 前后加 ``` 代码块。
 - 不要输出解释性文字、标题、序号、总结。
 - 字段一律全部输出（没有值就写 null 或 [] 或 ""），不要省略字段。
-```
+````
 
 ---
 
 ## 二、推荐的 User 提示词模板
 
 ```
-请把下面这段题面按规则切成结构化题目：
+请把下面这段题面按规则切成结构化题目。
+
+科目：行测
+（如果不填科目，所有题的 subject 会为空，导入时需要手动指定）
 
 <<<题面开始
 （在这里粘贴题面）
@@ -104,19 +119,21 @@
 
 ## 三、字段速查表（人工校对用）
 
-| 字段 | 必填 | 取值 | 校对要点 |
-|---|---|---|---|
-| `type` | 是 | choice/multi/judge/fill/calculation/short_answer/subjective/essay/material | 与 `is_subjective` 联动：short_answer、subjective、essay、material → true |
-| `stem` | 是 | 文本 | 无题号、无选项、无答案；下划线占位已换成 `（  ）` |
-| `options` | 是 | `[{key,text}]` 或 `[]` | key 大写连排不跳号；无选项写 `[]` 不是 `null` |
-| `answer` | 是 | 字符串 | choice 单字母；multi 连写无分隔；judge 只能是"正确"/"错误"；fill 用 ` \| ` 分隔多空 |
-| `analysis` | 是 | 字符串 | 没有就 `""`，不要编 |
-| `formula_text` | 是 | LaTeX 或 `null` | 不带 `$`、不带代码块 |
-| `difficulty` | 是 | easy/medium/hard | 拿不准写 medium |
-| `tags` | 是 | 字符串数组 | 0–4 个短词 |
-| `is_subjective` | 是 | 布尔 | 主观四类必须 true |
-| `needs_review` | 是 | 布尔 | 不确定才 true |
-| `review_note` | 是 | 字符串 | needs_review=true 时说明卡点 |
+| 字段              | 必填 | 取值                                                                         | 校对要点                                                               |
+| --------------- | -- | -------------------------------------------------------------------------- | ------------------------------------------------------------------ |
+| `type`          | 是  | choice/multi/judge/fill/calculation/short_answer/subjective/essay/material | 与 `is_subjective` 联动：short_answer、subjective、essay、material → true |
+| `stem`          | 是  | 文本                                                                         | 无题号、无选项、无答案；下划线占位已换成 `（  ）`                                        |
+| `options`       | 是  | `[{key,text}]` 或 `[]`                                                      | key 大写连排不跳号；无选项写 `[]` 不是 `null`                                    |
+| `answer`        | 是  | 字符串                                                                        | choice 单字母；multi 连写无分隔；judge 只能是"正确"/"错误"；fill 用 `\|` 分隔多空         |
+| `analysis`      | 是  | 字符串                                                                        | 没有就 `""`，不要编                                                       |
+| `formula_text`  | 是  | LaTeX 或 `null`                                                             | 不带 `$`、不带代码块                                                       |
+| `difficulty`    | 是  | easy/medium/hard                                                           | 拿不准写 medium                                                        |
+| `tags`          | 是  | 字符串数组                                                                      | 0–4 个短词                                                            |
+| `is_subjective` | 是  | 布尔                                                                         | 主观四类必须 true                                                        |
+| `needs_review`  | 是  | 布尔                                                                         | 不确定才 true                                                          |
+| `review_note`   | 是  | 字符串                                                                        | needs_review=true 时说明卡点                                            |
+| `subject`       | 是  | 字符串                                                                        | 用户提供，AI 不猜；空字符串表示未提供                                               |
+| `node`          | 是  | 字符串                                                                        | AI 分析，"/" 分隔最多 3 层；空字符串表示无法判断                                      |
 
 ---
 
@@ -144,7 +161,9 @@ D. 有故宫、天安门
 ```json
 [
   {
-    "type": "choice",
+    "subject": "行测",
+    "node": "资料分析/增长率",
+	"type": "choice",
     "stem": "下列关于我国首都是（  ）的表述，正确的是",
     "options": [
       { "key": "A", "text": "简称是京" },
@@ -162,7 +181,9 @@ D. 有故宫、天安门
     "review_note": ""
   },
   {
-    "type": "calculation",
+    "subject": "数学",
+    "node": "函数",
+	"type": "calculation",
     "stem": "已知函数 f(x)=x^2，求 f(2) 的值。",
     "options": [],
     "answer": "4",
@@ -182,14 +203,24 @@ D. 有故宫、天安门
 ## 五、导入路径
 
 **路线 A：走批量导入（推荐，文件级）**
-1. 让模型输出 JSON 数组 → 存成 `questions.json`
-2. 转成导入管线认识的题面格式，或直接用
-   `POST /questions/import`（body：`filename` / `mime` / `content_base64` / `subject_id` / `knowledge_node_id` / `default_type`）
-3. 服务端会再跑一遍规则识别（`detectQuestionType`）并写 `generation_meta`，
-   统计里的 `type_detected` / `type_needs_review` / `sanitized` 就是识别结果
 
-**路线 B：走单题建题（人工逐题校对后）**
-`POST /questions`，body 字段：
+1. 让模型输出 JSON → 存成 `questions.json`
+2. **直接把这份 JSON 上传**（`mime: application/json`，或扩展名是 `.json`）。服务端有专门的 JSON 解析器，`subject` 与 `node` 会参与科目匹配与考点创建：  
+   `POST /questions/import`（body：`filename` / `mime` / `content_base64` / `subject_mode` / `subject_id` / `knowledge_node_id` / `default_type`）
+   - `subject_mode: "from_file"`（推荐）：每题自己的 `subject` 决定归属科目、`node` 决定考点；`subject_id` 只当**兜底科目**
+   - `subject_mode: "uniform"`：忽略文件里的 `subject` / `node`，所有题都进 `subject_id` 指定的科目（老客户端默认行为）
+3. 科目匹配：先在该用户所有 active 考试目标的科目里找**名字完全相同**的，再找**包含关系**（文件写「行测」能命中库里的「行测-资料分析」）；**匹配不到不会自动建科目**，该题归兜底科目，并列进 `unmatched_subjects` 等你手动分配
+4. 考点匹配：`node` 按 `/` 分级（最多 3 层），逐级在**同一科目**下匹配，最后一级不存在时**自动创建**；自动创建只发生在导入，手动建题不会建考点
+5. 响应里看两个新字段：
+   - `subject_matched: { matched_count, unmatched_count, unmatched_subjects: [], matched_subjects: [{ subject_id, name, count }] }`
+   - `node_created: { created_count, created_paths: ["资料分析/增长率"] }`
+6. 服务端再跑一遍规则识别（`detectQuestionType`）并写 `generation_meta`；  
+   统计里的 `type_detected` / `type_needs_review` / `sanitized` / `subject_mode` / `subject_from_file_available` 就是识别结果
+
+> JSON 里的 `type` 写了合法值（`choice` / `multi` / `judge` / `fill` / `calculation` / `short_answer` / `subjective` / `essay` / `material`）时服务端直接采用，没写或写错才回落到自动识别。
+
+**路线 B：走单题建题（人工逐题校对后）**  
+`POST /questions`，body 字段：  
 `type` / `stem` / `options` / `answer` / `analysis` / `formula_text` / `difficulty` / `tags` / `is_subjective` / `subject_id` / `knowledge_node_id`
 
 注意：`source`、`content_hash`、`owner_user_id` **由服务端决定**，不要在请求体里传。
@@ -198,12 +229,12 @@ D. 有故宫、天安门
 
 ## 六、常见坑（模型容易出错的地方）
 
-1. **JSON 里带 ``` 代码块** → 导入前先剥掉围栏，或让模型重发。
+1. **JSON 里带 \`\`\` 代码块** → 导入前先剥掉围栏，或让模型重发。
 2. **多选答案写成 "A、B、C"** → 必须改成 "ABC"，否则判分逻辑对不上。
 3. **判断题答案写 "对" / "√"** → 统一成 "正确" / "错误"。
 4. **stem 里残留题号**（"1. 下列…"）→ 导入后 content_hash 会和历史重复题错配，去掉。
 5. **公式写成 `$x^2$`** → `formula_text` 里不要带美元符号。
-6. **模型自己编答案**：题面没给答案却写了答案 → 对照原题核对，
+6. **模型自己编答案**：题面没给答案却写了答案 → 对照原题核对，  
    `needs_review` 应该为 true。
 7. **下划线占位没换**：`____` 必须变成 `（  ）`，否则渲染出来是一串横线。
 8. **主观题 `is_subjective` 忘填 true** → 会影响后端对该题型的判定。

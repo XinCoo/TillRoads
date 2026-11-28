@@ -44,12 +44,19 @@ let app;
 let base;
 let seed; // { userId, profileId, subjectId }
 
+// ★ m30197：PATCH /questions/batch 是「按 owner 域」改题的端点，要求 ctx.authUserId，
+//   所以本文件也必须用 Bearer Token 建立归属（对照 routes/questions.integration.test.mjs）。
+//   token→userId 的绑定在 before 里按 seed.userId 设置。
+const TOKEN = 'tk_import_owner';
+
 async function req(method, path, body) {
   const init = { method };
   if (body !== undefined) {
     init.headers = { 'Content-Type': 'application/json' };
     init.body = JSON.stringify(body);
   }
+  // 每个请求都带 token：导入写入的题会归属于 seed.userId，批量改归属才有题可改。
+  init.headers = { ...(init.headers ?? {}), Authorization: `Bearer ${TOKEN}` };
   const res = await fetch(base + path, init);
   const text = await res.text();
   let data = null;
@@ -111,6 +118,8 @@ before(async () => {
     c.release();
   }
 
+  // TOKENS 在 createApp 时读取进闭包，必须先设（设晚了会拿到空数组）。
+  process.env.TOKENS = `${TOKEN}:${seed.userId}`;
   app = createApp({ pool });
   await new Promise((resolve) => app.server.listen(0, '127.0.0.1', resolve));
   base = `http://127.0.0.1:${app.server.address().port}`;
@@ -141,6 +150,9 @@ after(async () => {
       [seed.userId],
     );
     await c.query(`DELETE FROM exam_profiles WHERE user_id = $1`, [seed.userId]);
+    // m31124：import_batches 有 user_id 外键（无级联），必须比 users 先删。
+    // 它不引用 questions，所以顺序上放在这里（题已被上面删掉）就安全。
+    await c.query(`DELETE FROM import_batches WHERE user_id = $1`, [seed.userId]);
     await c.query(`DELETE FROM users WHERE id = $1`, [seed.userId]);
   } catch (cleanupError) {
     // 与 mock_exams.integration.test.mjs 同样的加固：清理抛错不能连带 skip 掉关服。
@@ -156,6 +168,7 @@ after(async () => {
     await new Promise((resolve) => app.close(resolve));
   } finally {
     await pool.end();
+    delete process.env.TOKENS;
   }
   if (cleanupFailure) {
     throw new Error(`after(): 清理数据失败（前置测试已跑完，但库中可能残留测试数据）: ${cleanupFailure.message}`);
@@ -496,4 +509,574 @@ test('stats：新增 sanitized / type_detected / type_needs_review 三个字段'
   for (const key of ['kind', 'mime', 'pages', 'total', 'preamble_lines', 'bytes', 'image_placeholders']) {
     assert.ok(key in s, `stats.${key} 不应被删掉`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// 8) m30197：导入按 subject 自动匹配科目 + 按 node 自动创建考点树 + 批量改归属
+// ---------------------------------------------------------------------------
+// 这些用例自己建科目（不依赖 before 的 seed.subjectId），
+// 且科目名互不重复 —— resolveSubject 是按「该用户全部 active 科目」做匹配的，
+// 同名科目会让断言随用例执行顺序变化。
+
+/** 直接建一个科目，返回 id。after() 会按 exam_profile 连带清理。 */
+async function createSubject(name) {
+  const c = await pool.connect();
+  try {
+    const r = await c.query(
+      `INSERT INTO subjects (exam_profile_id, name, kind) VALUES ($1, $2, 'objective') RETURNING id`,
+      [seed.profileId, name],
+    );
+    return r.rows[0].id;
+  } finally {
+    c.release();
+  }
+}
+
+/** 数「某个科目下」的题，用来验证同一份文件被拆到了不同科目。 */
+async function countQuestionsInSubject(subjectId) {
+  const c = await pool.connect();
+  try {
+    const r = await c.query(
+      `SELECT count(*)::int AS n FROM questions WHERE subject_id = $1 AND deleted_at IS NULL`,
+      [subjectId],
+    );
+    return r.rows[0].n;
+  } finally {
+    c.release();
+  }
+}
+
+/** 列某科目下的考点，用来验证「两级考点被自动创建」。 */
+async function listNodes(subjectId) {
+  const c = await pool.connect();
+  try {
+    const r = await c.query(
+      `SELECT id, title, parent_id FROM knowledge_nodes
+        WHERE subject_id = $1 AND deleted_at IS NULL
+        ORDER BY parent_id NULLS FIRST, title`,
+      [subjectId],
+    );
+    return r.rows;
+  } finally {
+    c.release();
+  }
+}
+
+test('from_file：3 道「行测」+ 2 道「公基」分别进入对应科目，且两级考点自动创建', skipOpt, async () => {
+  const xingceId = await createSubject('行测');
+  const gongjiId = await createSubject('公基');
+
+  const r = await req(
+    'POST',
+    '/questions/import',
+    fileBody('sample-04-ai-json.json', { subject_mode: 'from_file' }),
+  );
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.imported, 5, '5 道题应全部入库');
+
+  // D4 的第一条证据：3 道 subject=行测 全部匹配成功。
+  assert.equal(r.data.subject_matched.matched_count, 5, '5 道题都应匹配到科目');
+  assert.equal(r.data.subject_matched.unmatched_count, 0);
+  assert.deepEqual(r.data.subject_matched.unmatched_subjects, []);
+  const byName = new Map(
+    r.data.subject_matched.matched_subjects.map((s) => [s.name, s.count]),
+  );
+  assert.equal(byName.get('行测'), 3, '行测应有 3 题');
+  assert.equal(byName.get('公基'), 2, '公基应有 2 题');
+
+  // 落库后按科目分开，不是全塞进同一个科目。
+  assert.equal(await countQuestionsInSubject(xingceId), 3);
+  assert.equal(await countQuestionsInSubject(gongjiId), 2);
+
+  // D4 的第二条证据：node 自动建出的两级考点真实存在于 knowledge_nodes。
+  assert.equal(r.data.node_created.created_count, 3, '三条不同路径应各记一次');
+  assert.deepEqual(
+    [...r.data.node_created.created_paths].sort(),
+    ['判断推理/图形推理', '法律/宪法', '资料分析/增长率'].sort(),
+  );
+
+  for (const subjectId of [xingceId, gongjiId]) {
+    const nodes = await listNodes(subjectId);
+    const roots = nodes.filter((n) => n.parent_id === null);
+    assert.ok(roots.length >= 1, '每个科目下至少应有一个根考点');
+    for (const child of nodes.filter((n) => n.parent_id !== null)) {
+      assert.ok(
+        roots.some((root) => root.id === child.parent_id),
+        `子考点的 parent_id 必须指向同一科目的根考点：${child.title}`,
+      );
+    }
+  }
+
+  // 行测下应是「资料分析 → 增长率」两级 + 「判断推理 → 图形推理」两级。
+  const xingceNodes = await listNodes(xingceId);
+  const titles = xingceNodes.map((n) => n.title).sort();
+  assert.deepEqual(titles, ['资料分析', '图形推理', '判断推理', '增长率'].sort());
+});
+
+test('from_file：subject 写「科技常识」而库里叫「科技常识-物理」，模糊匹配成功', skipOpt, async () => {
+  const targetId = await createSubject('科技常识-物理');
+
+  const payload = {
+    questions: [
+      {
+        type: 'choice',
+        subject: '科技常识',
+        node: '',
+        stem: '下列哪一项是牛顿第一定律的表述？',
+        options: [
+          { key: 'A', text: '物体在不受外力时保持匀速直线运动' },
+          { key: 'B', text: '力等于质量乘以加速度' },
+        ],
+        answer: 'A',
+      },
+    ],
+  };
+  const r = await req('POST', '/questions/import', {
+    filename: 'fuzzy-subject.json',
+    mime: 'application/json',
+    content_base64: Buffer.from(JSON.stringify(payload), 'utf8').toString('base64'),
+    subject_mode: 'from_file',
+  });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.imported, 1);
+  assert.equal(r.data.subject_matched.matched_count, 1, '模糊匹配应算作匹配成功');
+  assert.equal(r.data.subject_matched.matched_subjects[0].subject_id, targetId);
+  assert.equal(await countQuestionsInSubject(targetId), 1);
+});
+
+test('from_file：subject 匹配不到时不自动建科目，回落请求里的默认科目', skipOpt, async () => {
+  const payload = {
+    questions: [
+      {
+        type: 'judge',
+        subject: '完全没建过的科目名',
+        node: '不存在的分支/不存在的子级',
+        stem: '这段文字用来验证未匹配科目时的兜底行为。',
+        answer: '正确',
+      },
+    ],
+  };
+  const r = await req('POST', '/questions/import', {
+    filename: 'unmatched-subject.json',
+    mime: 'application/json',
+    content_base64: Buffer.from(JSON.stringify(payload), 'utf8').toString('base64'),
+    subject_mode: 'from_file',
+    subject_id: seed.subjectId,
+  });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.imported, 1);
+  assert.equal(r.data.subject_matched.matched_count, 0);
+  assert.equal(r.data.subject_matched.unmatched_count, 1);
+  assert.deepEqual(r.data.subject_matched.unmatched_subjects, ['完全没建过的科目名']);
+
+  // 硬约束：绝不自动建科目。
+  const c = await pool.connect();
+  try {
+    const found = await c.query(
+      `SELECT count(*)::int AS n FROM subjects WHERE exam_profile_id = $1 AND name = $2`,
+      [seed.profileId, '完全没建过的科目名'],
+    );
+    assert.equal(found.rows[0].n, 0, '匹配失败不得自动创建科目');
+  } finally {
+    c.release();
+  }
+
+  // 兜底科目落到了请求里的 subject_id。
+  // 不断言该科目的绝对题数：前面多个用例也往 seed.subjectId 里导入过，
+  // 绝对计数会随测试执行顺序变化（CI 上只报第一条，排查成本很高）。
+  // 改成按题干定位这一道题，再检查它落在哪个科目。
+  const c0 = await pool.connect();
+  try {
+    const row = await c0.query(
+      `SELECT subject_id FROM questions
+        WHERE stem LIKE '%验证未匹配科目时的兜底行为%' AND deleted_at IS NULL`,
+    );
+    assert.equal(row.rows.length, 1);
+    assert.equal(row.rows[0].subject_id, seed.subjectId, '未匹配时回落到请求里的默认科目');
+  } finally {
+    c0.release();
+  }
+  // 没有科目就没有考点树可挂：node 必须为 null 而不是 500。
+  const c2 = await pool.connect();
+  try {
+    const q = await c2.query(
+      `SELECT knowledge_node_id FROM questions
+        WHERE subject_id = $1 AND stem LIKE '%验证未匹配科目时的兜底行为%'`,
+      [seed.subjectId],
+    );
+    assert.equal(q.rows.length, 1);
+    assert.equal(q.rows[0].knowledge_node_id, null);
+  } finally {
+    c2.release();
+  }
+});
+
+test('uniform（默认）：文件里的 subject/node 被忽略，全部进请求指定的科目', skipOpt, async () => {
+  const payload = {
+    questions: [
+      {
+        type: 'judge',
+        subject: '行测',
+        node: '资料分析/增长率',
+        stem: 'uniform 模式下这题的 subject 字段应被忽略。',
+        answer: '正确',
+      },
+    ],
+  };
+  const r = await req('POST', '/questions/import', {
+    filename: 'uniform-mode.json',
+    mime: 'application/json',
+    content_base64: Buffer.from(JSON.stringify(payload), 'utf8').toString('base64'),
+    subject_id: seed.subjectId,
+  });
+  assert.equal(r.status, 200, JSON.stringify(r.data));
+  assert.equal(r.data.imported, 1);
+  assert.equal(r.data.stats.subject_mode, 'uniform', '不传 subject_mode 时按 uniform 处理');
+  assert.equal(r.data.subject_matched.matched_count, 0, 'uniform 模式不做科目匹配');
+  assert.equal(r.data.node_created.created_count, 0, 'uniform 模式不自动建考点');
+  // 同上：不断言绝对题数，只确认这一道题进了请求指定的科目、且没有考点。
+  const c1 = await pool.connect();
+  try {
+    const row = await c1.query(
+      `SELECT subject_id, knowledge_node_id FROM questions
+        WHERE stem LIKE '%uniform 模式下这题的 subject 字段应被忽略%' AND deleted_at IS NULL`,
+    );
+    assert.equal(row.rows.length, 1, 'uniform 模式仍应正常入库');
+    assert.equal(row.rows[0].subject_id, seed.subjectId);
+    assert.equal(row.rows[0].knowledge_node_id, null, 'uniform 模式不解析 node');
+  } finally {
+    c1.release();
+  }
+});
+
+test('PATCH /questions/batch：批量改科目会清空旧考点，批量设考点可单改', skipOpt, async () => {
+  // 造两道题：直接走仓储插入会让用例依赖 SQL 细节，这里仍用导入 + from_file。
+  const srcSubject = await createSubject('批量归属源科目');
+  const dstSubject = await createSubject('批量归属目标科目');
+
+  const payload = {
+    questions: [
+      {
+        type: 'judge',
+        subject: '批量归属源科目',
+        node: '分支A/子级A',
+        stem: '批量改归属用例第一题。',
+        answer: '正确',
+      },
+      {
+        type: 'judge',
+        subject: '批量归属源科目',
+        node: '分支A/子级A',
+        stem: '批量改归属用例第二题。',
+        answer: '错误',
+      },
+    ],
+  };
+  const imported = await req('POST', '/questions/import', {
+    filename: 'batch-assign.json',
+    mime: 'application/json',
+    content_base64: Buffer.from(JSON.stringify(payload), 'utf8').toString('base64'),
+    subject_mode: 'from_file',
+  });
+  assert.equal(imported.status, 200, JSON.stringify(imported.data));
+  assert.equal(imported.data.imported, 2);
+
+  const c = await pool.connect();
+  let ids;
+  try {
+    const r = await c.query(
+      `SELECT id FROM questions WHERE subject_id = $1 AND deleted_at IS NULL ORDER BY stem`,
+      [srcSubject],
+    );
+    ids = r.rows.map((row) => row.id);
+  } finally {
+    c.release();
+  }
+  assert.equal(ids.length, 2);
+
+  // ① 只改科目：旧考点必须一起清空（否则题在科目 B、考点却挂科目 A 的子树）。
+  const moved = await req('PATCH', '/questions/batch', {
+    ids,
+    subject_id: dstSubject,
+  });
+  assert.equal(moved.status, 200, JSON.stringify(moved.data));
+  assert.equal(moved.data.updated, 2);
+  assert.equal(moved.data.requested, 2);
+  assert.equal(moved.data.skipped, 0);
+  assert.equal(await countQuestionsInSubject(dstSubject), 2);
+  assert.equal(await countQuestionsInSubject(srcSubject), 0);
+
+  const c2 = await pool.connect();
+  let nodeId;
+  try {
+    const left = await c2.query(
+      `SELECT id, subject_id, knowledge_node_id FROM questions WHERE id = ANY($1::uuid[])`,
+      [ids],
+    );
+    for (const row of left.rows) {
+      assert.equal(row.subject_id, dstSubject);
+      assert.equal(row.knowledge_node_id, null, '换科目后旧考点必须清空');
+    }
+
+    // ② 单独设考点。
+    const n = await c2.query(
+      `INSERT INTO knowledge_nodes (subject_id, title) VALUES ($1, $2) RETURNING id`,
+      [dstSubject, '批量设置的目标考点'],
+    );
+    nodeId = n.rows[0].id;
+  } finally {
+    c2.release();
+  }
+
+  const assigned = await req('PATCH', '/questions/batch', {
+    ids,
+    knowledge_node_id: nodeId,
+  });
+  assert.equal(assigned.status, 200, JSON.stringify(assigned.data));
+  assert.equal(assigned.data.updated, 2);
+
+  // ③ 传 knowledge_node_id: null = 只清考点，科目不动。
+  const cleared = await req('PATCH', '/questions/batch', {
+    ids,
+    knowledge_node_id: null,
+  });
+  assert.equal(cleared.status, 200, JSON.stringify(cleared.data));
+  assert.equal(cleared.data.updated, 2);
+
+  // ④ 两个字段都不给 -> 400 NOTHING_TO_UPDATE（不能变成 no-op 成功）。
+  const nothing = await req('PATCH', '/questions/batch', { ids });
+  assert.equal(nothing.status, 400, JSON.stringify(nothing.data));
+  assert.equal(nothing.data.error, 'NOTHING_TO_UPDATE');
+
+  // ⑤ 空 ids -> 400 EMPTY_IDS。
+  const empty = await req('PATCH', '/questions/batch', { ids: [], subject_id: dstSubject });
+  assert.equal(empty.status, 400);
+  assert.equal(empty.data.error, 'EMPTY_IDS');
+
+  // ⑥ 别人的题静默跳过（公共题 / 他人题都不在 owner 域内）。
+  const notMine = await req('PATCH', '/questions/batch', {
+    ids: ['00000000-0000-4000-8000-000000000001'],
+    subject_id: dstSubject,
+  });
+  assert.equal(notMine.status, 200);
+  assert.equal(notMine.data.updated, 0);
+  assert.equal(notMine.data.skipped, 1);
+});
+
+// ---------------------------------------------------------------------------
+// m31124：导入批次（import_batches + questions.batch_id + GET /import-batches +
+//                     DELETE /questions/batch { batch_id }）
+// ---------------------------------------------------------------------------
+
+/** 造一份 JSON 题库（题目内容用 prefix 区分，避免两批之间相互判重）。 */
+function batchPayload(prefix, stems) {
+  return {
+    questions: stems.map((stem, i) => ({
+      type: 'judge',
+      subject: '批次测试科目',
+      node: '批次节点',
+      stem: `${prefix}${i + 1}：${stem}`,
+      answer: '正确',
+    })),
+  };
+}
+
+/** 数某个批次下未被软删的题。 */
+async function countQuestionsInBatch(batchId) {
+  const c = await pool.connect();
+  try {
+    const r = await c.query(
+      `SELECT count(*)::int AS n FROM questions
+        WHERE batch_id = $1 AND deleted_at IS NULL`,
+      [batchId],
+    );
+    return r.rows[0].n;
+  } finally {
+    c.release();
+  }
+}
+
+/** 读一个 batch 行。 */
+async function readBatchRow(batchId) {
+  const c = await pool.connect();
+  try {
+    const r = await c.query(
+      `SELECT id, user_id, filename, question_count FROM import_batches WHERE id = $1`,
+      [batchId],
+    );
+    return r.rows[0] ?? null;
+  } finally {
+    c.release();
+  }
+}
+
+test('m31124 批次：导两次得到两个批次，删第一批不影响第二批', skipOpt, async () => {
+  // 本轮要求「不改 schema.sql」，所以科目/考点都由导入自己匹配/创建：
+  //   先把「批次测试科目」建出来，否则 subject 匹配失败会落到兜底科目（本轮不传兜底）。
+  const batchSubjectId = await createSubject('批次测试科目');
+
+  // ── 第一批：3 题 ──────────────────────────────────────────────
+  const first = await req('POST', '/questions/import', {
+    filename: 'batch-first.json',
+    mime: 'application/json',
+    content_base64: Buffer.from(
+      JSON.stringify(batchPayload('第一批', ['甲题', '乙题', '丙题'])),
+      'utf8',
+    ).toString('base64'),
+    subject_mode: 'from_file',
+  });
+  assert.equal(first.status, 200, JSON.stringify(first.data));
+  assert.equal(first.data.imported, 3);
+  assert.ok(first.data.batch_id, '响应要回本次批次 id');
+  assert.equal(first.data.import_filename, 'batch-first.json');
+
+  // 题目行：3 行且 batch_id 一致、imported_at 非空。
+  assert.equal(await countQuestionsInBatch(first.data.batch_id), 3);
+  const c1 = await pool.connect();
+  try {
+    const r = await c1.query(
+      `SELECT batch_id, import_filename, imported_at FROM questions
+        WHERE subject_id = $1 AND deleted_at IS NULL AND import_filename = $2`,
+      [batchSubjectId, 'batch-first.json'],
+    );
+    assert.equal(r.rows.length, 3);
+    for (const row of r.rows) {
+      assert.equal(row.batch_id, first.data.batch_id);
+      assert.equal(row.import_filename, 'batch-first.json');
+      assert.ok(row.imported_at, 'imported_at 必须被写上');
+    }
+  } finally {
+    c1.release();
+  }
+
+  // 批次行：question_count 已回填成 3（不是占位的 0）。
+  const firstBatch = await readBatchRow(first.data.batch_id);
+  assert.ok(firstBatch, 'import_batches 里要有这一行');
+  assert.equal(firstBatch.question_count, 3);
+  assert.equal(firstBatch.filename, 'batch-first.json');
+  assert.equal(firstBatch.user_id, seed.userId);
+
+  // ── 第二批：2 题 ──────────────────────────────────────────────
+  const second = await req('POST', '/questions/import', {
+    filename: 'batch-second.json',
+    mime: 'application/json',
+    content_base64: Buffer.from(
+      JSON.stringify(batchPayload('第二批', ['丁题', '戊题'])),
+      'utf8',
+    ).toString('base64'),
+    subject_mode: 'from_file',
+  });
+  assert.equal(second.status, 200, JSON.stringify(second.data));
+  assert.equal(second.data.imported, 2);
+  assert.notEqual(second.data.batch_id, first.data.batch_id, '两次导入必须是两个批次');
+  assert.equal(await countQuestionsInBatch(second.data.batch_id), 2);
+
+  // ── GET /import-batches：两条，按 created_at DESC（第二批在前） ──
+  const listed = await req('GET', '/import-batches?limit=50');
+  assert.equal(listed.status, 200, JSON.stringify(listed.data));
+  const mine = listed.data.items.filter(
+    (b) => b.id === first.data.batch_id || b.id === second.data.batch_id,
+  );
+  assert.equal(mine.length, 2);
+  assert.equal(mine[0].id, second.data.batch_id, '最近的批次排在最前');
+  assert.equal(mine[0].question_count, 2);
+  assert.equal(mine[1].question_count, 3);
+  // 响应不泄漏 token / 内部字段（只白名单四列）。
+  assert.deepEqual(
+    Object.keys(mine[0]).sort(),
+    ['created_at', 'filename', 'id', 'question_count'],
+  );
+
+  // ── GET /questions?batch_id=...：只返回该批的题 ─────────────
+  const filtered = await req('GET', `/questions?batch_id=${first.data.batch_id}&limit=50`);
+  assert.equal(filtered.status, 200, JSON.stringify(filtered.data));
+  assert.equal(filtered.data.items.length, 3);
+  for (const item of filtered.data.items) {
+    assert.ok(String(item.stem).startsWith('第一批'), '按批次筛选只能拿到该批的题');
+  }
+
+  // 「全部批次」不带 filter 时，两批题都在。
+  const all = await req('GET', '/questions?limit=100');
+  assert.equal(all.status, 200);
+  const batchStems = all.data.items.filter((q) => String(q.stem).startsWith('第一批') || String(q.stem).startsWith('第二批'));
+  assert.equal(batchStems.length, 5);
+
+  // ── DELETE /questions/batch { batch_id }：只删第一批 ────────
+  const removed = await req('DELETE', '/questions/batch', { batch_id: first.data.batch_id });
+  assert.equal(removed.status, 200, JSON.stringify(removed.data));
+  assert.equal(removed.data.deleted, 3);
+  assert.equal(removed.data.requested, 3);
+  assert.equal(removed.data.skipped, 0);
+  assert.equal(removed.data.batch_id, first.data.batch_id);
+
+  assert.equal(await countQuestionsInBatch(first.data.batch_id), 0, '第一批 3 题全部软删');
+  assert.equal(await countQuestionsInBatch(second.data.batch_id), 2, '第二批 2 题毫发无伤');
+
+  // 软删而非物理删：行还在，只是 deleted_at 非空（「已删除」档可恢复）。
+  const c2 = await pool.connect();
+  try {
+    const r = await c2.query(
+      `SELECT deleted_at FROM questions WHERE batch_id = $1`,
+      [first.data.batch_id],
+    );
+    assert.equal(r.rows.length, 3, '软删不能真的删行');
+    for (const row of r.rows) assert.ok(row.deleted_at, 'deleted_at 必须被写上');
+  } finally {
+    c2.release();
+  }
+
+  // 批次行仍在（账本是账本，题是题）：question_count 保留当初导入的 3。
+  const stillThere = await readBatchRow(first.data.batch_id);
+  assert.ok(stillThere, '删题不删批次档案');
+  assert.equal(stillThere.question_count, 3);
+
+  // 再删一次同一批：已无可删，deleted=0 且不报错（幂等）。
+  const again = await req('DELETE', '/questions/batch', { batch_id: first.data.batch_id });
+  assert.equal(again.status, 200, JSON.stringify(again.data));
+  assert.equal(again.data.deleted, 0);
+  assert.equal(again.data.requested, 0);
+});
+
+test('m31124 批次：手动建题 batch_id 为 null，不出现在任何批次筛选里', skipOpt, async () => {
+  const created = await req('POST', '/questions', {
+    subject_id: seed.subjectId,
+    type: 'judge',
+    stem: '手动建的题（无批次）',
+    answer: '正确',
+  });
+  assert.equal(created.status, 201, JSON.stringify(created.data));
+
+  const c = await pool.connect();
+  try {
+    const r = await c.query(
+      `SELECT batch_id, import_filename, imported_at FROM questions WHERE id = $1`,
+      [created.data.id],
+    );
+    assert.equal(r.rows.length, 1);
+    assert.equal(r.rows[0].batch_id, null, '手动建题必须没有批次');
+    assert.equal(r.rows[0].import_filename, null);
+    assert.equal(r.rows[0].imported_at, null);
+  } finally {
+    c.release();
+  }
+});
+
+test('m31124 批次：DELETE /questions/batch 参数校验', skipOpt, async () => {
+  // 既没有 batch_id 也没有 ids -> 400 EMPTY_IDS（沿用原有 ids 路径的校验）。
+  const neither = await req('DELETE', '/questions/batch', {});
+  assert.equal(neither.status, 400, JSON.stringify(neither.data));
+  assert.equal(neither.data.error, 'EMPTY_IDS');
+
+  // batch_id 不是字符串 -> 400 INVALID_BATCH_ID（不让它落到 PG 的 uuid 铸型变 500）。
+  const badType = await req('DELETE', '/questions/batch', { batch_id: 123 });
+  assert.equal(badType.status, 400, JSON.stringify(badType.data));
+  assert.equal(badType.data.error, 'INVALID_BATCH_ID');
+
+  // 不存在的批次：删不到任何行，但也不能报错（幂等）；账本里本来就没有它。
+  const missing = await req('DELETE', '/questions/batch', {
+    batch_id: '00000000-0000-4000-8000-0000000000ff',
+  });
+  assert.equal(missing.status, 200, JSON.stringify(missing.data));
+  assert.equal(missing.data.deleted, 0);
+  assert.equal(missing.data.requested, 0);
 });

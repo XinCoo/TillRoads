@@ -499,15 +499,42 @@ export function createFakeRepos() {
       return questionPool.map((r) => ({ ...r }));
     },
     // ★ m17431：与真实仓储 listVisible 同口径（公共题 + 自己的题）。
-    async listVisible(_client, { limit = 50, offset = 0, ownerUserId = null, subjectId = null, mastered } = {}) {
+    async listVisible(
+      _client,
+      {
+        limit = 50,
+        offset = 0,
+        ownerUserId = null,
+        subjectId = null,
+        knowledgeNodeId = null,
+        batchId = null,
+        types,
+        mastered,
+        masteryState,
+      } = {},
+    ) {
+      const typeList = Array.isArray(types) ? types : [];
       const rows = questionPool.filter((q) => {
         if (q.deleted_at) return false;
         if (subjectId && q.subject_id !== subjectId) return false;
+        if (knowledgeNodeId && q.knowledge_node_id !== knowledgeNodeId) return false;
+        if (batchId && q.batch_id !== batchId) return false;
+        // ★ m31635：题型多选（与真实仓储 `type = ANY(...)` 同口径）。
+        if (typeList.length > 0 && !typeList.includes(q.type)) return false;
         if (ownerUserId && q.owner_user_id != null && q.owner_user_id !== ownerUserId) {
           return false;
         }
-        // m25316：掌握状态过滤（与真实仓储同口径）。
-        if (typeof mastered === 'boolean' && ownerUserId) {
+        // m25316 / ★ m31635：掌握状态过滤（与真实仓储同口径）。
+        //   masteryState 优先（多一个 unmarked：一行标记都没有才算）。
+        if (masteryState && ownerUserId) {
+          const m = masteryRows.get(`${ownerUserId}:${q.id}`);
+          if (masteryState === 'unmarked') {
+            if (m) return false;
+          } else if (masteryState === 'mastered' || masteryState === 'unmastered') {
+            const want = masteryState === 'mastered';
+            if (!m || m.mastered !== want) return false;
+          }
+        } else if (typeof mastered === 'boolean' && ownerUserId) {
           const m = masteryRows.get(`${ownerUserId}:${q.id}`);
           if (!m || m.mastered !== mastered) return false;
         }

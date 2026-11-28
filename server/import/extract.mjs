@@ -32,6 +32,10 @@ export const MIME_ALIASES = Object.freeze({
   'application/csv': 'csv',
   'application/pdf': 'pdf',
   'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  // ★ m30197：AI 按 docs/question-recognition-prompt.md 产出的题库 JSON。
+  //   只有 JSON 里才有每题的 subject / node，所以必须能直接吃。
+  'application/json': 'json',
+  'text/json': 'json',
   'image/png': 'image',
   'image/jpeg': 'image',
   'image/jpg': 'image',
@@ -52,8 +56,8 @@ const EXT_KINDS = Object.freeze({
   '.jpeg': 'image',
   '.webp': 'image',
   '.heic': 'image',
+  '.json': 'json',
 });
-
 /**
  * 构造带 HTTP 语义的导入错误。
  * 形状对齐 repositories/_common.mjs：err.statusCode + err.code + err.body，
@@ -194,7 +198,7 @@ export async function extractText(file = {}) {
     throw importError(
       'UNSUPPORTED_MEDIA',
       415,
-      '不支持的文件类型，请上传 Markdown / TXT / CSV / 文字版 PDF / XLSX',
+      '不支持的文件类型，请上传 Markdown / TXT / CSV / 文字版 PDF / XLSX / JSON',
       { mime: file.mime || null, filename: file.filename || null },
     );
   }
@@ -206,6 +210,9 @@ export async function extractText(file = {}) {
     case 'markdown':
     case 'text':
     case 'csv':
+    case 'json':
+      // JSON 与文本类一样直接转 utf8，"JSON 长什么样" 交给 json_import.mjs 解析。
+      // 这里不 JSON.parse：抽取阶段只管「字节 → 文本」，解析失败在切题阶段报。
       text = Buffer.from(buffer).toString('utf8');
       break;
     case 'pdf': {

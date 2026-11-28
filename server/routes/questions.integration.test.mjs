@@ -145,6 +145,13 @@ after(async () => {
                  WHERE p.user_id IN ($1, $2))`,
       [seed.userA, seed.userB],
     );
+    // m31124：本用例会用 A 的 token 调 POST /questions/import，导入管线现在会在
+    //   import_batches 里建一行（user_id 外键、无级联），必须在删 users 之前清掉，
+    //   否则收尾报 import_batches_user_id_fkey（23503）。
+    await c.query(`DELETE FROM import_batches WHERE user_id IN ($1, $2)`, [
+      seed.userA,
+      seed.userB,
+    ]);
     // 模考记录引用 exam_profiles（mock_exams_exam_profile_id_fkey），必须在删 exam_profiles
     // 之前删掉。第 4 个用例 POST /mock-exams 建了 1 条，漏掉它 after() 会 23503。
     await c.query(

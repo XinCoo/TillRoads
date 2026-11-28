@@ -64,6 +64,14 @@ const List<String> kSupportedExtensions = <String>[
   'xlsx',
 ];
 
+/// 科目归属模式（与后端 `POST /questions/import` 的 `subject_mode` 同值）。
+///
+/// [kSubjectModeFromFile]：按文件里每题自带的 `subject` 文本匹配科目、
+/// 按 `node` 文本匹配或创建考点；请求里的 `subject_id` 只当兜底科目。
+/// [kSubjectModeUniform]：现有行为 —— 所有题都进请求里的 `subject_id`。
+const String kSubjectModeFromFile = 'from_file';
+const String kSubjectModeUniform = 'uniform';
+
 /// 导入的三个阶段。
 ///
 /// 后端 `POST /questions/import` 是**一次性同步接口**：没有 job id，
@@ -102,6 +110,14 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
 
   /// 选中的科目 id。
   String? _subjectId;
+
+  /// 科目归属模式（对应后端 `subject_mode`）。
+  ///
+  /// 默认 [kSubjectModeFromFile]：题目自带的科目文本说了算，
+  /// 用户选的 `_subjectId` 降级成「文件里没写科目名」时的兜底科目。
+  String _subjectMode = kSubjectModeFromFile;
+
+  bool get _isFromFile => _subjectMode == kSubjectModeFromFile;
 
   /// 选中的考点 id（可空）。
   String? _knowledgeNodeId;
@@ -228,14 +244,36 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
     }
   }
 
+  /// 切换科目归属模式。
+  ///
+  /// 切回「统一指定」时如果用户之前已经选过科目、且考点列表为空，
+  /// 重新拉一次考点（否则「3. 选择考点」卡片不会出现）。
+  void _setSubjectMode(String mode) {
+    if (mode == _subjectMode) return;
+    setState(() {
+      _subjectMode = mode;
+      _error = null;
+    });
+    final String? subjectId = _subjectId;
+    if (!_isFromFile &&
+        subjectId != null &&
+        subjectId.isNotEmpty &&
+        _knowledgeNodes.isEmpty) {
+      _pickSubject(subjectId);
+    }
+  }
+
   Future<void> _upload() async {
     final PlatformFile? file = _file;
     if (file == null) {
       setState(() => _error = '请先选择要导入的文件。');
       return;
     }
+    // from_file 模式下「文件里没写科目名」需要有兜底科目，但没选也能导
+    // （全部题都不带科目名时，后端会把它们记到未分类，用户可事后批量移动）。
+    // uniform 模式仍然强制选科目（否则后端没有归属可写）。
     final String? subjectId = _subjectId;
-    if (subjectId == null || subjectId.isEmpty) {
+    if (!_isFromFile && (subjectId == null || subjectId.isEmpty)) {
       setState(() => _error = '请选择题目所属的科目。');
       return;
     }
@@ -256,8 +294,10 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
         filename: file.name,
         contentBase64: base64,
         mime: _mimeOf(file.name),
+        subjectMode: _subjectMode,
         subjectId: subjectId,
-        knowledgeNodeId: _knowledgeNodeId,
+        // from_file 模式下考点由文件里的 node 决定，不再传界面选的考点。
+        knowledgeNodeId: _isFromFile ? null : _knowledgeNodeId,
       );
       if (!mounted) return;
       setState(() {
@@ -455,6 +495,45 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
             crossAxisAlignment: CrossAxisAlignment.start,
             children: <Widget>[
               const SectionHeader(text: '2. 选择科目'),
+              // 科目归属两模式（与后端 subject_mode 同值）。默认「从文件读取」——
+              // 文件里本来就写了科目，再让用户选一遍是重复劳动且容易选错。
+              Row(
+                children: <Widget>[
+                  _Chip(
+                    label: '从文件读取',
+                    selected: _isFromFile,
+                    onTap: () => _setSubjectMode(kSubjectModeFromFile),
+                  ),
+                  const SizedBox(width: 8),
+                  _Chip(
+                    label: '统一指定',
+                    selected: !_isFromFile,
+                    onTap: () => _setSubjectMode(kSubjectModeUniform),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 8),
+              Text(
+                _isFromFile
+                    ? '每道题按自己携带的科目名入库；下面选的科目只当兜底：'
+                        '文件里没有科目名时，会归到这里选的兜底科目。'
+                    : '所有题都归到下面选中的科目。',
+                style: const TextStyle(
+                  fontFamily: kFontFamily,
+                  fontSize: 12,
+                  height: 1.4,
+                  color: AppColors.secondaryLabel,
+                ),
+              ),
+              if (_isFromFile) ...<Widget>[
+                const SizedBox(height: 8),
+                const _ImportNotice(
+                  icon: CupertinoIcons.arrow_branch,
+                  color: AppColors.accent,
+                  text: '不选科目也能直接导入。考点也由文件里的 node 自动匹配或创建，无需在这里选。',
+                ),
+              ],
+              const SizedBox(height: 8),
               if (_profiles.isEmpty)
                 const Text(
                   '还没有考试档案，请先在「我的 → 考试配置」中添加考试目标与科目。',
@@ -464,18 +543,30 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
                     color: AppColors.secondaryLabel,
                   ),
                 )
-              else
-                for (final Map<String, Object?> profile in _profiles)
-                  _ProfileSubjectPicker(
-                    profile: profile,
-                    subjectId: subjectId,
-                    onPickSubject: _pickSubject,
-                  ),
+                else ...<Widget>[
+                  if (_isFromFile) ...<Widget>[
+                    const Text(
+                      '兜底科目（可选）',
+                      style: TextStyle(
+                        fontFamily: kFontFamily,
+                        fontSize: 13,
+                        color: AppColors.secondaryLabel,
+                      ),
+                    ),
+                    const SizedBox(height: 8),
+                  ],
+                  for (final Map<String, Object?> profile in _profiles)
+                    _ProfileSubjectPicker(
+                      profile: profile,
+                      subjectId: subjectId,
+                      onPickSubject: _pickSubject,
+                    ),
+                ],
             ],
           ),
         ),
         const SizedBox(height: 12),
-        if (_knowledgeNodes.isNotEmpty)
+        if (!_isFromFile && _knowledgeNodes.isNotEmpty)
           _CardBox(
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
@@ -496,14 +587,40 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
               ],
             ),
           ),
+        // from_file 模式下考点由文件里的 node 决定，这里只做只读说明，
+        // 不展示可选 chip（否则用户会以为选了就能生效）。
+        if (_isFromFile) ...<Widget>[
+          const SizedBox(height: 12),
+          _CardBox(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                const SectionHeader(text: '3. 选择考点'),
+                Text(
+                  '考点由文件里每道题的 node 字段自动匹配；'
+                  '文件里的考点在库里不存在时，后端会自动创建（结果页会列出新建的考点）。',
+                  style: const TextStyle(
+                    fontFamily: kFontFamily,
+                    fontSize: 13,
+                    height: 1.4,
+                    color: AppColors.secondaryLabel,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
         if (_error != null) ...<Widget>[
           const SizedBox(height: 12),
           _ErrorBanner(message: _error!),
         ],
         const SizedBox(height: 20),
         CupertinoButton.filled(
-          onPressed:
-              (_uploading || file == null || subjectId == null) ? null : _upload,
+          // from_file 模式下不要求选科目（只要有文件就能提交）；
+          // uniform 模式仍需要科目。
+          onPressed: (_uploading || file == null || (!_isFromFile && subjectId == null))
+              ? null
+              : _upload,
           child: _uploading
               ? const CupertinoActivityIndicator(color: CupertinoColors.white)
               : const Text(
@@ -531,6 +648,13 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
     final int? review = _statInt(result, 'type_needs_review');
     final int? sanitized = _statInt(result, 'sanitized');
     final bool hasTypeStats = detected != null || review != null || sanitized != null;
+    // ★ 科目匹配结果：旧后端没有这两段字段时 fromJson 会归零，
+    // 全 0 就不显示（避免给用户看一个「匹配 0 题」的空区块）。
+    final ImportSubjectMatch subjectMatch = result.subjectMatched;
+    final ImportNodeCreated nodeCreated = result.nodeCreated;
+    final bool hasSubjectMatch =
+        subjectMatch.matchedCount > 0 || subjectMatch.unmatchedCount > 0;
+    final bool hasNodeCreated = nodeCreated.createdCount > 0 || nodeCreated.createdPaths.isNotEmpty;
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 24, 16, 32),
       children: <Widget>[
@@ -587,6 +711,89 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
                         fontSize: 13,
                         height: 1.4,
                         color: AppColors.dueSoon,
+                      ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+        // ── 科目匹配结果（new）：识别统计之后、判重列表之前。
+        if (hasSubjectMatch) ...<Widget>[
+          const SizedBox(height: 16),
+          const SectionHeader(text: '科目匹配结果'),
+          _CardBox(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                if (subjectMatch.matchedCount > 0)
+                  _ResultRow(
+                    label: '按文件科目匹配',
+                    value: '${subjectMatch.matchedCount}',
+                  ),
+                if (subjectMatch.matchedCount > 0 &&
+                    subjectMatch.matchedSubjects.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(
+                      '归入：${subjectMatch.matchedSubjects.map((ImportSubjectCount s) => '${s.name.isEmpty ? '未命名科目' : s.name}（${s.count} 题）').join('、')}',
+                      style: const TextStyle(
+                        fontFamily: kFontFamily,
+                        fontSize: 13,
+                        height: 1.4,
+                        color: AppColors.secondaryLabel,
+                      ),
+                    ),
+                  ),
+                if (subjectMatch.unmatchedCount > 0)
+                  _ResultRow(
+                    label: '未能匹配科目',
+                    value: '${subjectMatch.unmatchedCount}',
+                  ),
+                if (subjectMatch.unmatchedSubjects.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 2),
+                    child: Text(
+                      '文件里的科目名：${subjectMatch.unmatchedSubjects.join('、')}',
+                      style: const TextStyle(
+                        fontFamily: kFontFamily,
+                        fontSize: 13,
+                        height: 1.4,
+                        color: AppColors.secondaryLabel,
+                      ),
+                    ),
+                  ),
+                if (subjectMatch.unmatchedCount > 0)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 8),
+                    child: _ImportNotice(
+                      icon: CupertinoIcons.info_circle,
+                      color: AppColors.dueSoon,
+                      text: '这些题已归入你选的兜底科目，可到题库管理页批量移动到正确科目。',
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+        if (hasNodeCreated) ...<Widget>[
+          const SizedBox(height: 16),
+          const SectionHeader(text: '自动创建的考点'),
+          _CardBox(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                _ResultRow(label: '新建考点', value: '${nodeCreated.createdCount}'),
+                for (final String path in nodeCreated.createdPaths)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Text(
+                      '· $path',
+                      style: const TextStyle(
+                        fontFamily: kFontFamily,
+                        fontSize: 13,
+                        height: 1.4,
+                        color: AppColors.secondaryLabel,
                       ),
                     ),
                   ),

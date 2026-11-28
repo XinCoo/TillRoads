@@ -25,7 +25,7 @@ import {
   updateWithVersion,
 } from './_common.mjs';
 import { normalizeQuestionText } from '../../core/index.mjs';
-import { masteryFilterClause } from './question_mastery.mjs';
+import { masteryFilterClause, masteryStateFilterClause } from './question_mastery.mjs';
 import { hiddenFilterClause } from './question_hidden.mjs';
 
 export const TABLE = 'questions';
@@ -53,16 +53,32 @@ export const WRITABLE_COLUMNS = Object.freeze([
   // 归属用户（m17431）：NULL = 公共题（seed / 系统题），非 NULL = 用户私有题。
   // 查重与组卷抽题都按这一列分域，见 findHashConflict 的注释。
   'owner_user_id',
+  // 导入批次（m31124）：batch_id / import_filename / imported_at。
+  // 由导入管线写入，手动建题与历史数据为 NULL。
+  // ★ 这三列**不进 UPDATE_COLUMNS**（见下方），只能由导入流程在 INSERT 时带上。
+  'batch_id',
+  'import_filename',
+  'imported_at',
 ]);
+
+/**
+ * 导入批次档案列（m31124）。
+ *
+ * 为什么单拎一个常量：这些列**只能由导入流程在 INSERT 时写入**，
+ * 手工建题、PATCH 编辑都不应该碰它们（"哪次导入的" 是档案属性，不是可编辑字段）。
+ * UPDATE_COLUMNS 显式排除之；create() 仍通过 INSERT_COLUMNS 带上。
+ */
+const BATCH_COLUMNS = Object.freeze(['batch_id', 'import_filename', 'imported_at']);
 
 /**
  * UPDATE 允许列（乐观锁）。
  *
  * 刻意**不含** owner_user_id：归属是「谁导进来的」，只能由服务端按 token 决定，
  * 不允许客户端 PATCH 把它改成别人的 id（否则就能「认领」别人的题）。
+ * 同样不含 BATCH_COLUMNS：批次档案不随编辑变动。
  */
 const UPDATE_COLUMNS = Object.freeze(
-  WRITABLE_COLUMNS.filter((c) => c !== 'owner_user_id'),
+  WRITABLE_COLUMNS.filter((c) => c !== 'owner_user_id' && !BATCH_COLUMNS.includes(c)),
 );
 
 const INSERT_COLUMNS = Object.freeze([...WRITABLE_COLUMNS]);
@@ -165,6 +181,10 @@ export async function create(client, input = {}) {
     input.is_subjective ?? false,
     // 归属：NULL = 公共题。列可空（不设 NOT NULL），公共题必须是 NULL。
     ownerUserId,
+    // 导入批次档案（m31124）：手动建题传空，导入管线带值。
+    input.batch_id ?? null,
+    input.import_filename ?? null,
+    input.imported_at ?? null,
   ];
 
   return insertRow(client, TABLE, INSERT_COLUMNS, values);
@@ -240,13 +260,40 @@ export async function listVisible(
     knowledgeNodeId,
     q,
     mastered,
+    /// ★ m31635：三态掌握度（`mastered` / `unmastered` / `unmarked`）。
+    ///
+    /// 与旧参数 [mastered] 共存：`masteryState` 优先级更高（它多一个 `unmarked`
+    /// 态，旧参数表达不了）。两者都给时只看 `masteryState`，避免两套语义打架。
+    masteryState,
+    /// ★ m31635：题型多选。路由层已把 `choice,multi` 拆成数组；
+    /// 空数组 / 未传都不加条件（保持旧行为）。
+    types,
     includeHidden,
+    batchId,
     orderBy,
-  } = {},
+  },
 ) {
   const p = pageParams({ limit, offset });
   const where = ['deleted_at IS NULL'];
   const params = [];
+  // m31124：按导入批次过滤（题库管理页的「导入批次」下拉用）。
+  //   batch_id 为 NULL 的题（手动建题 / 历史数据）永远不会命中具体批次，
+  //   这正是需求 C3 要的行为：选中具体批次时不显示手动建的题。
+  if (batchId) {
+    params.push(batchId);
+    where.push(`batch_id = $${params.length}`);
+  }
+  if (subjectId) {
+    params.push(subjectId);
+    where.push(`subject_id = $${params.length}`);
+  }
+  // ★ m31635：题型多选过滤。用 `= ANY($n::text[])` —— 数组参数一次比较，
+  //   比 `type = 'a' OR type = 'b'` 拼接更稳（不会因逗号/引号注出 SQL）。
+  //   types 已由路由层归一（去空白、去重、只留合法题型），空数组不加条件。
+  if (Array.isArray(types) && types.length > 0) {
+    params.push(types);
+    where.push(`type = ANY($${params.length}::text[])`);
+  }
   if (subjectId) {
     params.push(subjectId);
     where.push(`subject_id = $${params.length}`);
@@ -280,19 +327,31 @@ export async function listVisible(
     params.push(...hFilter.params);
     where.push(hFilter.clause);
   }
-  // m25316：掌握状态过滤（练习模式 R2）。
-  //   mastered=true  → 有标记且标为已掌握；mastered=false → 有标记且标为未掌握。
-  //   「从没标记过」的题两个值都不匹配（未标记是第三种状态，单独筛暂不做）。
+  // m25316 / ★ m31635：掌握状态过滤（练习模式 R2 + 题库多条件组合筛选）。
+  //   masteryState（新，三态优先）：
+  //     'mastered'   → 有标记且标为已掌握
+  //     'unmastered' → 有标记且标为未掌握（不含从未标记过的题）
+  //     'unmarked'   → 一行标记都没有（必须整个 NOT EXISTS 取反）
+  //   旧参数 mastered（布尔）保留兼容：masteryState 缺省时才看它。
   // 用 EXISTS 子查询（不是 JOIN），避免同一题因多行标记产生重复行。
-  if (typeof mastered === 'boolean' && ownerUserId) {
-    const mFilter = masteryFilterClause({
-      userId: ownerUserId,
-      mastered,
-      tableAlias: 'questions',
-      paramIndex: params.length + 1,
-    });
-    params.push(...mFilter.params);
-    where.push(mFilter.clause);
+  const stateClause = masteryState
+    ? masteryStateFilterClause({
+        userId: ownerUserId,
+        state: masteryState,
+        tableAlias: 'questions',
+        paramIndex: params.length + 1,
+      })
+    : typeof mastered === 'boolean' && ownerUserId
+      ? masteryFilterClause({
+          userId: ownerUserId,
+          mastered,
+          tableAlias: 'questions',
+          paramIndex: params.length + 1,
+        })
+      : null;
+  if (stateClause) {
+    params.push(...stateClause.params);
+    where.push(stateClause.clause);
   }
 
   // 题库列表默认「最新导入的排最前」—— 用户刚导入完要能立刻在第一屏看到自己导入的题。
@@ -534,4 +593,91 @@ export async function updateTagsBatch(client, ids, tags, mode = 'replace', owner
     RETURNING q.id`;
   const rows = await queryMany(client, sql, [ids, ownerUserId, tagsJsonb, mode]);
   return rows.length;
+}
+
+/**
+ * 批量改归属（科目 / 考点）—— m30197 任务 C。
+ *
+ * 三条与任务书对齐的语义：
+ *   1. 只改「自己的题」（`owner_user_id = $2`），公共题与别人的题静默跳过；
+ *      subject_id / knowledge_node_id 是归属类字段，改公共题会污染别人的视图。
+ *   2. `clearKnowledgeNode` 可以把考点置 NULL（「不指定考点」），但科目不能置空：
+ *      知识点必须挂在科目下，脱离科目的题不会出现在任何考点树上。
+ *   3. 只改科目、没显式给考点时，把考点一并置 NULL —— 旧考点属于旧科目，
+ *      留着会得到「题在科目 A、考点却在科目 B 的子树里」这种自相矛盾的数据。
+ *
+ * 不带 version：批量操作与 updateTagsBatch 同口径（用户已在多选里确认过意图，
+ * 逐行版本校验会让任意一行被别人改过就整批失败）。
+ */
+export async function updateAssignmentBatch(
+  client,
+  ids,
+  { subjectId = null, knowledgeNodeId = null, clearKnowledgeNode = false } = {},
+  ownerUserId,
+) {
+  if (!Array.isArray(ids) || ids.length === 0) return 0;
+
+  const params = [ids, ownerUserId];
+  const sets = [];
+
+  if (subjectId) {
+    params.push(subjectId);
+    sets.push(`subject_id = $${params.length}::uuid`);
+  }
+  if (clearKnowledgeNode) {
+    sets.push('knowledge_node_id = NULL');
+  } else if (knowledgeNodeId) {
+    params.push(knowledgeNodeId);
+    sets.push(`knowledge_node_id = $${params.length}::uuid`);
+  } else if (subjectId) {
+    // 只换了科目：旧考点已经不属于新科目，必须清掉。
+    sets.push('knowledge_node_id = NULL');
+  }
+
+  if (sets.length === 0) return 0;
+
+  const sql = `UPDATE ${TABLE} q
+                  SET ${sets.join(', ')},
+                      updated_at = now()
+                WHERE q.id = ANY($1::uuid[])
+                  AND q.deleted_at IS NULL
+                  AND q.owner_user_id = $2
+                RETURNING q.id`;
+  const rows = await queryMany(client, sql, params);
+  return rows.length;
+}
+
+/**
+ * 整批软删（m31124）：把某个批次下**自己的**题全部打上 tombstone。
+ *
+ * 为什么不用 archiveBatch 逐个 id：前端只知道 batch_id，不该先把整批题拉下来
+ * 再回传一堆 id（题多时请求体会很大，而且中间还有并发漏网）。
+ *
+ * 条件三条：
+ *   * `batch_id = $1` —— 只动这一批；
+ *   * `owner_user_id = $2` —— 只动自己的（公共题、别人的题绝不可能被误伤）；
+ *   * `deleted_at IS NULL` —— 已经是墓碑的跳过，返回值即「本次实际删掉几条」。
+ *
+ * 软删仍走 deleted_at（不物理删）：与单题删除、批量删除同一语义，
+ * 题库管理页的「已删除」档还能看到并恢复。
+ */
+export async function archiveByBatch(client, batchId, ownerUserId) {
+  if (!batchId || !ownerUserId) return 0;
+  const sql = `UPDATE ${TABLE} SET deleted_at = now()
+    WHERE batch_id = $1 AND deleted_at IS NULL AND owner_user_id = $2
+    RETURNING id`;
+  const rows = await queryMany(client, sql, [batchId, ownerUserId]);
+  return rows.length;
+}
+
+/**
+ * 数某个批次下的未删题数（m31124）。整批删除前的确认弹窗要靠它显示「将删除 N 道题」。
+ * 过滤条件与 archiveByBatch 完全一致，否则会出现「说删 5 道实际删 3 道」。
+ */
+export async function countByBatch(client, batchId, ownerUserId) {
+  if (!batchId || !ownerUserId) return 0;
+  const sql = `SELECT count(*)::int AS n FROM ${TABLE}
+    WHERE batch_id = $1 AND deleted_at IS NULL AND owner_user_id = $2`;
+  const row = await queryOne(client, sql, [batchId, ownerUserId]);
+  return row ? Number(row.n) || 0 : 0;
 }

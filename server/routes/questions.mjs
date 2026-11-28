@@ -49,6 +49,20 @@ async function listQuestions(ctx) {
   // m25316：掌握状态筛选。'true'/'false' 才是有效值；其它值（如 '1'、'yes'、空串）一律当作没传。
   const rawMastered = ctx.searchParams.get('mastered');
   const mastered = rawMastered === 'true' ? true : rawMastered === 'false' ? false : undefined;
+  // m31124：按导入批次筛选。题库管理页选中某个批次时传 batch_id。
+  //   空串/纯空白当作没传（「全部批次」走这条）。
+  const rawBatchId = ctx.searchParams.get('batch_id');
+  const batchId = rawBatchId && rawBatchId.trim().length > 0 ? rawBatchId.trim() : null;
+  // ★ m31635：题型多选。`type=choice,multi` → ['choice','multi']。
+  //   每个值都按 QUESTION_TYPES 校验：合法值保留，非法值直接忽略（不报 400）——
+  //   报错会让旧客户端的脏参数把整页打成错误页，而忽略一个脏值退化成“少一个筛选维度”，
+  //   用户能立刻看出列表没按预期缩窄。
+  //   去空白 + 去重 + 保序（顺序不影响 SQL，但便于日志复现）。
+  const types = parseTypeFilter(ctx.searchParams.get('type'));
+  // ★ m31635：掌握状态三态。只有 mastered / unmastered / unmarked 有效，
+  //   其余（含旧参数 mastered 的 true/false）一律不传 —— 旧参数由下方的
+  //   mastered 布尔值单独兼容，路由层不做两者互转。
+  const mastery = parseMasteryFilter(ctx.searchParams.get('mastery'));
 
   // limit/offset 复用 pagination（字符串→数字），非法值由仓储层 pageParams 兜底。
   const page = pagination(ctx.searchParams);
@@ -62,7 +76,9 @@ async function listQuestions(ctx) {
     knowledgeNodeId: knowledgeNodeId || null,
     q,
     mastered,
-
+    masteryState: mastery,
+    types,
+    batchId,
   });
 
   // m25316：题库列表带掌握度。批量查一次本批题的掌握度 Map（题库页要挂徽标）。
@@ -103,6 +119,40 @@ async function listQuestions(ctx) {
     limit: page.limit,
     offset: page.offset,
   });
+}
+
+/**
+ * ★ m31635：解析 `type=choice,multi` 这种逗号分隔的题型参数。
+ *
+ * 返回合法题型数组；没传 / 全是非法值时返回空数组（= 不加条件）。
+ * 非法值静默忽略而不报 400：筛选器是「多选叠加」的辅助维度，
+ * 一个脏值不应该把整页打成错误页。
+ */
+function parseTypeFilter(raw) {
+  if (!raw || typeof raw !== 'string') return [];
+  const out = [];
+  for (const piece of raw.split(',')) {
+    const value = piece.trim();
+    if (!value) continue;
+    if (!QUESTION_TYPES.includes(value)) continue;
+    if (out.includes(value)) continue;
+    out.push(value);
+  }
+  return out;
+}
+
+/**
+ * ★ m31635：解析三态掌握度 `mastery=mastered|unmastered|unmarked`。
+ *
+ * 返回三态字符串；其它值（含旧参数 `mastered=true`）返回 undefined = 不筛。
+ * 与旧参数 [mastered] 各走各的：路由层不把 `mastery=mastered` 翻译成
+ * `mastered=true`，因为两者语义不同（`mastered=true` 不含 unmarked）。
+ */
+function parseMasteryFilter(raw) {
+  if (!raw || typeof raw !== 'string') return undefined;
+  const value = raw.trim();
+  if (value === 'mastered' || value === 'unmastered' || value === 'unmarked') return value;
+  return undefined;
 }
 
 /**
@@ -514,21 +564,43 @@ async function setQuestionHidden(ctx, id) {
 }
 
 /**
- * DELETE /questions/batch —— 批量软删（m26090 练习模式 R3）。
+ * DELETE /questions/batch —— 批量软删（m26090 练习模式 R3 / m31124 批次删除）。
  *
- * body: { "ids": ["uuid", ...] }
+ * 两种 body 二选一（严格先看 batch_id，再看 ids）：
+ *   * { "batch_id": "uuid" }   —— 删整个导入批次（m31124）
+ *   * { "ids": ["uuid", ...] }  —— 按 id 列表删（原有行为）
  *
  * 规则：
- *   * 只能删**自己的**题；公共题与别人的题在 SQL 层就被 owner_user_id 条件排除了
- *     （archiveBatch 里带 owner_user_id = $2），所以它们会被静默跳过。
- *   * 不带 version（见仓储层 archiveBatch 的注释：批量操作不做乐观锁）。
- *   * 响应回 skipped 列表，让前端能告诉用户「其中 N 道是公共题，没删掉」。
+ *   * 只能删**自己的**题；公共题与别人的题在 SQL 层就被 owner_user_id 条件排除了，
+ *     所以它们会被静默跳过（响应里的 skipped 计）。
+ *   * 不带 version（批量操作不做乐观锁，与单题删除的口径不同是刻意的）。
+ *   * 两条路径都是软删（deleted_at），「已删除」档仍可恢复。
  */
 async function deleteQuestionsBatch(ctx) {
   if (!ctx.authUserId) {
     return fail('unauthorized', 401, { message: '批量删除需要有效的 Bearer Token' });
   }
   const body = ctx.body ?? {};
+
+  // ★ m31124：按批次删 —— 前端只持有 batch_id，不该先拉整批再回传一堆 id。
+  const rawBatchId = body.batch_id;
+  if (rawBatchId !== undefined && rawBatchId !== null && rawBatchId !== '') {
+    if (typeof rawBatchId !== 'string') {
+      return fail('INVALID_BATCH_ID', 400, { message: 'batch_id 必须是字符串' });
+    }
+    const batchId = rawBatchId.trim();
+    if (batchId.length === 0) {
+      return fail('INVALID_BATCH_ID', 400, { message: 'batch_id 不能为空' });
+    }
+    // requested 取「该批次当前未删条数」，前端拿它算 skipped 才有意义。
+    const requested = await withTransaction(ctx.pool, (client) =>
+      qRepo.countByBatch(client, batchId, ctx.authUserId),
+    );
+    const deleted = await withTransaction(ctx.pool, (client) =>
+      qRepo.archiveByBatch(client, batchId, ctx.authUserId),
+    );
+    return ok({ deleted, batch_id: batchId, requested, skipped: Math.max(0, requested - deleted) });
+  }
   const ids = Array.isArray(body.ids) ? body.ids.filter((v) => typeof v === 'string' && v !== '') : [];
   if (ids.length === 0) {
     return fail('EMPTY_IDS', 400, { message: 'ids 不能为空' });
@@ -594,6 +666,55 @@ async function updateQuestionsTagsBatch(ctx) {
   }
   const updated = await withTransaction(ctx.pool, (client) =>
     qRepo.updateTagsBatch(client, ids, tags ?? [], mode, ctx.authUserId),
+  );
+  return ok({ updated, requested: ids.length, skipped: ids.length - updated });
+  return ok({ updated, requested: ids.length, skipped: ids.length - updated });
+}
+
+/**
+ * PATCH /questions/batch —— 批量改归属（科目 / 考点）—— m30197 任务 C。
+ *
+ * body: { ids: string[], subject_id?: uuid, knowledge_node_id?: uuid|null }
+ *   - 只传 subject_id  —— 换科目，旧考点一并清空（旧考点不属于新科目）；
+ *   - 传 knowledge_node_id —— 设考点；
+ *   - 传 knowledge_node_id: null —— 只清考点。
+ *
+ * 与 /questions/batch/tags 同形状：只改自己的题，公共题与别人的题静默跳过
+ * （响应里的 skipped 就是这部分的条数）。不带 version，理由见仓储注释。
+ */
+async function updateQuestionsAssignmentBatch(ctx) {
+  if (!ctx.authUserId) {
+    return fail('unauthorized', 401, { message: '批量改归属需要有效的 Bearer Token' });
+  }
+  const body = ctx.body ?? {};
+  const ids = Array.isArray(body.ids)
+    ? body.ids.map((v) => optionalId(v)).filter((v) => v !== null)
+    : [];
+  if (ids.length === 0) {
+    return fail('EMPTY_IDS', 400, { message: 'ids 不能为空' });
+  }
+
+  const subjectId = optionalId(body.subject_id);
+  // 「键在不在」与「值是 null」是两件事：
+  //   键不在     -> 完全不碰考点；
+  //   键在且 null -> 用户选了「不指定考点」，必须清空。
+  const hasNodeKey = Object.prototype.hasOwnProperty.call(body, 'knowledge_node_id');
+  const knowledgeNodeId = hasNodeKey ? optionalId(body.knowledge_node_id) : null;
+  const clearKnowledgeNode = hasNodeKey && knowledgeNodeId === null;
+
+  if (!subjectId && !hasNodeKey) {
+    return fail('NOTHING_TO_UPDATE', 400, {
+      message: 'subject_id 与 knowledge_node_id 至少要给一个',
+    });
+  }
+
+  const updated = await withTransaction(ctx.pool, (client) =>
+    qRepo.updateAssignmentBatch(
+      client,
+      ids,
+      { subjectId, knowledgeNodeId, clearKnowledgeNode },
+      ctx.authUserId,
+    ),
   );
   return ok({ updated, requested: ids.length, skipped: ids.length - updated });
 }
@@ -669,6 +790,13 @@ export async function match(method, seg, ctx) {
   if (method === 'PATCH' && seg.length === 3 && seg[0] === 'questions' && seg[1] === 'batch' && seg[2] === 'tags') {
     return updateQuestionsTagsBatch(ctx);
   }
+  //   PATCH /questions/batch —— 批量改归属（科目 / 考点）（m30197）
+  //   ★ seg.length === 2，会与文件末尾的通用 `PATCH /questions/:id` 撞车：
+  //     被通用分支抢走就会拿 'batch' 当 uuid 查，PG 报 22P02 → 被 httpError 吞成 500。
+  if (method === 'PATCH' && seg.length === 2 && seg[0] === 'questions' && seg[1] === 'batch') {
+    return updateQuestionsAssignmentBatch(ctx);
+  }
+
   //   PATCH /questions/:id/restore —— 恢复软删的题
   if (method === 'PATCH' && seg.length === 3 && seg[0] === 'questions' && seg[2] === 'restore') {
     return restoreQuestion(ctx, seg[1]);
