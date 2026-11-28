@@ -1,4 +1,4 @@
-﻿# 题路 TillRoad
+# 题路 TillRoad
 
 > 一款「不追刷题量、追缺陷闭环」的成人考试备考管理 App。
 > 核心闭环：**目标配置 → 能力层级 → 缺陷单 → 三次验证关闭 → 周期复盘**。
@@ -980,6 +980,38 @@ R2 的掌握度标记只能「标」，不能「不看」——用户一周下�
 
 **校验**：新增 3 条集成用例（预检 5 题 3 重复 → `new=2`/`duplicate=3` 且题数与批次数都不变；不传 decisions 默认 skip → `new=2`/`skipped=3`；overwrite → `overwritten=3` 且原题 id 与归属不变、总题数只 +2），**PGlite 真库 23/23**；`npm test` **428 tests / 215 pass / 0 fail / 213 skipped**；`flutter analyze --no-fatal-infos` **0 error / 0 warning / 101 info**；`flutter test` **137/137**。
 
+### 跨设备恢复：`.tillroad` 导入的科目 / 考点 ID 重映射（m34301）
+
+导出的 `.tillroad` 里，`questions.subject_id` / `knowledge_node_id` 存的都是**原设备库里的 uuid**。换一台设备导入时这些 uuid 在目标库里并不存在，题目会挂空（科目为空、考点为空），导出包里的 `subjects` / `knowledge_nodes` 两张分类树也从来没有被重建过。m34301 补的就是这一步：**导入前先把分类树按名字重建成目标库的 uuid，再按映射把每道题挂回去**。
+
+| 阶段 | 做什么 | 落在哪 |
+|---|---|---|
+| `remapSubjects` | 遍历文件里的 `subjects`，按 `name` 在目标用户 active 考试目标下的科目里匹配（精确 → 包含 → 被包含，同档取名字最短者）；先只在文件声明的那个 `exam_profile_id` 下找，找不到再跨目标；命中就记 `旧 uuid → 新 uuid`，没命中就**建一个同名科目**并记为新建 | `server/import/remap_tillroad.mjs` |
+| `remapNodes` | 按拓扑顺序（父在前）逐层处理 `knowledge_nodes`；每层用「映射后的 subject + 映射后的 parent + title」三段定位，命中复用、缺失新建（`title` / `parent_id` / `freq_tag` / `weight_to_target` 都从文件带过来；`freq_tag` / `weight` 非法时置 null，否则 schema 的 CHECK 会让整批回滚） | 同上 |
+| `resolveQuestion` | 每题用 `source_subject_id` / `source_knowledge_node_id` 查两张映射表；查不到就把该字段置 null 并计入 `questions_without_subject`（**题仍然入库**，导入是「尽量恢复」不是严格校验） | 同上 |
+
+**为什么必须在同一个事务里**：`remapSubjects` / `remapNodes` 会**写库**（建科目、建考点）。如果它们和题目插入不在一个事务，题目回滚时会留下孤儿科目 / 考点树 —— 用户会看到「导入失败但科目多了一堆」。所以 `runImport` 里 `remapTillroad(...)` 紧跟 `withTransaction` 开头调用，失败一起回滚。
+
+**逐题字段语义的变化**：`json_import.mjs` 现在把文件里的 `subject_id` / `knowledge_node_id` 解析成 **`source_subject_id` / `source_knowledge_node_id`**（加了 `source_` 前缀），与 m30197 的「按 `subject` / `node` **文本**匹配」彻底分开 —— 前者是 uuid 映射（跨设备恢复），后者是名字启发式（AI 生成题自动归类）。两者可以同时存在：`.tillroad` 走 uuid 映射，AI JSON 走文本匹配。
+
+响应体新增一段（普通导入全 0，前端据此整块不渲染）：
+
+```json
+{
+  "remap_result": {
+    "subjects_mapped": 0, "subjects_created": 2,
+    "nodes_mapped": 0, "nodes_created": 3,
+    "questions_without_subject": 0,
+    "created_subject_names": ["重映射行测", "重映射公基"],
+    "created_node_paths": ["资料分析", "资料分析/增长率", "法律/宪法"]
+  }
+}
+```
+
+前端结果页在「自动创建的考点」之后多一块 **「科目与考点恢复」**：复用 / 新建四个计数 + 未关联科目数 + 新建的科目名与考点路径清单；有未关联题时给橙色提示「这些题已入库但没有科目，可到题库管理页批量移动到正确科目」，只发生了新建时给灰色提示「可以在题库管理 / 科目管理里改名或删除；同名科目、同路径考点下次导入会直接复用」。
+
+**校验**：新增 `server/import/remap.integration.test.mjs`（3 用例：A 的 2 科目 + 3 考点 + 5 题导入 B 全部重建并挂对位置；同一份快照导两次第二次不新建任何科目与考点；`subject_id` 映射不到的题置 null 但导入仍成功），**PGlite 真库 3/3**，既有 `import.integration.test.mjs` 回归 **23/23**；`npm test` **431 tests / 215 pass / 0 fail / 216 skipped**；`flutter analyze --no-fatal-infos` **0 error / 0 warning / 101 info**；`flutter test` **137/137**。
+
 ## 5.5 应用界面与字体（`tillroad_app/`）
 
 
@@ -1491,7 +1523,8 @@ Select-String -Path tillroad_app\build\app\intermediates\merged_manifest\release
 - ✅ **App 私有目录 + 通知权限引导（m32036）**：日志从 `Directory.systemTemp/tillroad/logs`（Android 上是应用私有缓存目录，存储吃紧时会被系统整个清掉）搬到 `AppDirs.logs()` = `getExternalStorageDirectory()/TillRoad/logs`（应用专属外部目录，scoped storage 下无需任何存储权限，用户可见可清），失败回落 `getApplicationDocumentsDirectory()/TillRoad/logs`。新建 `lib/storage/app_dirs.dart` + `lib/storage/log_migration.dart`；`AndroidManifest.xml` 只加 `POST_NOTIFICATIONS`、零存储权限；新建 `lib/pages/onboarding_page.dart` 首启动引导；设置页新增「权限」分区。★ 顺手修掉一个真 bug：「清除本地缓存」原来只删旧 `systemTemp/tillroad`，日志搬走后删不到新位置的日志。校验：`flutter analyze` 0 error / 0 warning / 101 info；`flutter test` 118/118
 - ✅ **题库导出 + SAF 目录选择 + 持久化 URI（m32406）**：新增只读端点 `GET /export/questions`（**只导 `owner_user_id = 当前用户` 的题**，带 `answer`/`analysis`，不含练习记录与缺陷单）；前端新增 `lib/services/export_location.dart`（`dir_picker` + `DirPicker.persist()` 持久化 token，key `export_dir_uri`）+ `lib/services/export_service.dart`（GZip + `saf_stream` 写 SAF 目录，文件名 `tillroad-export-{userId前8位}-{YYYYMMDD-HHmmss}.tillroad`，失败四档）；题库管理页 `⋯` →「导出题库」，设置页新增「数据管理」分区。校验：`flutter analyze` 0 error / 0 warning / 100 info；`flutter test` 137/137；`npm test` 425/215/0/210；PGlite 真库 6/6
 - ✅ **题库导入预检 + 批量决策（m32773）**：新增只读端点 `POST /questions/import/preview`（**不插题、不建考点、不建批次**；只按 `content_hash` 精确判重，不做相似度）→ `{new_count, duplicate_count, duplicates:[{incoming, existing, diff}], parse_errors}`；`POST /questions/import` 支持 `decisions.duplicate_action` = `skip`（**默认，行为与之前完全一致**）/ `overwrite`（按 content_hash 覆盖题干/选项/答案/解析/难度/标签，**保留 id 与归属**，走直写 SQL 不复用 `rep.update`），响应拆成 `{imported:{new,overwritten}, duplicates:{skipped,overwritten}, duplicate_details}`；`.tillroad`（gzip 的 JSON）可导入（`extract.mjs` 按 gzip magic 判定并 `gunzipSync`）；前端改两段式（选文件 → `import_preview_page.dart` 预检并决策 → pop 回决策串再走原 `_upload`），三态进度与结果页未动。校验：新增 3 条集成用例，**PGlite 真库 23/23**；`npm test` **428 tests / 215 pass / 0 fail / 213 skipped**；`flutter analyze --no-fatal-infos` **0 error / 0 warning / 101 info**；`flutter test` **137/137**（按任务书未截图、未跑 adb）
-- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两个节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）；⑥本地优先 R3 的增量对账尚未实现（后端需加 `updated_since` 或变更日志）；⑦R4a 的冲突只做「丢弃本地 + 以云端为准」，字段级自动仲裁与写队列的删除操作未做；⑧R4b 未做 dead 队列的 UI 管理入口（死信行只能在数据库里看），也未做删除操作的入队；⑨题库的 **AI 生成题入口**未做（手动建题与编辑删除本轮 FE-02 已做；题目本地缓存待 R5 拍板）；⑩「删除我的所有数据」只软删不物理删（数据仍在库里可恢复，合规的「彻底抹除」需物理删除与保留期策略）；⑪题目选择器的**考点筛选未做进 UI**（后端 `knowledge_node_id` 已可用且有集成测试，但页面没有该 chip）、**中文关键字未真机验证**（`adb shell input text` 对非 ASCII 直接 NPE）；⑫FE-02 未做**拍照 OCR**（需先补 BYOK 服务端密钥管理与 vision adapter）；⑬练习模式**删题已做（R3）**，但**按题目选择器组练习**、**练习记录删除入口**（`practice_sessions.deleted_at` 无端点）、**每题用时展示**（`duration_ms` 已在收但未显示）仍未做，且公共题自评的对错只存在练习记录里、不回流题库；⑭题库管理页的**物理抹除**未做（题只软删，可恢复）；⑮**「已隐藏」列表目前只能用本地快照**（后端只有 `PATCH /questions/:id/hide`，**没有 list-hidden 端点**，`GET /questions` 默认就排除隐藏题），后果是跨设备不可见、清缓存丢失、与服务端不对账 —— 正确修法是后端加 `GET /questions?hidden=true`（需改 `server/`，本轮硬约束禁止）；⑯`exam_type_custom` 没有写进本地 `exam_profiles` 表，从本地读出的卡片进编辑页时自定义类型名会回落成预设标签，需下拉走一次云端才有；⑰科目匹配是「按名字」的启发式（精确→包含），文件写简称（「公基」）而库里叫全称（「公共基础知识」）时不会命中，只能靠兜底科目 + 手动批量移动；跨多个 active 考试目标时同名科目取「名字最短」那个，不确定归属时也会归兜底；⑱`import_batches` 是**只增不删**的账本（本轮没有清理/归档机制），长期使用后下拉会越来越长 —— 需要时再加「只显示最近 N 条」或过期清理，另 `batch_id` 刻意无外键，删题不会动批次行；⑲导入批次的筛选不作用于「已删除」与「已隐藏」两档（前者走 `/questions/deleted`、后者走本机快照，接口都不带批次语义），要按批次恢复题只能先切回「全部批次」再逐题看；⑳m32036 只做了**通知权限申请**，**真正的临期提醒推送尚未实现** —— 没有本地通知调度（需 `flutter_local_notifications`，且后端需要窗口到期扫描或客户端本地计算），也没有服务端 FCM/APNs 通道；㉑m32406 的 `.tillroad` **导入已能读回**（m32773 给了 gzip 解压 + JSON 题库解析），但**跨设备完整恢复仍未做** —— 导出快照里的 `subject_id` / `knowledge_node_id` 指向原库的 uuid，在另一台设备上并不存在，所以科目与考点树不会被重建（题会落到未分类 / 空考点），要真正恢复需要按快照里的 `subjects` / `knowledge_nodes` 先建树再按名字回挂；另外 SAF 目录持久化只验了 Android，iOS 的 bookmark 分支未实机验证；㉒m32773 的**覆盖只改内容字段**，不更新 `subject_id` / `knowledge_node_id`（覆盖一道题不会把它挪到别的科目或考点），也不改 `import_batches` 的归属（被覆盖的题仍算在原批次里）；㉓预检**不做相似度判定**（硬约束），只能告诉用户「完全相同」与「不同」，无法提示「疑似同一题」；预检明细目前**全量返回**（没有分页/截断上限），超大文件（数万道重复题）时响应体会很大
+- ✅ **`.tillroad` 跨设备科目 / 考点 ID 重映射（m34301）**：导出包里的 `subject_id` / `knowledge_node_id` 是原库 uuid，换设备导入时目标库不存在 → 题目挂空、分类树从不重建。新建 `server/import/remap_tillroad.mjs`：`remapSubjects`（按 `name` 在本用户 active 目标下的科目里 精确→包含→被包含 三档匹配，先同目标再跨目标，同档取名字最短；命中记映射，缺失**建同名科目**并记新建，新建的科目也回添到候选池避免同一文件里两个旧 id 同名建两次）、`remapNodes`（拓扑排序父在前，逐层用「映射后 subject + 映射后 parent + title」三段定位，缺失则建；`freq_tag`/`weight_to_target` 先校验否则置 null，防 schema CHECK 整批回滚）、`resolveQuestion`（查不到就置 null 并计入 `questions_without_subject`，题仍入库）。**三者在 `runImport` 的同一个 `withTransaction` 内调用**，否则会出现「导入失败但科目多了一堆」的孤儿。`json_import.mjs` 把文件里的 `subject_id`/`knowledge_node_id` 改名为 `source_subject_id`/`source_knowledge_node_id`（与 m30197 的文本匹配语义彻底分开），并新增 `pickArray` 读出 `subjects`/`knowledge_nodes` + `isTillroad` 标识；响应新增 `remap_result{subjects_mapped,subjects_created,nodes_mapped,nodes_created,questions_without_subject,created_subject_names,created_node_paths}`；前端 `question_api.dart` 新增 `ImportRemapResult`（含 `isEmpty`/`hasCreated`），`question_import_page.dart` 结果页新增「科目与考点恢复」区块（`isEmpty` 时整块不渲染）。校验：新增 `remap.integration.test.mjs` 3 用例（跨设备重建 / 重复导入不重建 / 脏数据置 null 不报错），**PGlite 真库 3/3**，既有 `import.integration.test.mjs` 回归 **23/23**；`npm test` **431 tests / 215 pass / 0 fail / 216 skipped**；`flutter analyze --no-fatal-infos` **0 error / 0 warning / 101 info**；`flutter test` **137/137**（按任务书未截图、未跑 adb）
+- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两个节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）；⑥本地优先 R3 的增量对账尚未实现（后端需加 `updated_since` 或变更日志）；⑦R4a 的冲突只做「丢弃本地 + 以云端为准」，字段级自动仲裁与写队列的删除操作未做；⑧R4b 未做 dead 队列的 UI 管理入口（死信行只能在数据库里看），也未做删除操作的入队；⑨题库的 **AI 生成题入口**未做（手动建题与编辑删除本轮 FE-02 已做；题目本地缓存待 R5 拍板）；⑩「删除我的所有数据」只软删不物理删（数据仍在库里可恢复，合规的「彻底抹除」需物理删除与保留期策略）；⑪题目选择器的**考点筛选未做进 UI**（后端 `knowledge_node_id` 已可用且有集成测试，但页面没有该 chip）、**中文关键字未真机验证**（`adb shell input text` 对非 ASCII 直接 NPE）；⑫FE-02 未做**拍照 OCR**（需先补 BYOK 服务端密钥管理与 vision adapter）；⑬练习模式**删题已做（R3）**，但**按题目选择器组练习**、**练习记录删除入口**（`practice_sessions.deleted_at` 无端点）、**每题用时展示**（`duration_ms` 已在收但未显示）仍未做，且公共题自评的对错只存在练习记录里、不回流题库；⑭题库管理页的**物理抹除**未做（题只软删，可恢复）；⑮**「已隐藏」列表目前只能用本地快照**（后端只有 `PATCH /questions/:id/hide`，**没有 list-hidden 端点**，`GET /questions` 默认就排除隐藏题），后果是跨设备不可见、清缓存丢失、与服务端不对账 —— 正确修法是后端加 `GET /questions?hidden=true`（需改 `server/`，本轮硬约束禁止）；⑯`exam_type_custom` 没有写进本地 `exam_profiles` 表，从本地读出的卡片进编辑页时自定义类型名会回落成预设标签，需下拉走一次云端才有；⑰科目匹配是「按名字」的启发式（精确→包含），文件写简称（「公基」）而库里叫全称（「公共基础知识」）时不会命中，只能靠兜底科目 + 手动批量移动；跨多个 active 考试目标时同名科目取「名字最短」那个，不确定归属时也会归兜底；⑱`import_batches` 是**只增不删**的账本（本轮没有清理/归档机制），长期使用后下拉会越来越长 —— 需要时再加「只显示最近 N 条」或过期清理，另 `batch_id` 刻意无外键，删题不会动批次行；⑲导入批次的筛选不作用于「已删除」与「已隐藏」两档（前者走 `/questions/deleted`、后者走本机快照，接口都不带批次语义），要按批次恢复题只能先切回「全部批次」再逐题看；⑳m32036 只做了**通知权限申请**，**真正的临期提醒推送尚未实现** —— 没有本地通知调度（需 `flutter_local_notifications`，且后端需要窗口到期扫描或客户端本地计算），也没有服务端 FCM/APNs 通道；㉑跨设备恢复已在 m34301 完成（按快照里的 `subjects` / `knowledge_nodes` 按名字重建分类树再回挂 uuid），但**仍有两个缺口**：①匹配是「按名字」，文件里科目改名过或目标库里同名科目在另一个考试目标下时会新建一份重复的树（不会合并到已有那棵）；②SAF 目录持久化只验了 Android，iOS 的 bookmark 分支未实机验证；㉒m32773 的**覆盖只改内容字段**，不更新 `subject_id` / `knowledge_node_id`（覆盖一道题不会把它挪到别的科目或考点），也不改 `import_batches` 的归属（被覆盖的题仍算在原批次里）；㉓预检**不做相似度判定**（硬约束），只能告诉用户「完全相同」与「不同」，无法提示「疑似同一题」；预检明细目前**全量返回**（没有分页/截断上限），超大文件（数万道重复题）时响应体会很大
 
 ---
 

@@ -3628,4 +3628,110 @@ D4 证据（真库）：选「科目一 + 题型 choice + 未掌握」→ 只剩
 6. **未做真机验证**（任务书要求不截图、不跑 adb）：`.tillroad` 的 gzip 解压与预检页交互只做了代码级验证。
 ---
 
-> 文档 v1.3 结束（m32406 题库导出与 SAF 归档）
+## 56. m34301 归档（`.tillroad` 导入的跨设备科目 / 考点 ID 重映射）
+
+### 56.1 范围与三个关键判断
+
+m34301 只解一个问题：**导出包里的 `questions.subject_id` / `knowledge_node_id` 是原库 uuid，换设备导入时目标库没有这些行 → 题目挂空，快照里的 `subjects` / `knowledge_nodes` 两棵分类树从来没被重建**。这正好补上 §55.8 遗留第 1 条。
+
+三个关键判断（写在 `server/import/remap_tillroad.mjs` 文件头）：
+
+1. **匹配优先、创建兜底**。同名科目 / 同路径考点已存在就复用，找不到才建；新建的挂在当前用户「最新 active 考试目标」下 —— 因为文件里的 `exam_profile_id` 同样是原设备 uuid，不可信。
+2. **考点按层级逐层重建**。先处理 `parent_id` 为 null 的根节点，再逐层；每层用「映射后的 subject + 映射后的 parent + title」**三段**定位。只按 title 匹配会把「资料分析/增长率」与「数量关系/增长率」合并成一个节点。
+3. **映射失败不报错**。某题 `subject_id` 在映射表里查不到 → 该字段置 null 并计数，题仍然入库。导入是「尽量恢复」不是严格校验。
+
+### 56.2 文件表
+
+| 文件 | 变化 | 要点 |
+|---|---|---|
+| `server/import/remap_tillroad.mjs` | **新建** 422 行 | `remapSubjects` / `remapNodes` / `remapTillroad` 三个导出 + `pickSubject` / `findNode` / `orderByDepth` 内部函数 |
+| `server/import/json_import.mjs` | 改 | 新增 `pickArray(data, keys)`（顶层与 `data.data` 两层都试）；`parseQuestionJson` 返回扩为 `{questions, errors, total, subjects, knowledgeNodes, isTillroad}`；每题新增 `source_subject_id` / `source_knowledge_node_id` |
+| `server/routes/questions_import.mjs` | 改 | import `remapTillroad`；`parseImportBody` 返回 `isTillroad` / `fileSubjects` / `fileNodes`；`runImport` 事务开头调 `remapTillroad`；逐题循环用 `tillroad.resolveQuestion(q)` 覆盖 `subjectId` / `nodeId`；响应新增 `remap_result` |
+| `server/import/remap.integration.test.mjs` | **新建** 约 470 行 | 3 个用例 + `createUser` / `dropUser` / `tillroadBody` / `buildSnapshot` 等 helper |
+| `tillroad_app/lib/api/question_api.dart` | 改 | `ImportResult.remapResult`；新建 `ImportRemapResult`（`isEmpty` / `hasCreated` / `fromJson`） |
+| `tillroad_app/lib/pages/question_import_page.dart` | 改 | 结果页新增「科目与考点恢复」区块（`isEmpty` 时整块不渲染） |
+| `package.json` | 改 | `test:integration` 插入 `server/import/remap.integration.test.mjs`（现 19 个） |
+
+### 56.3 关键实现
+
+**候选科目 SQL 必须 JOIN `exam_profiles`**（`subjects` 表没有 `user_id` 列）：
+
+```sql
+SELECT s.id, s.name, s.exam_profile_id, s.kind
+  FROM subjects s
+  JOIN exam_profiles ep ON ep.id = s.exam_profile_id
+ WHERE ep.user_id = $1 AND ep.deleted_at IS NULL AND ep.status = 'active'
+   AND s.deleted_at IS NULL
+ ORDER BY s.created_at ASC, s.id ASC
+ LIMIT 500
+```
+
+**`pickSubject` 两轮 scope**：先只在文件声明的那个 `exam_profile_id` 下找（三档：`exact` → `name` 含 `want` → `want` 含 `name`，同档取名字最短者），找不到再跨目标。这样「用户在同一个目标下有同名科目」不会被跨目标误配。
+
+**新建的科目要回添候选池**：`remapSubjects` 里 `candidates.push({id: row.id, name, exam_profile_id, kind})` —— 否则同一文件里两个不同旧 uuid 指向同名科目时会建两次。
+
+**根节点匹配必须用 `IS NOT DISTINCT FROM`**：
+
+```sql
+SELECT id, title, parent_id FROM knowledge_nodes
+ WHERE subject_id = $1 AND parent_id IS NOT DISTINCT FROM $2
+   AND title = $3 AND deleted_at IS NULL
+ LIMIT 1
+```
+
+普通 `parent_id = $2` 在 `parent_id IS NULL` 时永远不成立（`NULL = NULL` 是 NULL），根层考点会每次导入都新建一遍。
+
+**`freq_tag` / `weight_to_target` 先校验再传**：`FREQ_TAGS` / `SUBJECT_KINDS` 白名单，非法值置 null。否则 schema 的 CHECK 会让**整批导入回滚** —— 一个脏字段拖垮整份文件。
+
+**`resolveQuestion` 用 `source_` 前缀**：`json_import.mjs` 把文件里的 `subject_id` / `knowledge_node_id` 解析成 `source_subject_id` / `source_knowledge_node_id`。这样和 m30197 的「按 `subject` / `node` **文本**匹配」彻底分开：前者是 uuid 映射（跨设备恢复），后者是名字启发式（AI 生成题自动归类），两者可以同时存在。
+
+**`orderByDepth` 拓扑排序**：返回 `{ordered, unresolved}`，父节点缺失或成环的节点留在 `unresolved` 并 warn，不影响其余节点。
+
+**并发 409 回查**：`remapSubjects` / `remapNodes` 的 `create` 都包了 `catch`，`err.code === 'conflict' || err.statusCode === 409` 时用同样的匹配键 `queryOne` 回查一次并复用 —— 两个客户端同时导入同一份文件时不会互相炸掉。
+
+### 56.4 三个真 bug
+
+1. **`edit` 的 `replace_with` 多行内容漏了函数体闭合 `}`** → `node --check` 报 `SyntaxError: Unexpected token 'export'`（`remap_tillroad.mjs:274`）与 `missing ) after argument list`（`questions_import.mjs:742`）。教训：**多行 edit 改完立刻 `node --check`，不要连做 6 处再检查**。
+2. **`remapSubjects` 的 `if (hit) { ... continue; }` 收尾 `}` 被吃掉**，后续所有 `if/for` 嵌套错位；靠 `read` 整段后补回才修好。
+3. **`candidates.push(...)` 那行被误删**（原本在 `createdNames.push(name)` 之后、`} catch (err) {` 之前）。同类「小范围覆盖吃掉相邻行」事故在本项目已出现 4 次以上。
+
+### 56.5 测试与验证
+
+新增 `server/import/remap.integration.test.mjs`，`buildSnapshot()` 随机生成 5 个旧 uuid（2 科目 / 3 考点 / 5 题），三组用例：
+
+| 用例 | 断言要点 |
+|---|---|
+| 跨设备：A 的 2 科目 + 3 考点 + 5 题导入 B | `imported.new=5`、`subjects_created=2`、`nodes_created=3`、`questions_without_subject=0`、`created_subject_names` 排序后 `['重映射公基','重映射行测']`、行测下 2 个考点且 `child.parent_id === root.id`、5 道题逐题挂对位置 |
+| 同一份快照导两次 | 第二遍 `imported.new=0`、`duplicates.skipped=5`、`subjects_created=0`、`subjects_mapped=2`、`nodes_created=0`、`nodes_mapped=3`，科目数与考点数不变 |
+| 脏数据 | `imported.new=2`、`subjects_created=1`、`questions_without_subject=1`，能映射的挂上、映射不到的为 null，**导入仍成功** |
+
+`tillroadBody()` 里 mime **故意用 `application/octet-stream`**，验证 `extract.mjs` 靠 gzip magic `0x1f 0x8b` 判定的容错路径（而不只依赖 mime）。
+
+**C4 证据**（PGlite 真库）：A 导出 5 题 → B 导入 → B 的 2 科目 / 3 考点 / 5 题与 A 一致；同一用户重复导入 → `subjects_created=0` / `nodes_created=0`。
+
+数字：PGlite `remap 3/3` + 既有 `import 23/23`；`npm test` **431 / 215 pass / 0 fail / 216 skipped**；`flutter analyze --no-fatal-infos` **0 error / 0 warning / 101 info**；`flutter test` **137/137**。
+
+### 56.6 踩坑
+
+1. **多行 `edit` 必须立刻 `node --check`**：漏一个 `}` 会在文件末尾才报，报错行号离改动点很远。
+2. **断点调试靠 PGlite 探针而不是看日志**：`runImport(pool, body, uid)` 直调（不走 HTTP）能一次打印 `[IMPORT] 科目匹配：命中 N 题 / 未命中 M 题，自动新建考点 K 条`，比从 HTTP 500 反推快得多。
+3. **PGlite 版测试文件生成法**：PowerShell `ReadAllText` + `.Replace("from '../db/pool.mjs'", "from '../../.tmp-pglite-pool.mjs'")` + `WriteAllText(..., UTF8Encoding($false))`，再 `$env:RUN_PG_INTEGRATION='1'`。
+4. **测试清理条件必须覆盖「无科目的题」**：m32773 用过一次这个教训，本轮 `remap.integration.test.mjs` 的 `dropUser` 一开始就按「只删挂在本科目下的题」写，`POST /questions` 造的无科目题会卡住 `DELETE FROM users`。
+5. **前端 Dart 文件用 `Get-Content` 读会乱码**：编码问题不是文件损坏；生成/改写一律走 `[System.IO.File]`。
+
+### 56.7 偏离任务书
+
+1. **`remapNodes` 的入参是 `Map`（`subjectResult.map`）而不是整个返回对象**：任务书 A1 写「`remapNodes(client, subjectMap, fileNodes)`」，实现里 `subjectMap` 就是 `Map`，语义一致。
+2. **新增 `created_subject_names` / `created_node_paths` 两个响应字段**：任务书 B2 只列了 5 个计数，但用户要「确认是否保留」新建的科目/考点，只给数字没法确认。
+3. **脏数据用例里 `subjects_created=1`**：任务书 A5-③ 说「该题 `subject_id` 置 null，不报错」，实现里文件声明的另 1 个科目仍会被建出来（那是合法数据），只有引用了未声明 uuid 的第 2 道题置 null。
+
+### 56.8 遗留
+
+1. **匹配是「按名字」的**：文件里科目改过名，或目标库里同名科目在另一个考试目标下，会新建一份重复的树（不会合并到已有那棵）。
+2. **`remap_result` 只报计数与名字/路径，不报「哪道题挂到了哪个科目」**：需要逐题确认时得去题库管理页看。
+3. **预检（`POST /questions/import/preview`）不做映射**（硬约束）：预检只按 `content_hash` 判重，用户看不到「这次导入会新建哪些科目/考点」，要等真导入完才知道。
+4. **未做真机验证**（任务书要求不截图、不跑 adb）：跨设备场景靠 PGlite 集成测试覆盖。
+
+---
+
+> 文档 v1.4 结束（m34301 跨设备 ID 重映射归档）

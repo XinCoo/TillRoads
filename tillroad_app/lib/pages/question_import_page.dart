@@ -747,6 +747,9 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
     final bool hasSubjectMatch =
         subjectMatch.matchedCount > 0 || subjectMatch.unmatchedCount > 0;
     final bool hasNodeCreated = nodeCreated.createdCount > 0 || nodeCreated.createdPaths.isNotEmpty;
+    // ★ m34301：跨设备恢复结果。普通 AI JSON / 文本导入时 remapResult.isEmpty 为 true，
+    //   整块不渲染 —— 否则每次导入都会多出一行「恢复了 0 个科目」的噪声。
+    final ImportRemapResult remap = result.remapResult;
     return ListView(
       padding: const EdgeInsets.fromLTRB(16, 24, 16, 32),
       children: <Widget>[
@@ -895,6 +898,96 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
                         height: 1.4,
                         color: AppColors.secondaryLabel,
                       ),
+                    ),
+                  ),
+              ],
+            ),
+          ),
+        ],
+        // ── 跨设备恢复（m34301）：只有 .tillroad 导出文件才会走到这里。
+        //    与上面「科目匹配 / 自动创建考点」的区别：那两块说的是**题目字段**（文件里写的
+        //    subject / node 文本）如何归到科目；这块说的是**导出文件的分类树**（subjects /
+        //    knowledge_nodes 两张表）如何在目标库里重建，对应的是旧 uuid → 新 uuid 的映射。
+        if (!remap.isEmpty) ...<Widget>[
+          const SizedBox(height: 16),
+          const SectionHeader(text: '科目与考点恢复'),
+          _CardBox(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: <Widget>[
+                if (remap.subjectsMapped > 0)
+                  _ResultRow(label: '复用已有科目', value: '${remap.subjectsMapped}'),
+                if (remap.nodesMapped > 0)
+                  _ResultRow(label: '复用已有考点', value: '${remap.nodesMapped}'),
+                if (remap.subjectsCreated > 0)
+                  _ResultRow(label: '新建科目', value: '${remap.subjectsCreated}'),
+                if (remap.nodesCreated > 0)
+                  _ResultRow(label: '新建考点', value: '${remap.nodesCreated}'),
+                if (remap.questionsWithoutSubject > 0)
+                  _ResultRow(
+                    label: '未关联科目',
+                    value: '${remap.questionsWithoutSubject}',
+                  ),
+                if (remap.createdSubjectNames.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 4),
+                    child: Text(
+                      '新建的科目：${remap.createdSubjectNames.join('、')}',
+                      style: const TextStyle(
+                        fontFamily: kFontFamily,
+                        fontSize: 13,
+                        height: 1.4,
+                        color: AppColors.secondaryLabel,
+                      ),
+                    ),
+                  ),
+                if (remap.createdNodePaths.isNotEmpty)
+                  Padding(
+                    padding: const EdgeInsets.only(top: 6),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: <Widget>[
+                        const Text(
+                          '新建的考点：',
+                          style: TextStyle(
+                            fontFamily: kFontFamily,
+                            fontSize: 13,
+                            height: 1.4,
+                            color: AppColors.secondaryLabel,
+                          ),
+                        ),
+                        for (final String path in remap.createdNodePaths)
+                          Padding(
+                            padding: const EdgeInsets.only(top: 4),
+                            child: Text(
+                              '· $path',
+                              style: const TextStyle(
+                                fontFamily: kFontFamily,
+                                fontSize: 13,
+                                height: 1.4,
+                                color: AppColors.secondaryLabel,
+                              ),
+                            ),
+                          ),
+                      ],
+                    ),
+                  ),
+                if (remap.questionsWithoutSubject > 0)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 8),
+                    child: _ImportNotice(
+                      icon: CupertinoIcons.info_circle,
+                      color: AppColors.dueSoon,
+                      text: '有题目的科目在原设备上已不存在，这些题已入库但没有科目，可到题库管理页批量移动到正确科目。',
+                    ),
+                  )
+                else if (remap.hasCreated)
+                  const Padding(
+                    padding: EdgeInsets.only(top: 8),
+                    child: _ImportNotice(
+                      icon: CupertinoIcons.info_circle,
+                      color: AppColors.secondaryLabel,
+                      text: '新建的科目与考点可以在「题库管理 / 科目管理」里改名或删除；同名科目、同路径考点下次导入会直接复用。',
                     ),
                   ),
               ],

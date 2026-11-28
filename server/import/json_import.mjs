@@ -131,10 +131,34 @@ function normalizeAnswer(raw) {
 }
 
 /**
+ * 从 JSON 顶层取一个数组（多个候选键名，第一个命中的就用）；取不到返回空数组。
+ *
+ * ★ m34301：.tillroad 导出文件里的 subjects / knowledge_nodes 可能被包在
+ *   { data: {...} } 之类的壳里，所以这里把顶层和 data 层都试一遂。
+ */
+function pickArray(data, keys) {
+  if (!data || typeof data !== 'object' || Array.isArray(data)) return [];
+  const scopes = [data];
+  if (data.data && typeof data.data === 'object' && !Array.isArray(data.data)) {
+    scopes.push(data.data);
+  }
+  for (const scope of scopes) {
+    for (const key of keys) {
+      if (Array.isArray(scope[key])) return scope[key];
+    }
+  }
+  return [];
+}
+
+/**
  * 解析 JSON 文本 → 题目数组（与 splitter 的产出同形状，额外保留 subject / node）。
  *
+ * ★ m34301：如果顶层带 subjects / knowledge_nodes（.tillroad 导出文件），
+ *   也一并返回，并把 isTillroad 置 true —— 导入管线据此走「ID 重映射」分支。
+ *
  * @param {string} text JSON 文本（已去 BOM）
- * @returns {{questions: Array<object>, errors: Array<{index:number,reason:string}>, total:number}}
+ * @returns {{questions: Array<object>, errors: Array<{index:number,reason:string}>,
+ *   total: number, subjects: Array<object>, knowledgeNodes: Array<object>, isTillroad: boolean}}
  */
 export function parseQuestionJson(text) {
   let data;
@@ -142,7 +166,7 @@ export function parseQuestionJson(text) {
     data = JSON.parse(String(text ?? ''));
   } catch (err) {
     const reason = err && err.message ? String(err.message).slice(0, 200) : 'JSON 解析失败';
-    return { questions: [], errors: [{ index: -1, reason }], total: 0 };
+    return { questions: [], errors: [{ index: -1, reason }], total: 0, subjects: [], knowledgeNodes: [], isTillroad: false };
   }
 
   // 允许顶层直接是数组，或包一层 { questions: [...] }
@@ -159,8 +183,16 @@ export function parseQuestionJson(text) {
   }
 
   if (!list) {
-    return { questions: [], errors: [{ index: -1, reason: 'JSON 顶层既不是数组，也没有 questions 数组' }], total: 0 };
+    return { questions: [], errors: [{ index: -1, reason: 'JSON 顶层既不是数组，也没有 questions 数组' }], total: 0, subjects: [], knowledgeNodes: [], isTillroad: false };
   }
+
+  // ★ m34301：.tillroad 导出文件除了 questions，还带 subjects / knowledge_nodes 两张表。
+  //   导入到另一台设备时，题目里的 subject_id / knowledge_node_id 是**原设备的 uuid**，
+  //   目标设备上并不存在 —— 必须按「名字 + 层级」重新映射（见 remap_tillroad.mjs）。
+  //   普通 AI 生成的 JSON 只有 questions，没有这两个数组 → isTillroad 为 false，行为一字未改。
+  const subjects = pickArray(data, ['subjects']);
+  const knowledgeNodes = pickArray(data, ['knowledge_nodes', 'knowledgeNodes']);
+  const isTillroad = subjects.length > 0 || knowledgeNodes.length > 0;
 
   const questions = [];
   const errors = [];
@@ -200,10 +232,15 @@ export function parseQuestionJson(text) {
       // ★ 本轮新增：每题自带的归属信息（只有 JSON 才有）
       subject: raw.subject === null || raw.subject === undefined ? '' : String(raw.subject).trim(),
       node: raw.node === null || raw.node === undefined ? '' : String(raw.node).trim(),
+      // ★ m34301：.tillroad 导出文件里的题带着**原设备的** subject_id / knowledge_node_id。
+      //   这里原样保留（不叫 subject_id 是为了不与「科目文本匹配」的语义混淆），
+      //   由导入管线查 remap 表换成本机的 uuid；普通 AI JSON 没有这两个字段，值为 null。
+      source_subject_id: raw.subject_id === null || raw.subject_id === undefined ? null : String(raw.subject_id),
+      source_knowledge_node_id: raw.knowledge_node_id === null || raw.knowledge_node_id === undefined ? null : String(raw.knowledge_node_id),
     });
   });
 
-  return { questions, errors, total: list.length };
+  return { questions, errors, total: list.length, subjects, knowledgeNodes, isTillroad };
 }
 
 /** JSON 题库里是否有任何一道题带 subject（B1 的「文件里没有 subject 字段就回落统一指定」据此判断）。 */

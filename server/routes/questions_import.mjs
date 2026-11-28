@@ -60,6 +60,7 @@ import { splitQuestions } from '../import/splitter.mjs';
 import { parseQuestionJson, hasAnySubject } from '../import/json_import.mjs';
 import { createSubjectResolver } from '../import/resolve_subject.mjs';
 import { createNodeResolver, splitNodePath } from '../import/resolve_node.mjs';
+import { remapTillroad } from '../import/remap_tillroad.mjs';
 import { dedupe, contentHashOf } from '../import/dedupe.mjs';
 import { separateAssets } from '../import/separate.mjs';
 import { toJsonbParam } from '../repositories/_common.mjs';
@@ -458,6 +459,10 @@ async function parseImportBody(body, ownerUserId) {
     filename,
     extracted,
     isJson,
+    // ★ m34301：.tillroad 导出文件带 subjects / knowledge_nodes 两张表，需要跨设备重映射。
+    isTillroad: split.isTillroad === true,
+    fileSubjects: split.subjects ?? [],
+    fileNodes: split.knowledgeNodes ?? [],
     split,
     parseProblems,
     createCtx,
@@ -477,6 +482,10 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
     sanitizedCount,
     cleanedQuestions,
     extracted,
+    // ★ m34301：.tillroad 的分类树（普通 AI JSON 为空数组 / false）。
+    isTillroad,
+    fileSubjects,
+    fileNodes,
   } = await parseImportBody(body, ownerUserId);
 
   // 阶段 3 + 4：去重与入库必须在同一事务内 —— 否则两个并发导入同一份文件时，
@@ -485,6 +494,18 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
   // ★ m30197：subject / node 解析也放在事务内 —— 它会**自动创建考点**（写库），
   //   必须与题目入库同生共死；抽到事务外会出现「题目回滚了但考点留在库里」。
   return withTransaction(pool, async (client) => {
+    // ── m34301：.tillroad 跨设备 ID 重映射 ────────────────────────────────
+    // 导出文件里的 subject_id / knowledge_node_id 是**原设备的 uuid**，目标库里不存在。
+    // 先把文件里的科目树 / 考点树在目标库重建（已有同名同路径则复用），拿到
+    // 「旧 uuid → 新 uuid」映射表，再拿它改写每道题的归属。
+    //
+    // 放在同一事务里的理由：它会建科目与考点（写库），必须与题目入库同生共死；
+    // 否则「题全重复没入库」时会在库里白留一堆空科目/空考点。
+    // 只有真带 subjects / knowledge_nodes 的文件（.tillroad）才走这条路，
+    // 普通 AI JSON（只有 questions）里 isTillroad 为 false，行为一字未改。
+    const tillroad = isTillroad
+      ? await remapTillroad(client, ownerUserId ?? '', { subjects: fileSubjects, knowledgeNodes: fileNodes })
+      : null;
     // ── m30197 A3：逐题解析 subject / node ──────────────────────────────────
     // 只有 from_file 模式才看文件里的 subject/node：uniform 模式要保证
     // 「所有题都进界面选的那个科目」的旧行为，不能被文件里的字段意外带跑。
@@ -537,6 +558,18 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
       // subject 是否「可信」（用于决定能否解析 node）：文件没写 subject、或写且匹配成功。
       // 不能用 subjectId !== 默认值 判断 —— 匹配到的科目恰好等于默认科目时会误判。
       let subjectResolved = true;
+
+      // ★ m34301：.tillroad 文件里的题带的是**原设备的** subject_id / knowledge_node_id，
+      //   用导出时重建的映射表换成本机 uuid。这是与 from_file 并列的另一条归属来源：
+      //   导出文件没有 subject / node 文本字段，只能靠 uuid 映射。
+      //   两个字段都没带（普通 AI JSON）时 resolveQuestion 返回 undefined，不覆盖默认值。
+      if (tillroad) {
+        const mapped = tillroad.resolveQuestion(q);
+        if (mapped.subject_id !== undefined) {
+          subjectId = mapped.subject_id;
+          nodeId = mapped.knowledge_node_id;
+        }
+      }
 
       if (fromFile) {
         const subjectText = String(q.subject ?? '').trim();
@@ -697,6 +730,20 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
       node_created: {
         created_count: createdPaths.length,
         created_paths: createdPaths,
+      },
+      // ★ m34301 B2：跨设备恢复的统计。只有带 subjects / knowledge_nodes 的文件
+      //   （.tillroad）才有意义；普通 AI JSON / 文本导入时全为 0（前端据此不渲染该区块）。
+      //   subjects_mapped / nodes_mapped —— 复用已有同名科目 / 同路径考点（未新建）
+      //   subjects_created / nodes_created —— 目标库里没有、本次新建的
+      //   questions_without_subject —— 文件里给了 subject_id 但映射不到（脏数据 / 旧版）
+      remap_result: {
+        subjects_mapped: tillroad ? tillroad.stats.subjects_mapped : 0,
+        subjects_created: tillroad ? tillroad.stats.subjects_created : 0,
+        nodes_mapped: tillroad ? tillroad.stats.nodes_mapped : 0,
+        nodes_created: tillroad ? tillroad.stats.nodes_created : 0,
+        questions_without_subject: tillroad ? tillroad.countQuestionsWithoutSubject() : 0,
+        created_subject_names: tillroad ? tillroad.createdSubjectNames : [],
+        created_node_paths: tillroad ? tillroad.createdNodePaths : [],
       },
       stats: {
         kind: extracted.kind,

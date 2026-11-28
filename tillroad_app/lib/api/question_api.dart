@@ -157,6 +157,7 @@ class ImportResult {
     this.stats = const <String, Object?>{},
     this.subjectMatched = const ImportSubjectMatch(),
     this.nodeCreated = const ImportNodeCreated(),
+    this.remapResult = const ImportRemapResult(),
   });
 
   /// 真正**新入库**的题数（`imported.new`）。
@@ -197,6 +198,12 @@ class ImportResult {
   /// 导入过程中自动创建的考点（`node_created`），同样是旧后端可缺失的字段。
   final ImportNodeCreated nodeCreated;
 
+  /// 跨设备恢复结果（`remap_result`，m34301）。
+  ///
+  /// 只有带 subjects / knowledge_nodes 的 `.tillroad` 导出文件才会填这个字段；
+  /// 普通 AI JSON / 文本导入时后端给全 0 —— 界面靠 [ImportRemapResult.isEmpty]
+  /// 判断整块不渲染，避免在每次普通导入后都显示一行「恢复了 0 个科目」。
+  final ImportRemapResult remapResult;
   /// 是否有题真正动过库。
   ///
   /// 注意语义变了：**「全部被跳过」不算成功**（`importedNew` 与
@@ -243,6 +250,7 @@ class ImportResult {
       stats: _asMap(json['stats']),
       subjectMatched: ImportSubjectMatch.fromJson(_asMap(json['subject_matched'])),
       nodeCreated: ImportNodeCreated.fromJson(_asMap(json['node_created'])),
+      remapResult: ImportRemapResult.fromJson(_asMap(json['remap_result'])),
     );
   }
 }
@@ -493,6 +501,71 @@ class ImportNodeCreated {
     );
   }
 }
+
+/// 跨设备恢复结果（`remap_result`，m34301）。
+///
+/// 语义分两对：
+/// - `subjects_mapped` / `nodes_mapped`：目标库里已有同名科目 / 同路径考点，**复用**了；
+/// - `subjects_created` / `nodes_created`：目标库里没有，本次**新建**了。
+/// 两者相加就是「文件里一共有多少科目 / 考点被处理」。
+///
+/// `questions_without_subject` 是映射失败的题数（文件里的 subject_id 在目标库找不到，
+/// 且文件自己的 subjects 数组里也没声明）——这些题仍会入库，只是没有科目。
+class ImportRemapResult {
+  const ImportRemapResult({
+    this.subjectsMapped = 0,
+    this.subjectsCreated = 0,
+    this.nodesMapped = 0,
+    this.nodesCreated = 0,
+    this.questionsWithoutSubject = 0,
+    this.createdSubjectNames = const <String>[],
+    this.createdNodePaths = const <String>[],
+  });
+
+  final int subjectsMapped;
+  final int subjectsCreated;
+  final int nodesMapped;
+  final int nodesCreated;
+  final int questionsWithoutSubject;
+
+  /// 新建的科目名（供用户确认是否要保留）。
+  final List<String> createdSubjectNames;
+
+  /// 新建的考点路径，形如 `资料分析/增长率`。
+  final List<String> createdNodePaths;
+
+  /// 无事可报：普通 AI JSON / 文本导入，或文件里根本没有分类树。
+  /// 界面据此整块不渲染。
+  bool get isEmpty =>
+      subjectsMapped == 0 &&
+      subjectsCreated == 0 &&
+      nodesMapped == 0 &&
+      nodesCreated == 0 &&
+      questionsWithoutSubject == 0;
+
+  /// 是否发生了「新建」（用于把提示语从「已恢复」改成「已恢复 + 新建了…」）。
+  bool get hasCreated => subjectsCreated > 0 || nodesCreated > 0;
+
+  factory ImportRemapResult.fromJson(Map<String, Object?> json) {
+    if (json.isEmpty) return const ImportRemapResult();
+    List<String> readList(Object? raw) => raw is List
+        ? raw
+            .map((Object? e) => _str(e).trim())
+            .where((String e) => e.isNotEmpty)
+            .toList(growable: false)
+        : const <String>[];
+    return ImportRemapResult(
+      subjectsMapped: _int(json['subjects_mapped'], 0),
+      subjectsCreated: _int(json['subjects_created'], 0),
+      nodesMapped: _int(json['nodes_mapped'], 0),
+      nodesCreated: _int(json['nodes_created'], 0),
+      questionsWithoutSubject: _int(json['questions_without_subject'], 0),
+      createdSubjectNames: readList(json['created_subject_names']),
+      createdNodePaths: readList(json['created_node_paths']),
+    );
+  }
+}
+
 
 /// 一道题的完整详情（m23700 FE-02）。
 ///
