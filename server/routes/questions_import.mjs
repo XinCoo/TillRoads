@@ -60,8 +60,9 @@ import { splitQuestions } from '../import/splitter.mjs';
 import { parseQuestionJson, hasAnySubject } from '../import/json_import.mjs';
 import { createSubjectResolver } from '../import/resolve_subject.mjs';
 import { createNodeResolver, splitNodePath } from '../import/resolve_node.mjs';
-import { dedupe } from '../import/dedupe.mjs';
+import { dedupe, contentHashOf } from '../import/dedupe.mjs';
 import { separateAssets } from '../import/separate.mjs';
+import { toJsonbParam } from '../repositories/_common.mjs';
 import { fail, ok } from './_http.mjs';
 import { sanitizeQuestionText } from '../../core/index.mjs';
 /** 这些分隔符编号不再作为题干前缀入库（splitter 已剥离），这里只用于报错行号。 */
@@ -80,6 +81,206 @@ const SUBJECT_MODE_UNIFORM = 'uniform';
 // 取值口径见 tillroad_app/lib/api/question_api.dart 的 BankQuestion.typeLabel。
 const SUBJECTIVE_TYPES = new Set(['short_answer', 'essay', 'subjective', 'material']);
 
+// ★ m32773：重复题的两种处理方式（body.decisions.duplicate_action）。
+//   skip      —— 默认，重复题原样留在库里，本次不写（与 m32773 之前的行为完全一致）；
+//   overwrite —— 用文件里的内容覆盖库里同 hash 的题（只覆盖内容字段，保留 id / owner / created_at）。
+// 刻意不做逐条决策、不做「保留两份」、不做相似度判定 —— 全是用户未要求的复杂度。
+const DUPLICATE_ACTION_SKIP = 'skip';
+const DUPLICATE_ACTION_OVERWRITE = 'overwrite';
+
+/**
+ * 解析 body.decisions.duplicate_action。
+ *
+ * 非法值不报 400 而是回落 skip：
+ *   导入是「用户点了确认就希望有结果」的操作，为一个拼错的枚举把整批挡在门外体验更差。
+ *   缺省（不传 decisions）必须等价于 skip —— 硬约束：不能改旧客户端的行为。
+ */
+function parseDuplicateAction(body) {
+  const raw = body && body.decisions ? body.decisions.duplicate_action : null;
+  return String(raw ?? '').trim().toLowerCase() === DUPLICATE_ACTION_OVERWRITE
+    ? DUPLICATE_ACTION_OVERWRITE
+    : DUPLICATE_ACTION_SKIP;
+}
+
+/**
+ * 把任意字段值压成一个可比较的字符串。
+ * jsonb 列（如 tags）经 pg 回来后可能已是对象/数组，不能直接 ===。
+ */
+function signature(value) {
+  if (value === null || value === undefined) return '';
+  if (typeof value === 'string') return value.trim();
+  return JSON.stringify(value);
+}
+
+/**
+ * 对比「文件里的题」与「库里已有的题」，给出人话层面的差异清单。
+ *
+ * 注意 content_hash 只由 stem + options + formula_text 算出，
+ * 所以同 hash 的两道题在前三项上必然一致（归一化之后）；
+ * 真正可能不同的是 answer / analysis / difficulty / tags / type。
+ * 用户关心的是「覆盖会不会丢掉我本地改过的答案」，所以默认展示这几项。
+ */
+function diffAgainst(incoming, existing) {
+  const out = [];
+  const pairs = [
+    ['answer', '答案不同'],
+    ['analysis', '解析不同'],
+    ['difficulty', '难度不同'],
+    ['tags', '标签不同'],
+    ['type', '题型不同'],
+  ];
+  for (const [field, label] of pairs) {
+    if (signature(incoming[field]) !== signature(existing[field])) out.push(label);
+  }
+  return out;
+}
+
+/**
+ * 把 dedupe() 给出的重复项补齐成预检页要展示的形状。
+ *
+ * dedupe 的 duplicate 只有 {content_hash, existing_id, stem}：
+ *   - incoming.type 得从候选里按 hash 取；
+ *   - existing.stem / created_at / 各字段得回库查一次。
+ * 用一次 ANY(uuid[]) 批量查，不逐题往返。
+ */
+async function describeDuplicates(client, duplicates, candidateByHash, ownerUserId) {
+  const ids = [...new Set(duplicates.map((d) => d.existing_id).filter(Boolean))];
+  const existingRows = new Map();
+  if (ids.length > 0) {
+    // 只查「自己的题」：公共题与别人的题在 overwrite 时也不会被改，
+    // 提前过滤掉能让 diff 与真实可覆盖范围保持一致。
+    const ownerClause = ownerUserId ? 'AND owner_user_id = $2' : 'AND owner_user_id IS NULL';
+    const params = ownerUserId ? [ids, ownerUserId] : [ids];
+    const { rows } = await client.query(
+      `SELECT id, stem, type, options, answer, analysis, difficulty, tags, created_at
+         FROM questions
+        WHERE id = ANY($1::uuid[])
+          AND deleted_at IS NULL
+          ${ownerClause}`,
+      params,
+    );
+    for (const row of rows) existingRows.set(row.id, row);
+  }
+
+  return duplicates.map((d) => {
+    const incoming = candidateByHash.get(d.content_hash) ?? {};
+    const existing = d.existing_id ? existingRows.get(d.existing_id) ?? null : null;
+    return {
+      incoming: {
+        stem: incoming.stem ?? d.stem ?? '',
+        type: incoming.type ?? null,
+        content_hash: d.content_hash,
+      },
+      existing: existing
+        ? { id: existing.id, stem: existing.stem, created_at: existing.created_at }
+        : null,
+      diff: existing
+        ? diffAgainst(incoming, existing)
+        : ['同一份文件里重复出现（库内还没有这道题）'],
+    };
+  });
+}
+
+/**
+ * overwrite 分支：按 content_hash 对应的库内行做内容覆盖。
+ *
+ * 为什么直写 SQL 而不用 questionsRep.update：
+ *   1. rep.update 需要 baseVersion（乐观锁），导入管线手上没有当前版本号；
+ *   2. rep.update 会重算 content_hash —— 覆盖场景我们的语义就是「同 hash 的两道题」,
+ *      不该因为它去改 hash（更不该触发与自己的重复判定）。
+ * 只改内容字段：id / owner_user_id / created_at / batch_id 等档案列全部保留。
+ * 只改自己的题：WHERE 带 owner_user_id，公共题与别人的题静默跳过。
+ *
+ * @returns {Promise<number>} 实际覆盖的行数
+ */
+async function overwriteDuplicates(client, duplicates, candidateByHash, ownerUserId) {
+  if (!ownerUserId) return 0;
+  const ids = [...new Set(duplicates.map((d) => d.existing_id).filter(Boolean))];
+  if (ids.length === 0) return 0;
+
+  const { rows } = await client.query(
+    `SELECT id FROM questions
+      WHERE id = ANY($1::uuid[])
+        AND deleted_at IS NULL
+        AND owner_user_id = $2`,
+    [ids, ownerUserId],
+  );
+  const own = new Set(rows.map((r) => r.id));
+
+  let overwritten = 0;
+  for (const d of duplicates) {
+    if (!own.has(d.existing_id)) continue;
+    const item = candidateByHash.get(d.content_hash);
+    if (!item) continue;
+    await client.query(
+      `UPDATE questions
+          SET stem = $2,
+              options = $3,
+              answer = $4,
+              analysis = $5,
+              difficulty = $6,
+              tags = $7
+        WHERE id = $1
+          AND owner_user_id = $8
+          AND deleted_at IS NULL`,
+      [
+        d.existing_id,
+        item.stem,
+        toJsonbParam(item.options ?? null),
+        item.answer ?? null,
+        item.analysis ?? null,
+        item.difficulty ?? null,
+        toJsonbParam(item.tags ?? null),
+        ownerUserId,
+      ],
+    );
+    overwritten += 1;
+  }
+  return overwritten;
+}
+
+/**
+ * 预检：跑完解析与查重后立刻返回统计，**不写任何数据**。
+ *
+ * 三条硬约束（任务书 B4）：
+ *   - 不写 import_batches；
+ *   - 不建 knowledge_nodes（所以这里刻意不调用 resolveNode）；
+ *   - 不插 questions。
+ * 因为全流程只读，所以不需要事务包裹 —— 用 pool 直接查即可。
+ */
+export async function previewImport(pool, body = {}, ownerUserId = null) {
+  const { extracted, split, parseProblems, createCtx, cleanedQuestions, sanitizedCount } =
+    await parseImportBody(body, ownerUserId);
+
+  // 预检不做 subject/node 解析：resolveNode 会建考点（写库），违反「预检不创建任何数据」。
+  // 归属字段一律用请求里的默认值，预检页只关心「新题/重复」两个数字。
+  const candidates = cleanedQuestions.map((q) => toCreateInput(q, createCtx));
+
+  const candidateByHash = new Map();
+  for (const item of candidates) candidateByHash.set(contentHashOf(item), item);
+
+  const { newQuestions, duplicates } = await dedupe(candidates, pool, ownerUserId ?? null);
+  const details = await describeDuplicates(pool, duplicates, candidateByHash, ownerUserId ?? null);
+
+  console.log(
+    `[IMPORT] 预检：新题 ${newQuestions.length} 条 / 重复 ${duplicates.length} 条（owner=${ownerUserId ?? 'public'}）`,
+  );
+
+  return {
+    new_count: newQuestions.length,
+    duplicate_count: duplicates.length,
+    duplicates: details,
+    // 单题级解析问题（JSON 里某条形状不对）也一并返回，前端预检页直接展示。
+    parse_errors: parseProblems.map((p) => p.message),
+    stats: {
+      kind: extracted.kind,
+      mime: extracted.mime,
+      bytes: Buffer.byteLength(extracted.text ?? '', 'utf8'),
+      total: split.total ?? split.questions.length,
+      sanitized: sanitizedCount,
+    },
+  };
+}
 /**
  * 把 base64 解成 Buffer。
  * Node 的 Buffer.from(str,'base64') 对非法字符是**静默跳过**而不是抛错，
@@ -164,7 +365,19 @@ function toCreateInput(question, ctx) {
  * 执行导入（四阶段）。
  * 单独导出，便于集成测试直接调用而不必起 HTTP。
  */
-export async function runImport(pool, body = {}, ownerUserId = null) {
+
+/**
+ * 阶段 1–2：解码 → 文本抽取 → 切题 → 题干清洗。
+ *
+ * ★ m32773：抽成独立函数，供「预检」与「真导入」共用。
+ *   两条路径必须拿到**同一份**解析结果 —— 否则预检说 300 道新题、真导入只进 298 道，
+ *   用户无法理解差在哪。本函数不碰数据库（纯解码 + 纯计算），所以预检可以直接调。
+ *
+ * @returns {Promise<{buffer: Buffer, filename: string, extracted: object, isJson: boolean,
+ *   split: object, parseProblems: Array<{message: string}>, createCtx: object,
+ *   sanitizedCount: number, cleanedQuestions: Array<object>}>}
+ */
+async function parseImportBody(body, ownerUserId) {
   if (!body.filename || String(body.filename).trim() === '') {
     throw Object.assign(new Error('filename 必填'), { code: 'MISSING_FILENAME' });
   }
@@ -172,7 +385,8 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
   const buffer = decodeBase64(body.content_base64);
   const filename = String(body.filename);
 
-  // 阶段 1：文本抽取（内部负责 10MB / 100 页 / 扫描版判定，抛 413/422/415）
+  // 阶段 1：文本抽取（内部负责 10MB / 100 页 / 扫描版判定，抛 413/422/415）。
+  // ★ m32773：.tillroad 的 gzip 解压也在这层（extract.mjs 看字节头判定）。
   const extracted = await extractText({ buffer, mime: body.mime, filename });
 
   // 阶段 2：切题（纯函数，无需事务）
@@ -238,6 +452,32 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
     if (cleaned !== q.stem) sanitizedCount += 1;
     return { ...q, stem: cleaned };
   });
+
+  return {
+    buffer,
+    filename,
+    extracted,
+    isJson,
+    split,
+    parseProblems,
+    createCtx,
+    sanitizedCount,
+    cleanedQuestions,
+  };
+}
+
+export async function runImport(pool, body = {}, ownerUserId = null) {
+  const {
+    buffer,
+    filename,
+    isJson,
+    split,
+    parseProblems,
+    createCtx,
+    sanitizedCount,
+    cleanedQuestions,
+    extracted,
+  } = await parseImportBody(body, ownerUserId);
 
   // 阶段 3 + 4：去重与入库必须在同一事务内 —— 否则两个并发导入同一份文件时，
   // 双方都能通过 dedupe（此时还都没写），然后双双插入同 hash 的两行。
@@ -366,6 +606,21 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
       ownerUserId ?? null,
     );
 
+    // ★ m32773：重复题的处理方式（skip / overwrite）。
+    //   skip      —— 默认。重复题原样留在库里，本次不写（与 m32773 之前完全一致）。
+    //   overwrite —— 用文件里的内容覆盖库里同 hash 的题（只改内容字段，保留 id / owner / created_at）。
+    // 非法值回落 skip（见 parseDuplicateAction 的注释）。
+    const duplicateAction = parseDuplicateAction(body);
+    const candidateByHash = new Map();
+    for (const item of candidates) candidateByHash.set(contentHashOf(item), item);
+
+    let overwritten = 0;
+    if (duplicateAction === DUPLICATE_ACTION_OVERWRITE) {
+      overwritten = await overwriteDuplicates(client, duplicates, candidateByHash, ownerUserId ?? null);
+    }
+    // skipped = 本次没写进去的重复题数（overwrite 模式下已覆盖的不算跳过）。
+    let skipped = duplicates.length - overwritten;
+
     // A3：查重结果 —— 与「插入成功」分开打，才能区分「都是重复题」与「插入失败」。
     console.log(
       `[IMPORT] 查重命中 ${duplicates.length} 条，待插入 ${newQuestions.length} 条`,
@@ -390,6 +645,8 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
             stem: item.stem,
             raced: true,
           });
+          // 并发撞车的那条也不可能被本次覆盖（它是刚被别人插进去的）。
+          skipped += 1;
           continue;
         }
         throw err;
@@ -413,15 +670,21 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
     }
 
     console.log(
-      `[IMPORT] 完成：插入 ${imported.length} 条，重复 ${duplicates.length} 条，耗时见上游`,
+      `[IMPORT] 完成：新增 ${imported.length} 条，覆盖 ${overwritten} 条，跳过 ${skipped} 条（action=${duplicateAction}）`,
     );
     return {
-      imported: imported.length,
-      // ★ m31124：本次导入的批次 id。前端拿它刷批次下拉，手动建题时没有批次。
-      //   公共题（无 token）导入时恒为 null。
+      // ★ m32773 C3：响应拆分。
+      //   imported.new       —— 新写入库的题数
+      //   imported.overwritten —— 重复题里被覆盖的条数（只有 overwrite 模式才可能 > 0）
+      //   duplicates.skipped  —— 因库内已存在而没写进去的条数
+      //   duplicates.overwritten —— 与 imported.overwritten 同口径（保留给前端按「重复题」维度展示）
+      // 旧字段 imported(数字) / duplicates(数组) 不能再用：前端要能分别显示「新增 / 覆盖 / 跳过」，
+      // 所以这里改成对象，并把明细挪到 duplicate_details（数组，形状与旧 duplicates 一致）。
+      imported: { new: imported.length, overwritten },
       batch_id: batchId,
       import_filename: batchId ? filename : null,
-      duplicates,
+      duplicates: { skipped, overwritten },
+      duplicate_details: duplicates,
       // 单题级的解析问题（JSON 里某条形状不对）也走 errors，前端已有展示位。
       errors: parseProblems,
       // ★ m30197 A4：按科目匹配与考点自动创建的统计（旧字段一个都没删）。
@@ -458,6 +721,26 @@ export async function runImport(pool, body = {}, ownerUserId = null) {
 
 export function match(method, seg, ctx) {
   const { pool, body, authUserId } = ctx;
+
+  // ★ m32773：预检端点必须排在真正导入之前。
+  //   路径长度不同（3 段 vs 2 段）本来不会误匹配，但顺序仍按「更具体的在前」写，
+  //   免得以后有人把判断写成前缀匹配时踩坑。
+  if (method === 'POST' && seg.length === 3 && seg[0] === 'questions' && seg[1] === 'import' && seg[2] === 'preview') {
+    return (async () => {
+      try {
+        const result = await previewImport(pool, body, authUserId ?? null);
+        return ok(result, 200);
+      } catch (err) {
+        if (err && !err.statusCode && typeof err.code === 'string' && err.code.startsWith('MISSING')) {
+          return fail(err.code, 400, { message: err.message });
+        }
+        if (err && !err.statusCode && err.code === 'INVALID_BASE64') {
+          return fail('INVALID_BASE64', 400, { message: err.message });
+        }
+        throw err;
+      }
+    })();
+  }
 
   if (method === 'POST' && seg.length === 2 && seg[0] === 'questions' && seg[1] === 'import') {
     return (async () => {

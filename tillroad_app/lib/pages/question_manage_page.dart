@@ -25,6 +25,8 @@ import 'package:flutter/cupertino.dart';
 import '../api/api_client.dart' show ApiException;
 import '../api/defect_api.dart' show DefectApi;
 import '../api/exam_api.dart' show ExamApi;
+import '../services/export_service.dart'
+    show ExportException, ExportFailureKind, ExportResult, ExportService;
 import '../api/question_api.dart';
 import '../config/api_config.dart';
 import '../local/hidden_questions_store.dart';
@@ -109,6 +111,9 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
   /// 批次列表 / 整批删除进行中（避免连点）。
   bool _batchBusy = false;
 
+  /// ★ m32406：导出进行中（防止连点多次弹 SAF 选择器）。
+  bool _exporting = false;
+
   /// ★ m31635：科目维度。null = 全部科目。
   ///
   /// 与「掌握状态」维度并列，不再互斥：`_filter` 管掌握度/删除/隐藏，
@@ -123,6 +128,8 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
 
   /// 科目下拉的选项缓存（首次打开下拉时懒加载）。
   List<_OptionItem> _subjectOptions = const <_OptionItem>[];
+
+  @override
   void initState() {
     super.initState();
     _load();
@@ -1212,6 +1219,87 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
     if (mounted) await _load();
   }
 
+  /// ★ m32406：右上角「⋯」菜单。目前只有「导出题库」一项，
+  /// 但用 ActionSheet 而不是直接按钮 —— 以后加「批量导入」「清空题库」不用再动导航栏布局。
+  Future<void> _openMoreMenu() async {
+    final String? action = await showCupertinoModalPopup<String>(
+      context: context,
+      builder: (BuildContext ctx) {
+        return CupertinoActionSheet(
+          title: const Text(
+            '更多操作',
+            style: TextStyle(fontFamily: kFontFamily, fontSize: 14),
+          ),
+          actions: <Widget>[
+            CupertinoActionSheetAction(
+              onPressed: () => Navigator.of(ctx).pop('export'),
+              child: const Text(
+                '导出题库',
+                style: TextStyle(
+                  fontFamily: kFontFamily,
+                  fontSize: 17,
+                  color: AppColors.accent,
+                ),
+              ),
+            ),
+          ],
+          cancelButton: CupertinoActionSheetAction(
+            onPressed: () => Navigator.of(ctx).pop(),
+            child: const Text(
+              '取消',
+              style: TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 17,
+                color: AppColors.accent,
+              ),
+            ),
+          ),
+        );
+      },
+    );
+    if (action == 'export') await _exportQuestions();
+  }
+
+  /// ★ m32406：导出题库到用户选的 SAF 目录。
+  ///
+  /// 流程完全交给 [ExportService]：没选目录它会自己弹选择器，目录失效它会
+  /// 清掉重弹一次。这里只负责「转圈 + 把四种失败分档翻译成人话」。
+  ///
+  /// 为什么不能让用户在一个 loading 里等很久还不知道在干什么：
+  /// SAF 选择器本身是系统 UI，会把 App 切到后台再切回来；导出本身可能几秒。
+  /// 所以选择器阶段不给 loading（否则用户以为卡住），只在真正写入时转圈。
+  Future<void> _exportQuestions() async {
+    if (_exporting) return;
+    setState(() => _exporting = true);
+
+    final ExportService service = ExportService();
+    try {
+      final ExportResult result = await service.exportQuestions(kDemoUserId);
+      if (!mounted) return;
+      await _showMessage(
+        '导出完成',
+        '已导出 ${result.questionCount} 道题到 ${result.path}\n'
+            '文件大小 ${result.sizeLabel}。',
+      );
+    } on ExportException catch (e) {
+      if (!mounted) return;
+      // 用户主动取消选择目录：不是错误，静默收场。
+      if (e.kind == ExportFailureKind.location && e.message.contains('已取消')) {
+        return;
+      }
+      await _showMessage(
+        e.kind == ExportFailureKind.network ? '网络异常' : '导出失败',
+        e.message,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      await _showMessage('导出失败', '$e');
+    } finally {
+      service.close();
+      if (mounted) setState(() => _exporting = false);
+    }
+  }
+
   /// 确认弹窗。
   ///
   /// [destructive] 为 true 时按钮用红色（默认沿用旧口径：`confirmText == '移除'`），
@@ -1338,18 +1426,33 @@ class _QuestionManagePageState extends State<QuestionManagePage> {
                 color: AppColors.label,
               ),
             ),
-            trailing: CupertinoButton(
-              padding: EdgeInsets.zero,
-              minimumSize: const Size(36, 36),
-              onPressed: _openBank,
-              child: const Text(
-                '浏览',
-                style: TextStyle(
-                  fontFamily: kFontFamily,
-                  fontSize: 17,
-                  color: AppColors.accent,
+            trailing: Row(
+              mainAxisSize: MainAxisSize.min,
+              children: <Widget>[
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  minimumSize: const Size(36, 36),
+                  onPressed: _exporting ? null : _openMoreMenu,
+                  child: const Icon(
+                    CupertinoIcons.ellipsis_circle,
+                    size: 22,
+                    color: AppColors.accent,
+                  ),
                 ),
-              ),
+                CupertinoButton(
+                  padding: EdgeInsets.zero,
+                  minimumSize: const Size(36, 36),
+                  onPressed: _openBank,
+                  child: const Text(
+                    '浏览',
+                    style: TextStyle(
+                      fontFamily: kFontFamily,
+                      fontSize: 17,
+                      color: AppColors.accent,
+                    ),
+                  ),
+                ),
+              ],
             ),
           ),
           SliverPadding(

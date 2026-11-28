@@ -331,7 +331,8 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 | `GET /capability-layers/:id` | 取单个模板 |
 | `PATCH /capability-layers/:id` | 更新模板（`base_version` 必填；`customizable=false` 时改 `layers` → `400 CUSTOMIZABLE_LOCKED`） |
 | `DELETE /capability-layers/:id` | 软删模板（`base_version` 必填；**同样受 gate 拦截**，刻意加严） |
-| `POST /questions/import` | **BE-02 / m30197** 题库导入（JSON + base64；四阶段：抽取→切题→去重→入库）→ `200 {imported, duplicates, errors, stats, subject_matched, node_created}`。`subject_mode: from_file` 时按每题 `subject` 匹配科目（精确→包含，**不自动建科目**）、按 `node` 逐级匹配考点（缺级**自动创建**）；`uniform` 时忽略文件字段走请求里的 `subject_id` |
+| `POST /questions/import` | **BE-02 / m30197 / m32773** 题库导入（JSON + base64；四阶段：抽取→切题→去重→入库）→ `200 {imported:{new,overwritten}, duplicates:{skipped,overwritten}, duplicate_details, errors, stats, subject_matched, node_created}`。`subject_mode: from_file` 时按每题 `subject` 匹配科目（精确→包含，**不自动建科目**）、按 `node` 逐级匹配考点（缺级**自动创建**）；`uniform` 时忽略文件字段走请求里的 `subject_id`。`decisions.duplicate_action` = `skip`（**默认**）/`overwrite`（按 content_hash 覆盖题干/选项/答案/解析/难度/标签，**保留 id 与归属**） |
+| `POST /questions/import/preview` | **m32773** 导入预检（**只读，不写任何数据**：不插题、不建考点、不建导入批次）→ `200 {new_count, duplicate_count, duplicates:[{incoming:{stem,type,content_hash}, existing:{id,stem,created_at}\|null, diff:[...]}], parse_errors, stats}`。**只按 content_hash 精确判重，不做相似度判定**；`diff` 是人话差异（`答案不同`/`解析不同`/`难度不同`/`标签不同`/`题型不同`） |
 | `POST /questions-import` | 上一行的路径别名 |
 | `POST /questions` | **FE-02** 手动建题 → `201`（`source` 固定 `manual`，归属只认 token；选项归一成 `[{key,text}]`；同题干同 owner → `409 DUPLICATE_QUESTION`） |
 | `GET /questions/:id` | **FE-02** 取单题详情（含 `answer` / `analysis` / `version`）；别人的私有题 → `404` |
@@ -340,6 +341,7 @@ DRAFT → ANALYZED → ACTION_DONE → V1 → V2 → V3 → CLOSED
 | `PATCH /questions/batch` | **m30197** 批量改归属：body `{ids[], subject_id?, knowledge_node_id?}`（`knowledge_node_id: null` = 清空考点）；只改自己的题，公共/他人题静默跳过 → `200 {updated, requested, skipped}`；两个字段都不给 → `400 NOTHING_TO_UPDATE` |
 | `GET /import-batches` | **m31124** 导入批次列表（`?limit=&offset=`，按 `created_at DESC`）→ `200 {items:[{id, filename, question_count, created_at}], total, limit, offset}`。`user_id` 从 token 取，不接受 query 传 |
 | `DELETE /questions/batch` | **m31124** 整批软删：body `{batch_id}` → `200 {deleted, requested, skipped, batch_id}`（`requested` = 删前该批还剩多少道，**必须在删除前统计**）。同一端点仍接受 `{ids[]}` 走原按 id 批量删；两者都不给 → `400 EMPTY_IDS`，`batch_id` 非字符串/空串 → `400 INVALID_BATCH_ID` |
+| `GET /export/questions` | **m32406** 导出题库快照（需 Bearer Token，无 query）→ `200 {version:"1.0", exported_at, user:{id,nickname}, subjects[], knowledge_nodes[], questions[]}`。**只含 `owner_user_id = 当前用户` 的题**（不含公共题，也不同于 `listVisible`），带 `answer`/`analysis`，不含练习记录与缺陷单；无 Token → `401 unauthorized` |
 | `POST /defect-tickets` | **BE-03** DRAFT 建单（归因列可空）；带完整归因直接 `201 ANALYZED`；禁用语 → `400 forbidden_phrase`；缺归因 → `400 missing_error_layer_or_cause` |
 | `GET /defect-tickets/:id` | 取单个缺陷单（回带 `verifications` + `actions` 历史） |
 | `GET /users/:userId/defect-tickets?status=` | 某人缺陷单列表（可按 status 过滤，分页） |
@@ -892,6 +894,92 @@ R2 的掌握度标记只能「标」，不能「不看」——用户一周下�
 ---
 
 
+### 题库导出与 SAF（m32406：`GET /export/questions` + 目录持久化 + `.tillroad`）
+
+把「我的题库」存成一个文件带走。导出**不是**列表分页的反面，而是一次完整快照：只含当前用户自己创建的题（带 `answer` / `analysis`，因为是导给自己），不含练习记录与缺陷单。
+
+**端点**：`GET /export/questions`（需 Bearer Token）→ `200`：
+
+```json
+{
+  "version": "1.0",
+  "exported_at": "2026-11-28T12:15:30.000Z",
+  "user": {"id": "...", "nickname": "..."},
+  "subjects": [{"id": "...", "name": "...", "kind": "objective", "exam_profile_id": "..."}],
+  "knowledge_nodes": [{"id": "...", "subject_id": "...", "parent_id": null, "title": "...", "freq_tag": "high", "weight_to_target": 0.5}],
+  "questions": [{"id": "...", "subject_id": "...", "knowledge_node_id": null, "type": "choice", "stem": "...", "options": [...], "answer": "A", "analysis": "...", "formula_text": null, "difficulty": "medium", "tags": [...], "is_subjective": false, "content_hash": "...", "created_at": "..."}]
+}
+```
+
+**为什么不复用 `listVisible`**：`listVisible` 的归属条件是 `(owner_user_id IS NULL OR owner_user_id = $n)` —— 它会带上公共题，而导出只能导自己的。所以 `server/routes/export.mjs` 用独立 SQL（`WHERE owner_user_id = $1 AND deleted_at IS NULL`），也顺带说明这是**唯一一个不复用列表查询的读端点**。
+
+**为什么不加密**：文件写到用户自己选的目录，权限边界由系统（SAF）负责；加密会引入密钥管理问题（丢密钥 = 数据全废），而导出本身就是为了「用户自己保管」。
+
+**客户端链路**（`tillroad_app/lib/services/`）：
+
+| 文件 | 职责 |
+|---|---|
+| `export_location.dart` | SAF 目录选择 + 持久化 token（`export_dir_uri`）。选**方案 A**：`dir_picker` 只管选目录、`saf_stream` 只管写文件，职责单一；`docman` 一站式但把「选择/持久化/写入」耦在一个包里，SecurityException 只能靠字符串判断。 |
+| `export_service.dart` | `GET /export/questions` → `gzip.encode(utf8.encode(jsonEncode(payload)))` → `SafStream().writeFileBytes(...)`，文件名 `tillroad-export-{userId前8位}-{YYYYMMDD-HHmmss}.tillroad`；失败分四档 `network` / `location` / `compress` / `other`。 |
+
+**`dir_picker` 的真实 API 与任务书写法不同**（0.8.1）：没有 `pickDirectory()`，是 `DirPicker.pick()` → `DirPicker.persist(location)` 拿持久化 token（`PickOptions.android(shouldPersist:)` 已弃用，1.0.0 会移除）；失效用 `DirPicker.restore(token)` 判空；换目录时必须 `DirPicker.release(旧 token)`（Android 每个 App 最多 128 个持久化 URI 配额，超了丢最旧的）。保存的是 `persist()` 返回的 **token** 而不是 URI 字符串 —— iOS/macOS 上它是 bookmark base64。
+
+**桌面（Windows/Linux）**：token 是 `file://` URI，`saf_stream` 只有 Android 实现，所以 `_write()` 在非 Android 的 `file://` 分支直接 `File(...).writeAsBytes()`。
+
+**入口**：题库管理页右上角 `⋯` →「导出题库」；设置页「数据管理」分区有「导出题库」+「导出位置」（显示友好名，未选时「未设置，导出时选择」，可「更换」）。
+
+**校验**：新增 `server/routes/export.integration.test.mjs`（6 个用例：A 导 5 题 / 科目与考点取全量 / 顶层键集合 / B 隔离 / 无 Token 401 / 软删题不出现），PGlite 真库 **6/6**；`npm test` **425 tests / 215 pass / 0 fail / 210 skipped**；`flutter analyze --no-fatal-infos` **0 error / 0 warning / 100 info**；`flutter test` **137/137**（新增 `test/export_test.dart` 19 个纯函数用例）。
+
+> E4 实测：50 道贴近真实行测题（题干 ~60 字 + 4 选项各 ~30 字 + 1/3 带解析）序列化 **56,227 字节**，gzip 后 **3,094 字节（≈3.0 KB）**，远低于任务书预估的 100–200 KB —— 中文题库 JSON 高度同构，gzip 压缩率约 18×。任务书那个数量级是按「已压缩的二进制」估的，纯文本 JSON 不会那么大。
+
+### 导入预检与批量决策（m32773：`POST /questions/import/preview` + `decisions.duplicate_action`）
+
+以前点「开始导入」就是直接把文件怼给后端：用户看不到这次到底会发生什么（会新进几道、撞上几道重复、哪些条目根本解析不出来），等看到结果页时库已经被改（或没改）了，没有反悔的机会。现在拆成两步。
+
+**第一步 —— 预检（只读）**：`POST /questions/import/preview`，请求体与真导入完全相同，但**不写任何数据**：不插题、不建考点、不建导入批次。
+
+```json
+{
+  "new_count": 2,
+  "duplicate_count": 3,
+  "duplicates": [
+    {
+      "incoming": {"stem": "题干…", "type": "choice", "content_hash": "…"},
+      "existing": {"id": "…", "stem": "题干…", "created_at": "…"},
+      "diff": ["答案不同", "难度不同"]
+    }
+  ],
+  "parse_errors": [],
+  "stats": {"kind": "json", "mime": "application/json", "bytes": 2126, "total": 5, "sanitized": 0}
+}
+```
+
+**只按 `content_hash` 精确判重，不做相似度判定**（硬约束）。`diff` 是给人看的差异清单：`答案不同` / `解析不同` / `难度不同` / `标签不同` / `题型不同`；文件内部自己重复的条目，`diff` 会写「同一份文件里重复出现（库内还没有这道题）」。
+
+**第二步 —— 决策与导入**：`POST /questions/import` 的 body 可带 `decisions.duplicate_action`：
+
+| 值 | 行为 |
+|---|---|
+| `skip`（**默认**） | 重复题原样跳过，库里已有的题不被碰。这是**不传 `decisions` 时的行为**，与 m32773 之前完全一致。 |
+| `overwrite` | 按 `content_hash` 找到库里的同题，用文件里的 `stem`/`options`/`answer`/`analysis`/`difficulty`/`tags` 覆盖它。**保留 `id` 与 `owner_user_id`**（不换题、不换归属），库里已有的记录不会被复制一份。 |
+
+响应体同步拆成三段：
+
+```json
+{
+  "imported": {"new": 2, "overwritten": 3},
+  "duplicates": {"skipped": 0, "overwritten": 3},
+  "duplicate_details": [ … ],
+  "errors": [], "subject_matched": {…}, "node_created": {…}, "stats": {…}
+}
+```
+
+**为什么覆盖是直写 SQL 而不是复用 `questionsRep.update`**：`update` 要求 `base_version`，而且改题干会重算 `content_hash` —— 覆盖场景下 hash 本来就不该变，走 `update` 会引入不必要的连锁反应。覆盖走一条带 `owner_user_id` 限定的 UPDATE，语义更窄也更可控。
+
+**前端两段式**：`question_import_page.dart` 选好文件后不再直接上传，而是 push `import_preview_page.dart`（预检页：新题数 / 重复数、重复区可选「全部跳过 / 全部覆盖」、可展开看重复明细、底部「取消」+「确认导入 N 道新题 + [跳过/覆盖] M 道重复」）；预检页 `pop` 回决策字符串（`null` = 用户取消，什么都不做），再由原 `_upload(duplicateAction: decision)` 执行真导入 —— **原有的三态进度与结果页一条都没动**。`.tillroad`（gzip 的 JSON 导出包）也支持导入：后端 `extract.mjs` 按字节头 `0x1f 0x8b` 判定 gzip 并 `gunzipSync` 解压，不是 gzip 就按普通 JSON 读。
+
+**校验**：新增 3 条集成用例（预检 5 题 3 重复 → `new=2`/`duplicate=3` 且题数与批次数都不变；不传 decisions 默认 skip → `new=2`/`skipped=3`；overwrite → `overwritten=3` 且原题 id 与归属不变、总题数只 +2），**PGlite 真库 23/23**；`npm test` **428 tests / 215 pass / 0 fail / 213 skipped**；`flutter analyze --no-fatal-infos` **0 error / 0 warning / 101 info**；`flutter test` **137/137**。
+
 ## 5.5 应用界面与字体（`tillroad_app/`）
 
 
@@ -918,11 +1006,11 @@ R2 的掌握度标记只能「标」，不能「不看」——用户一周下�
 
 ### 目录与依赖
 
-- `tillroad_app/lib/` 74 个 dart 文件：`main.dart` / `theme/` 1 / `config/` 3（`api_config`、`app_info`、`local_config`）/ `mock/` 2（`home_mock`、`defects_mock`）/ `api/` 7 / `logging/` 4 / `local/` 16（其中 `local/dao/` 5）/ `pages/` 29 / `widgets/` 11。
-- 运行时依赖 `cupertino_icons` + `http` + `shared_preferences` + `share_plus` + `sqflite` + `path` + `file_picker`（后两个是本地优先 R1 引入、`file_picker` 是题库导入入口引入，见下节）；dev 依赖 `flutter_lints` + `flutter_launcher_icons` + `sqflite_common_ffi`（**仅测试用**，不进产物）。**无状态管理库、无路由库、无图表库、无 ORM、无 build_runner**。
+- `tillroad_app/lib/` 88 个 dart 文件：`main.dart` / `theme/` 1 / `config/` 3（`api_config`、`app_info`、`local_config`）/ `mock/` 2（`home_mock`、`defects_mock`）/ `api/` 10 / `logging/` 4 / `local/` 17（其中 `local/dao/` 5）/ `pages/` 30 / `services/` 2（`export_location`、`export_service`，m32406）/ `storage/` 2（`app_dirs`、`log_migration`，m32036）/ `utils/` 1 / `widgets/` 15。
+- 运行时依赖 `cupertino_icons` + `http` + `shared_preferences` + `share_plus` + `sqflite` + `path` + `file_picker` + `permission_handler`（m32036 通知权限）+ `path_provider`（m32036 目录）+ `dir_picker` / `saf_stream`（m32406 SAF 导出）；dev 依赖 `flutter_lints` + `flutter_launcher_icons` + `sqflite_common_ffi` + `flutter_test`（**仅测试用**，不进产物）。**无状态管理库、无路由库、无图表库、无 ORM、无 build_runner**。
 - ⚠️ `file_picker` 版本必须是 **^13.4.1**（不是 8.x）：8.x 依赖 `win32 ^5`，与 `share_plus 13.x`（`win32 ^6`）冲突，pub 解析不出来。13.x 的 API 也变了——`FilePicker.pickFiles(...)` 是**静态方法**直接返回 `List<PlatformFile>`（没有 `.platform`、没有 `FilePickerResult`），文件大小用 `await file.length()` 取、内容用 `await file.readAsBytes()` 取（没有 `size`/`bytes` 字段）。
 - 兼容平台：`android` / `ios` / `windows`（Windows 仅为本机开发期验证用，交付目标是移动端；**Windows 上不启用本地库**，见下节）。
-- 已知 `flutter analyze` 输出：**0 error / 0 warning / 86 info**（R1 前是 30 info；R1 +2、R2 +5、R4a +14、R4b +3、题库导入 +3、m18680 +11、§41 修完 13 条 warning 后为 55、题目选择器 +1、FE-02 +18、练习 R1 +10、练习 R3 +2）。全部 info 都是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「纯 Cupertino」的约束冲突。
+- 已知 `flutter analyze` 输出：**0 error / 0 warning / 100 info**（m32406 后；m32036 后是 101，因新文件拆分少了一条 info）。全部 info 都是同一条 `deprecated_member_use`（`package:flutter/cupertino.dart` 在 3.47+ 提示改用 `package:cupertino_ui/cupertino_ui.dart`）。刻意不改——改它需要引入第二个运行时依赖，与「纯 Cupertino」的约束冲突。
 - **判断 analyze 结果时不要写死行的格式**：本机是 `warning - …`，CI 的机器可读格式是 `warning • …`。写死分隔符会漏判（这坑踩过，见 REVIEW-NOTES §41）。CI 的判据用 `grep -Eq '^[[:space:]]*(error|warning)[[:space:]]'`。
 
 ### 缺陷单界面（FE-03）
@@ -1095,14 +1183,16 @@ App 给外部测试用户后拿不到 adb logcat，所以自带一份「可导�
 | `lib/logging/log_export.dart` | 内存缓冲 + 近 3 天文件 + 设备信息头 → 单个 `.txt`，返回 `LogExportResult` |
 | `lib/logging/nav_observer.dart` | `LoggingNavigatorObserver` 记录 `[NAV] push X ← Y`，替代逐处改 push |
 | `lib/config/app_info.dart` | `kAppName` / `kAppVersion`（与 pubspec 手工同步，不引 `package_info_plus`） |
+| `lib/storage/app_dirs.dart` | **m32036 新增**：App 私有目录（`AppDirs.logs()` / `data()` / `root()` + `init()` / `describe()`）；外部专属目录→文档目录两档回落，实测探针确保「非 null 即一定可写」 |
+| `lib/storage/log_migration.dart` | **m32036 新增**：把旧 `systemTemp/tillroad/logs` 下的 `app-*.log` 一次性搬到 `AppDirs.logs()`；`log_migration_done` 标记、同名不覆盖、copy+delete（跨挂载点 rename 会 EXDEV） |
 
 **脱敏是在 `AppLogger._write()` 里做的，而不是在导出时**——顺序是「先 `sanitizeLogText()`，再构造 `LogEntry`」，所以内存缓冲里也不存在原文（任务 C4）。四条规则：`Bearer <token>` → `Bearer ***`；裸 `tk_xxx` → `***`；UUID → 前 4 位 + `****`（`11111111-1111-4111-8111-111111111111` → `1111****`）；URL query 里的 `token=/access_token=/api_key=/password=` → `***`（任务书没点名，但 URL 要落盘，顺手堵上）。
 
 **埋点位置**：`main.dart` 的 `FlutterError.onError`（保留原 handler，所以 debug 仍打印）+ `PlatformDispatcher.instance.onError`；`api_client.dart` 的 `_send()` 一处覆盖全部端点——请求前 `[API] GET /path`、2xx `[API] GET /path 200 OK 342ms`、非 2xx `... 500 ERROR 1200ms code=... body=...`（body 截 200 字符，避免题干进日志）、网络/超时 `... 网络失败 95ms：...`。`diagnose()` 的结果也记一条 `[DIAG]`。
 
-**新增依赖只有 `share_plus`**（实际解析到 13.3.1）：`SharePlus.instance.share(ShareParams(files: [XFile(path)]))` 调系统分享面板。注意 `path_provider` 只是它的传递依赖，**代码里不直接 import**，日志目录用 `Directory.systemTemp`（Android 上即应用私有 cache）。
+**共享依赖**：`share_plus`（实际解析到 13.3.1），`SharePlus.instance.share(ShareParams(files: [XFile(path)]))` 调系统分享面板。日志目录在 m32036 之后改由 `lib/storage/app_dirs.dart` 决定（见下节），不再直接用 `Directory.systemTemp`。
 
-日志文件位置（Android）：`/data/data/<pkg>/code_cache/tillroad/logs/`，导出文件在同级 `export/`，分享时由 share_plus 复制到 `cache/share_plus/`。
+日志文件位置（Android，m32036 之后）：`/storage/emulated/0/Android/data/com.tillroad.app/files/TillRoad/logs/`；若应用专属外部目录不可用则回落 `/data/user/0/com.tillroad.app/app_flutter/TillRoad/logs/`。导出临时文件仍在 `systemTemp/tillroad/export/`（即 `/data/user/0/<pkg>/cache/tillroad/export/`），分享时由 share_plus 复制到 `cache/share_plus/`。
 
 #### 底部 Tab 收敛与「我的 / 设置」（FE-UI 重构）
 
@@ -1112,7 +1202,7 @@ App 给外部测试用户后拿不到 adb logcat，所以自带一份「可导�
 |---|---|
 | `lib/main.dart` | `RootTabs`：3 个 `BottomNavigationBarItem`，`_switchTab` 上界跟着数量走（`index > 2` 直接 return） |
 | `lib/pages/profile_page.dart` | 「我的」：账户卡片（`maskUuid` 脱敏 ID + 切换 Token / 退出）+ 数据概览四格 + 功能列表四入口 |
-| `lib/pages/settings_page.dart` | 设置：连接与诊断 / 日志 / 账户 / 危险操作 / 关于 五个 `CupertinoListSection` |
+| `lib/pages/settings_page.dart` | 设置：连接与诊断 / 日志 / 账户 / 数据管理 / 危险操作 / 权限 / 关于 七个 `CupertinoListSection`（数据管理与权限分别由 m32406、m32036 新增） |
 | `lib/pages/home_page.dart` | 右上角 trailing 从「诊断 + 日志」两个图标改为单个 `CupertinoIcons.gear` → push 设置页 |
 
 **为什么全部改 push 而不再切 Tab**：只剩 3 个 Tab 时「验证 / 模考 / 复盘」没有对应索引（旧代码写死 verify=2 / mock=3 / review=4）。继续用切 Tab 语义，一旦 Tab 数量变化，这些写死的索引会**静默指到别的页面**——现在索引 2 已经是「我的」，点「今日待验证」会把用户送到错误的分区。改 `appRoute()` push 后，导航意图用**类型**表达（`VerifyPage()`），不依赖任何数字。
@@ -1189,6 +1279,26 @@ App 给外部测试用户后拿不到 adb logcat，所以自带一份「可导�
 **R4b：首页「今日待验证」读本地真实任务**：R4a 之前首页这张卡始终渲染 mock 常量 `kHomeSnapshot.tasks`（只有三色计数是真的）。R4b 改为读 `loadVerificationTasks()` 的本地结果，空时才回落 mock；点卡片直接进该单的详情页。
 
 **R4b：启动一致性校验**：`checkLocalStatusConsistency()` 对比本地与云端的 `defect_tickets` status 分布，不一致就记 warn 并触发一次全量对账。埋点：`[QUEUE] 入队 xxx op_id=N` / `[PUSH] xxx 成功，本地 status=… version=…` / `[LOCAL] 读取缺陷单 N 条`——三行日志能把「写入 → 队列 → 推送 → 本地刷新」整条链自证出来（详见设计文档 §11）。
+### App 私有目录与通知权限（m32036）
+
+**背景**：m32036 之前日志落在 `Directory.systemTemp/tillroad/logs`。Android 上 `systemTemp` 是应用私有**缓存**目录（`/data/user/0/<包名>/cache`），系统存储吃紧时会整个清掉——用户报障时常发现日志目录是空的。
+
+| 目录 | 路径（Android） | 用途 |
+|---|---|---|
+| `AppDirs.logs()` | `/storage/emulated/0/Android/data/com.tillroad.app/files/TillRoad/logs` | 日志（`app-YYYY-MM-DD.log`） |
+| `AppDirs.data()` | `…/files/TillRoad/data` | 导入临时文件、题库缓存 |
+
+**只定义这两个目录、刻意不定义导出目录**：导出位置将来由 SAF（Storage Access Framework）让用户自己选，那是一条与「App 自己的数据放哪」完全不同的决策链。
+
+**为什么用 `getExternalStorageDirectory()`**：它在 scoped storage 里属「应用专属外部目录」，**不需要任何存储权限**就能读写，且在「设置 → 应用 → 存储」里用户可见、可清理。`getApplicationDocumentsDirectory()`（内部存储 `/data/user/0/<包名>/app_flutter`）用户完全看不到，只作**回落**候选。因此 `AndroidManifest.xml` **只加了 `POST_NOTIFICATIONS`，没有任何存储权限**。
+
+**日志迁移（只搬一次）**：启动时 `migrateLegacyLogs()` 扫旧目录里的 `app-*.log`，`copy` + `delete` 搬到新目录。四条取舍写在 `lib/storage/log_migration.dart` 头部：① `log_migration_done` 标记只搬一次；② 失败不阻塞启动（`warn` 而非 `error`，且**不置标记**，下次重试）；③ 同名文件**不覆盖**（升级当天两版都写过 `app-2026-11-20.log`，追加会把同一天的行拆到两文件）；④ 必须 copy+delete 而非 rename —— `systemTemp` 与外部目录在 Android 上是不同挂载点，rename 会抛 `EXDEV: Cross-device link`。
+
+**「清除本地缓存」必须扫两个位置**：`utils/session.dart` 的 `purgeCacheDirectories()` 同时扫旧 `systemTemp/tillroad`（升级前残留）与新 `AppDirs.root()`。设置页不再自己拼路径，改为委托给它——m32036 实际踩过一次「只改了日志写入器、清缓存还删旧目录」的 bug。
+
+**通知权限的获取时机**：`POST_NOTIFICATIONS` 是 Android 13+ 运行时权限，只能在有上下文的时刻弹系统框。`lib/pages/onboarding_page.dart` 在首启动（`onboarding_done` 为 false）时一屏讲清「为了让验证窗口临期提醒正常工作，请允许通知权限」，「允许」→ `Permission.notification.request()`，「暂不开启」→ 直接过，**两者都置 `onboarding_done=true`**（拒绝后不重复弹窗——反复弹是 Android 上最招人烦的反模式，系统在用户拒绝两次后甚至不再显示对话框）。之后想开启只能走**设置页 → 权限 → 通知权限 → 去系统设置**（`openAppSettings()`，**不重复 `request()`**，否则会被永久拒绝）。
+
+**测试**：`test/log_migration_test.dart` 10 个用例（`AppDirs` 建目录/探针清理/`root()` 不创建、迁移的置标记/搬运/同名跳过/`force` 重扫/重置标记），用 `AppDirs.debugOverrideRoot()` 钉到临时目录，绝不碰真实设备目录。
 
 ---
 
@@ -1378,7 +1488,10 @@ Select-String -Path tillroad_app\build\app\intermediates\merged_manifest\release
 - ✅ **题库导入科目自动匹配 + 考点自动创建 + 批量重新分配（m30197）**：**A1** 新增 `server/import/resolve_subject.mjs`（`resolveSubject` + 带 Map 缓存的 `createSubjectResolver`；候选 SQL 必须 `JOIN exam_profiles` 且 `ep.user_id = $1 AND ep.status = 'active'` —— `subjects` 表没有 `user_id` 列；匹配三档 `exact` → `contains`（文件写「行测」命中库里的「行测-资料分析」）→ `contained`，同档取名字最短者；**匹配失败返回 null，绝不自动建科目**）；**A2** 新增 `server/import/resolve_node.mjs`（`splitNodePath` 按 `/` 或全角 `／` 拆、最多 3 层、每层截 40 字；`findNode` 用 `parent_id IS NOT DISTINCT FROM $2` 才能命中根层；逐级缺则 `knRepo.create`，409 并发冲突时重查一次，其他异常 `console.warn` 后返回 null **不整批失败**；自动创建**只发生在导入**，手动建题不建考点）。**A3** 因为 md/txt/csv/pdf/xlsx 都是纯文本、`splitter.parseBlock` 拿不到 `subject`/`node`，新增 `server/import/json_import.mjs`（`parseQuestionJson` 兼容裸数组与 `{questions|items|data|list}`、题型中文映射、选项三种写法归一、单题坏只跳过该题不整份失败、`hasAnySubject` 供判定是否回落统一指定）+ `extract.mjs` 新增 `json` kind（`application/json` / `text/json` / `.json`）。导入管线按 `subject_mode` 分流：`from_file` 时逐题解析 subject/node，**resolution 必须在事务内**（它会写库建考点，抽到事务外会留下「题回滚了但考点还在」）；`uniform` 保持旧行为。★ 两个真 bug：①**文件写了 subject 但匹配不到**时仍解析 node，会把**别的科目的考点路径**建到兜底科目树下污染考点树 → 加逐题 `subjectResolved` flag（初值 true；匹配成功 true、失败 false），node 仅在 flag 为 true 时解析；②`matchedCount` / `unmatchedCount` 两个计数器在插入 flag 时被 edit 连带覆盖删除，导致 `matched_count` 恒 0 而 `matched_subjects` 正确 → 从 PGlite 探针一眼看出不一致才定位到。**A4** 响应新增 `subject_matched: {matched_count, unmatched_count, unmatched_subjects, matched_subjects:[{subject_id,name,count}]}` 与 `node_created: {created_count, created_paths}`，`errors` 改成解析问题列表，`stats` 加 `subject_mode` / `subject_from_file_available`。**C3** 新增 `PATCH /questions/batch`（路由分支**必须排在 `:id` 之前**，否则 `'batch'` 当 uuid → 22P02 → 被 `httpError` 吞成 500）+ 仓储 `updateAssignmentBatch`（只改 `owner_user_id`；`clearKnowledgeNode` 可置空考点但科目不能空；**只换科目且没给考点时一并把 `knowledge_node_id` 置 NULL**，否则出现「题在科目 A、考点挂科目 B 子树」的自相矛盾；不带 version，与 `updateTagsBatch` 同口径）。前端：`question_import_page.dart` 两模式切换（默认「从文件读取」，`uniform` 才强制选科目）+ 结果页「科目匹配结果」「自动创建的考点」两块；`question_manage_page.dart` 批量条加「移动到科目」「设置考点」（两步选择；`clearKnowledgeNode` 清空）。`docs/question-recognition-prompt.md` 第五节重写（JSON 直接上传、`subject_mode` 语义、匹配规则、新响应字段），输出格式示例补上 `subject`/`node` 两字段。校验：新增 fixture `tests/fixtures/questions/sample-04-ai-json.json`（3 行测 + 2 公基，含两级考点）、`import.integration.test.mjs` 12→17 用例、**PGlite 真库 17/17**、`npm test` **408 tests / 215 pass / 0 fail / 193 skipped**、`flutter analyze --no-fatal-infos` **0 error / 0 warning / 97 info**、`flutter test` **108/108**（本轮按任务书**未截图、未跑 adb**）
 - ✅ **题库导入批次 + 批次筛选 + 整批删除（m31124）**：`migrations/0007_import_batch.sql`(+down，任务书要求 0006 但已被 `0006_exam_custom_defect_questions.sql` 占用) 给 `questions` 加 `batch_id uuid` / `import_filename text` / `imported_at timestamptz`（均可空，**刻意不建外键**：批次是账本、题是数据）+ 部分索引 `idx_q_batch` + 新建 `import_batches(id, user_id FK, filename, question_count, created_at)` 与 `idx_ib_user_time`；`scripts/migrate.mjs` 的 UP 追加、DOWN 前插，`server/db/test_schema.mjs` 的 MIGRATION_FILES 同步。**导入双写时序**：事务内先 `importBatchesRep.create`（question_count=0 占位）→ 逐题带 `batch_id`/`import_filename`/`imported_at` → 插完 `updateQuestionCount(imported.length)`（判重跳过的不算），三步同一 `withTransaction`，回填失败只 warn 不回滚。新增 `server/repositories/import_batches.mjs`（create / updateQuestionCount / listByUser / getById）与 `server/routes/import_batches.mjs`（`GET /import-batches`，user_id 只认 token，items 白名单四列）。`GET /questions` 加 `batch_id` 查询参数（`listVisible` 里 `batch_id = $n`，NULL 的题不命中任何具体批次 = 手动建题只在「全部批次」可见）。`DELETE /questions/batch` 分流：有 `batch_id` 走整批软删（**countByBatch 必须先于 archiveByBatch**，否则 requested 恒 0），否则走原 `{ids[]}`；参数校验 `INVALID_BATCH_ID`。仓储：`WRITABLE_COLUMNS` 加三列、`UPDATE_COLUMNS` 用 `BATCH_COLUMNS` 排除（编辑不许改档案）、`archiveByBatch` / `countByBatch` 过滤条件严格一致。前端：`question_api.dart` 加 `ImportBatch`（`label` 拼「文件名（N 题）· 相对时间」）/ `fetchImportBatches` / `deleteQuestionsByBatch`，`question_manage_page.dart` 在筛选行下加「批次下拉 + 删除整批」（只在全部/已掌握/未掌握三档显示，已删除走 `/questions/deleted`、已隐藏走本机快照，都不带批次语义），批次列表失败只 debugPrint 不拖垮题目列表。校验：`import.integration.test.mjs` 17→20 用例（导两次两批、删第一批不影响第二批、软删可恢复、重复删幂等、手动建题 batch_id 为 null、参数校验三条），**PGlite 真库 20/20**；`npm test` **411 tests / 215 pass / 0 fail / 196 skipped**；`flutter analyze --no-fatal-infos` **0 error / 0 warning / 98 info**；`flutter test` **108/108**（按任务书未截图、未跑 adb）
 - ✅ **题库多条件组合筛选（m31635）**：把筛选器从「一次只能选一档」改成**多维度叠加（AND）**。后端 `GET /questions` 新增两个参数：`type`（逗号分隔多值，按 `QUESTION_TYPES` 过滤非法值后去重，SQL 用 `type = ANY($n::text[])` 数组比较而非字符串拼接）与 `mastery`（三态 `mastered` / `unmastered` / `unmarked`，非法值静默忽略）。★ 关键 SQL 差别：`unmarked` 必须用 **`NOT EXISTS (整个子查询)`**，写成 `NOT EXISTS(… AND mastered = false)` 会把「已掌握」也算成「未标记」——三态由 `question_mastery` 行存在与否承载。新增 `masteryStateFilterClause`（`server/repositories/question_mastery.mjs`），与旧 `masteryFilterClause` 共存、`masteryState` 优先（旧 `mastered=true|false` 仍生效，参数全空时行为不变）。同步 `server/_fake_repos.mjs` 的 `listVisible`（否则 fake 路径用例口径不同）。前端 `question_manage_page.dart`：五个档位保留为「掌握状态」维度，筛选行下新增 `_buildDimensionRow()`（科目下拉复用 `_loadBatchSubjects`、懒加载缓存；题型多选带勾选标记，来源 `kQuestionTypeLabels` 本地枚举不发请求）+ `_buildActiveFilterTags()`（「当前筛选：科目=行测 · 题型=选择题 · 未掌握 · 批次=国考50题」，每标签点掉一条 + 「清除全部」）；有叠加条件且空结果时空状态改「该筛选条件下没有题目」+「清除所有筛选」；筛选状态只存 State **不持久化**，切到已删除/已隐藏档时把科目/题型/批次一起清掉。校验：新增 `server/routes/question_filter.integration.test.mjs`（8 用例），**PGlite 真库 8/8**；`npm test` **419 tests / 215 pass / 0 fail / 204 skipped**；`flutter analyze --no-fatal-infos` **0 error / 0 warning / 98 info**；`flutter test` **108/108**（按任务书未截图、未跑 adb）
-- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两个节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）；⑥本地优先 R3 的增量对账尚未实现（后端需加 `updated_since` 或变更日志）；⑦R4a 的冲突只做「丢弃本地 + 以云端为准」，字段级自动仲裁与写队列的删除操作未做；⑧R4b 未做 dead 队列的 UI 管理入口（死信行只能在数据库里看），也未做删除操作的入队；⑨题库的 **AI 生成题入口**未做（手动建题与编辑删除本轮 FE-02 已做；题目本地缓存待 R5 拍板）；⑩「删除我的所有数据」只软删不物理删（数据仍在库里可恢复，合规的「彻底抹除」需物理删除与保留期策略）；⑪题目选择器的**考点筛选未做进 UI**（后端 `knowledge_node_id` 已可用且有集成测试，但页面没有该 chip）、**中文关键字未真机验证**（`adb shell input text` 对非 ASCII 直接 NPE）；⑫FE-02 未做**拍照 OCR**（需先补 BYOK 服务端密钥管理与 vision adapter）；⑬练习模式**删题已做（R3）**，但**按题目选择器组练习**、**练习记录删除入口**（`practice_sessions.deleted_at` 无端点）、**每题用时展示**（`duration_ms` 已在收但未显示）仍未做，且公共题自评的对错只存在练习记录里、不回流题库；⑭题库管理页的**物理抹除**未做（题只软删，可恢复）；⑮**「已隐藏」列表目前只能用本地快照**（后端只有 `PATCH /questions/:id/hide`，**没有 list-hidden 端点**，`GET /questions` 默认就排除隐藏题），后果是跨设备不可见、清缓存丢失、与服务端不对账 —— 正确修法是后端加 `GET /questions?hidden=true`（需改 `server/`，本轮硬约束禁止）；⑯`exam_type_custom` 没有写进本地 `exam_profiles` 表，从本地读出的卡片进编辑页时自定义类型名会回落成预设标签，需下拉走一次云端才有；⑰科目匹配是「按名字」的启发式（精确→包含），文件写简称（「公基」）而库里叫全称（「公共基础知识」）时不会命中，只能靠兜底科目 + 手动批量移动；跨多个 active 考试目标时同名科目取「名字最短」那个，不确定归属时也会归兜底；⑱`import_batches` 是**只增不删**的账本（本轮没有清理/归档机制），长期使用后下拉会越来越长 —— 需要时再加「只显示最近 N 条」或过期清理，另 `batch_id` 刻意无外键，删题不会动批次行；⑲导入批次的筛选不作用于「已删除」与「已隐藏」两档（前者走 `/questions/deleted`、后者走本机快照，接口都不带批次语义），要按批次恢复题只能先切回「全部批次」再逐题看
+- ✅ **App 私有目录 + 通知权限引导（m32036）**：日志从 `Directory.systemTemp/tillroad/logs`（Android 上是应用私有缓存目录，存储吃紧时会被系统整个清掉）搬到 `AppDirs.logs()` = `getExternalStorageDirectory()/TillRoad/logs`（应用专属外部目录，scoped storage 下无需任何存储权限，用户可见可清），失败回落 `getApplicationDocumentsDirectory()/TillRoad/logs`。新建 `lib/storage/app_dirs.dart` + `lib/storage/log_migration.dart`；`AndroidManifest.xml` 只加 `POST_NOTIFICATIONS`、零存储权限；新建 `lib/pages/onboarding_page.dart` 首启动引导；设置页新增「权限」分区。★ 顺手修掉一个真 bug：「清除本地缓存」原来只删旧 `systemTemp/tillroad`，日志搬走后删不到新位置的日志。校验：`flutter analyze` 0 error / 0 warning / 101 info；`flutter test` 118/118
+- ✅ **题库导出 + SAF 目录选择 + 持久化 URI（m32406）**：新增只读端点 `GET /export/questions`（**只导 `owner_user_id = 当前用户` 的题**，带 `answer`/`analysis`，不含练习记录与缺陷单）；前端新增 `lib/services/export_location.dart`（`dir_picker` + `DirPicker.persist()` 持久化 token，key `export_dir_uri`）+ `lib/services/export_service.dart`（GZip + `saf_stream` 写 SAF 目录，文件名 `tillroad-export-{userId前8位}-{YYYYMMDD-HHmmss}.tillroad`，失败四档）；题库管理页 `⋯` →「导出题库」，设置页新增「数据管理」分区。校验：`flutter analyze` 0 error / 0 warning / 100 info；`flutter test` 137/137；`npm test` 425/215/0/210；PGlite 真库 6/6
+- ✅ **题库导入预检 + 批量决策（m32773）**：新增只读端点 `POST /questions/import/preview`（**不插题、不建考点、不建批次**；只按 `content_hash` 精确判重，不做相似度）→ `{new_count, duplicate_count, duplicates:[{incoming, existing, diff}], parse_errors}`；`POST /questions/import` 支持 `decisions.duplicate_action` = `skip`（**默认，行为与之前完全一致**）/ `overwrite`（按 content_hash 覆盖题干/选项/答案/解析/难度/标签，**保留 id 与归属**，走直写 SQL 不复用 `rep.update`），响应拆成 `{imported:{new,overwritten}, duplicates:{skipped,overwritten}, duplicate_details}`；`.tillroad`（gzip 的 JSON）可导入（`extract.mjs` 按 gzip magic 判定并 `gunzipSync`）；前端改两段式（选文件 → `import_preview_page.dart` 预检并决策 → pop 回决策串再走原 `_upload`），三态进度与结果页未动。校验：新增 3 条集成用例，**PGlite 真库 23/23**；`npm test` **428 tests / 215 pass / 0 fail / 213 skipped**；`flutter analyze --no-fatal-infos` **0 error / 0 warning / 101 info**；`flutter test` **137/137**（按任务书未截图、未跑 adb）
+- ⏳ **仍待补的后端缺口**：①新增 `defect_events` 表以支持状态时间线完整历史（当前时间线只有「创建 + 当前状态」两个节点）；②CORS 的 `*` 生产前收窄为白名单；③登录体系（当前是固定 Bearer Token 映射，无注册/改密/多设备）；④前端建单后逐条 `POST /:id/actions` 的补丁**已可移除**（后端已改同事务），保留只为向后兼容；⑤Neon 冷启动时三路并发建 TLS 会偶发 `Connection closed before full header was received`（单路重试即恢复，可在 ApiClient 加一次自动重试）；⑥本地优先 R3 的增量对账尚未实现（后端需加 `updated_since` 或变更日志）；⑦R4a 的冲突只做「丢弃本地 + 以云端为准」，字段级自动仲裁与写队列的删除操作未做；⑧R4b 未做 dead 队列的 UI 管理入口（死信行只能在数据库里看），也未做删除操作的入队；⑨题库的 **AI 生成题入口**未做（手动建题与编辑删除本轮 FE-02 已做；题目本地缓存待 R5 拍板）；⑩「删除我的所有数据」只软删不物理删（数据仍在库里可恢复，合规的「彻底抹除」需物理删除与保留期策略）；⑪题目选择器的**考点筛选未做进 UI**（后端 `knowledge_node_id` 已可用且有集成测试，但页面没有该 chip）、**中文关键字未真机验证**（`adb shell input text` 对非 ASCII 直接 NPE）；⑫FE-02 未做**拍照 OCR**（需先补 BYOK 服务端密钥管理与 vision adapter）；⑬练习模式**删题已做（R3）**，但**按题目选择器组练习**、**练习记录删除入口**（`practice_sessions.deleted_at` 无端点）、**每题用时展示**（`duration_ms` 已在收但未显示）仍未做，且公共题自评的对错只存在练习记录里、不回流题库；⑭题库管理页的**物理抹除**未做（题只软删，可恢复）；⑮**「已隐藏」列表目前只能用本地快照**（后端只有 `PATCH /questions/:id/hide`，**没有 list-hidden 端点**，`GET /questions` 默认就排除隐藏题），后果是跨设备不可见、清缓存丢失、与服务端不对账 —— 正确修法是后端加 `GET /questions?hidden=true`（需改 `server/`，本轮硬约束禁止）；⑯`exam_type_custom` 没有写进本地 `exam_profiles` 表，从本地读出的卡片进编辑页时自定义类型名会回落成预设标签，需下拉走一次云端才有；⑰科目匹配是「按名字」的启发式（精确→包含），文件写简称（「公基」）而库里叫全称（「公共基础知识」）时不会命中，只能靠兜底科目 + 手动批量移动；跨多个 active 考试目标时同名科目取「名字最短」那个，不确定归属时也会归兜底；⑱`import_batches` 是**只增不删**的账本（本轮没有清理/归档机制），长期使用后下拉会越来越长 —— 需要时再加「只显示最近 N 条」或过期清理，另 `batch_id` 刻意无外键，删题不会动批次行；⑲导入批次的筛选不作用于「已删除」与「已隐藏」两档（前者走 `/questions/deleted`、后者走本机快照，接口都不带批次语义），要按批次恢复题只能先切回「全部批次」再逐题看；⑳m32036 只做了**通知权限申请**，**真正的临期提醒推送尚未实现** —— 没有本地通知调度（需 `flutter_local_notifications`，且后端需要窗口到期扫描或客户端本地计算），也没有服务端 FCM/APNs 通道；㉑m32406 的 `.tillroad` **导入已能读回**（m32773 给了 gzip 解压 + JSON 题库解析），但**跨设备完整恢复仍未做** —— 导出快照里的 `subject_id` / `knowledge_node_id` 指向原库的 uuid，在另一台设备上并不存在，所以科目与考点树不会被重建（题会落到未分类 / 空考点），要真正恢复需要按快照里的 `subjects` / `knowledge_nodes` 先建树再按名字回挂；另外 SAF 目录持久化只验了 Android，iOS 的 bookmark 分支未实机验证；㉒m32773 的**覆盖只改内容字段**，不更新 `subject_id` / `knowledge_node_id`（覆盖一道题不会把它挪到别的科目或考点），也不改 `import_batches` 的归属（被覆盖的题仍算在原批次里）；㉓预检**不做相似度判定**（硬约束），只能告诉用户「完全相同」与「不同」，无法提示「疑似同一题」；预检明细目前**全量返回**（没有分页/截断上限），超大文件（数万道重复题）时响应体会很大
 
 ---
 

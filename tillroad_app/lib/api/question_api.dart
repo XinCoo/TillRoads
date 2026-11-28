@@ -148,18 +148,38 @@ class BankQuestion {
 /// 导入结果。
 class ImportResult {
   const ImportResult({
-    required this.imported,
-    required this.duplicates,
-    required this.errors,
+    this.importedNew = 0,
+    this.importedOverwritten = 0,
+    this.duplicatesSkipped = 0,
+    this.duplicatesOverwritten = 0,
+    this.duplicates = const <ImportDuplicate>[],
+    this.errors = const <String>[],
     this.stats = const <String, Object?>{},
     this.subjectMatched = const ImportSubjectMatch(),
     this.nodeCreated = const ImportNodeCreated(),
   });
 
-  /// 成功入库的题数。
-  final int imported;
+  /// 真正**新入库**的题数（`imported.new`）。
+  final int importedNew;
 
-  /// 判重的题（已存在，没重复入库）。每条带原题干供用户核对。
+  /// 覆盖写入的题数（`imported.overwritten`，即选了 `overwrite` 后
+  /// 用文件内容更新了库里同题的条数）。
+  final int importedOverwritten;
+
+  /// 判重跳过的题数（`duplicates.skipped`，即因为库里已有而没入库的条数）。
+  final int duplicatesSkipped;
+
+  /// 判重项里被覆盖的题数（`duplicates.overwritten`）。
+  ///
+  /// 与 [importedOverwritten] 口径不同：前者是「重复题里被覆盖了多少」，
+  /// 后者是「入库动作里有多少是覆盖」，正常一次导入两者应当相等，
+  /// 分开保留是为了后端拆分统计口径时前端不必改签名。
+  final int duplicatesOverwritten;
+
+  /// 重复题的明细（新结构在 `duplicate_details`）。
+  ///
+  /// 每条带原题干（`stem`）与库里的 id（`existing_id`）供用户核对；
+  /// 旧后端这个列表明细在 `duplicates` 数组里，[fromJson] 已做兼容。
   final List<ImportDuplicate> duplicates;
 
   /// 出错的题（单题级错误）。
@@ -177,13 +197,44 @@ class ImportResult {
   /// 导入过程中自动创建的考点（`node_created`），同样是旧后端可缺失的字段。
   final ImportNodeCreated nodeCreated;
 
-  bool get isSuccess => imported > 0;
+  /// 是否有题真正动过库。
+  ///
+  /// 注意语义变了：**「全部被跳过」不算成功**（`importedNew` 与
+  /// `importedOverwritten` 都是 0），但也不能算失败 ——
+  /// 调用方要结合 [duplicatesSkipped] 判断，别把「全已存在」显示成红的。
+  bool get isSuccess => importedNew > 0 || importedOverwritten > 0;
 
   factory ImportResult.fromJson(Map<String, Object?> json) {
-    final List<Object?> rawDups = json['duplicates'] is List ? json['duplicates']! as List<Object?> : const <Object?>[];
+    // ── 旧响应结构兼容（护栏）──────────────────────────────────────────
+    // 旧后端：`imported` 是**数字**（新入库题数）、`duplicates` 是**数组**
+    //（判重明细）。新后端：`imported` 是 `{new, overwritten}`、
+    // `duplicates` 是 `{skipped, overwritten}`，明细搬到了 `duplicate_details`。
+    // 这里按「先看类型再取值」解析，两种形状都能读 —— 是为了让前端先上线、
+    // 后端灰度或回滚时页面不会因为一次 `is int` 判断写反就整页报错。
+    final Object? rawImported = json['imported'];
+    final int importedNew = rawImported is int
+        ? rawImported
+        : _int(_asMap(rawImported)['new'], 0);
+    final int importedOverwritten =
+        rawImported is int ? 0 : _int(_asMap(rawImported)['overwritten'], 0);
+
+    final Object? rawDuplicates = json['duplicates'];
+    final int duplicatesSkipped = rawDuplicates is List
+        ? rawDuplicates.length
+        : _int(_asMap(rawDuplicates)['skipped'], 0);
+    final int duplicatesOverwritten =
+        rawDuplicates is List ? 0 : _int(_asMap(rawDuplicates)['overwritten'], 0);
+
+    // 明细优先读 `duplicate_details`；旧结构就直接用 `duplicates` 数组本身。
+    final List<Object?> rawDups = json['duplicate_details'] is List
+        ? json['duplicate_details']! as List<Object?>
+        : (rawDuplicates is List ? rawDuplicates : const <Object?>[]);
     final List<Object?> rawErrors = json['errors'] is List ? json['errors']! as List<Object?> : const <Object?>[];
     return ImportResult(
-      imported: _int(json['imported'], 0),
+      importedNew: importedNew,
+      importedOverwritten: importedOverwritten,
+      duplicatesSkipped: duplicatesSkipped,
+      duplicatesOverwritten: duplicatesOverwritten,
       duplicates: rawDups
           .whereType<Map>()
           .map((Map m) => ImportDuplicate.fromJson(m.cast<String, Object?>()))
@@ -210,6 +261,134 @@ class ImportDuplicate {
     return ImportDuplicate(
       stem: _str(json['stem']),
       existingId: _str(json['existing_id']),
+    );
+  }
+}
+
+/// 导入预检结果（`POST /questions/import/preview`，不写库）。
+///
+/// 预检只回答三件事：会新进多少道、会撞上多少道重复、哪些条目根本解析不出来。
+/// 真正的导入仍走 [QuestionApi.importQuestions]，决策（跳过 / 覆盖）由用户在预检页选。
+class ImportPreviewResult {
+  const ImportPreviewResult({
+    this.newCount = 0,
+    this.duplicateCount = 0,
+    this.duplicates = const <ImportPreviewDuplicate>[],
+    this.parseErrors = const <String>[],
+  });
+
+  /// 会新入库的题数（`new_count`）。
+  final int newCount;
+
+  /// 与库里已有题重复的条数（`duplicate_count`，含「同一文件内互相重复」）。
+  final int duplicateCount;
+
+  /// 重复题明细（`duplicates`），供用户逐条核对题干与差异。
+  final List<ImportPreviewDuplicate> duplicates;
+
+  /// 解析失败的条目说明（`parse_errors[].message`）。
+  ///
+  /// 这些条目**不会被导入**，所以要逐条告诉用户是哪一条、为什么。
+  final List<String> parseErrors;
+
+  bool get hasDuplicates => duplicateCount > 0;
+
+  /// 文件里一道可用的题都没有（既没有新题、也没有重复题）。
+  bool get isEmptyFile => newCount == 0 && duplicateCount == 0;
+
+  factory ImportPreviewResult.fromJson(Map<String, Object?> json) {
+    final List<Object?> rawDuplicates =
+        json['duplicates'] is List ? json['duplicates']! as List<Object?> : const <Object?>[];
+    final List<Object?> rawErrors =
+        json['parse_errors'] is List ? json['parse_errors']! as List<Object?> : const <Object?>[];
+    return ImportPreviewResult(
+      newCount: _int(json['new_count'], 0),
+      duplicateCount: _int(json['duplicate_count'], 0),
+      duplicates: rawDuplicates
+          .whereType<Map>()
+          .map((Map m) => ImportPreviewDuplicate.fromJson(m.cast<String, Object?>()))
+          .toList(growable: false),
+      // `parse_errors` 是 `[{message}]`，只取 message（可能为空白，过滤掉）。
+      parseErrors: rawErrors
+          .map((Object? e) => e is Map ? _str(e['message']).trim() : '$e'.trim())
+          .where((String e) => e.isNotEmpty)
+          .toList(growable: false),
+    );
+  }
+}
+
+/// 预检里的一条重复题。
+///
+/// 注意 [existingId] 可能为 null：同一份文件内部前后重复、而库里还没有这道题时，
+/// 后端给不出「已存在的那道题」，界面上要按「文件内重复」呈现。
+class ImportPreviewDuplicate {
+  const ImportPreviewDuplicate({
+    this.incomingStem = '',
+    this.incomingType = '',
+    this.contentHash = '',
+    this.existingId,
+    this.existingStem,
+    this.existingCreatedAt,
+    this.diff = const <String>[],
+  });
+
+  /// 文件里那道题的题干（后端可能已截断）。
+  final String incomingStem;
+
+  /// 文件里那道题的题型（原始值，如 `choice`）。
+  final String incomingType;
+
+  /// 判重用的内容指纹。
+  final String contentHash;
+
+  /// 库里已存在的那道题的 id（文件内重复且库里没有时为 null）。
+  final String? existingId;
+
+  /// 库里已存在的那道题的题干。
+  final String? existingStem;
+
+  /// 库里那道题的入库时间。
+  final DateTime? existingCreatedAt;
+
+  /// 差异说明（中文短语，如 `answer 不同`）；空数组 = 内容一致。
+  final List<String> diff;
+
+  /// 库里是否真的有这道题（false = 只跟文件里的另一道重复）。
+  bool get hasExisting {
+    final String? id = existingId;
+    return id != null && id.trim().isNotEmpty;
+  }
+
+  /// 列表里显示的题干（前 30 个字符，超出加省略号）。
+  String get shortIncomingStem {
+    final String stem = incomingStem.trim();
+    if (stem.length <= 30) return stem;
+    return '${stem.substring(0, 30)}…';
+  }
+
+  /// 差异摘要（空数组时回「内容相同」）。
+  String get diffLabel => diff.isEmpty ? '内容相同' : diff.join('、');
+
+  /// 题型展示名（复用全局口径）。
+  String get incomingTypeLabel => questionTypeLabel(incomingType);
+
+  factory ImportPreviewDuplicate.fromJson(Map<String, Object?> json) {
+    final Map<String, Object?> incoming = _asMap(json['incoming']);
+    // `existing` 可能显式为 null —— 这时整段按「库里没有」处理。
+    final Map<String, Object?> existing = _asMap(json['existing']);
+    return ImportPreviewDuplicate(
+      incomingStem: _str(incoming['stem']),
+      incomingType: _str(incoming['type']),
+      contentHash: _str(incoming['content_hash']),
+      existingId: _strOrNull(existing['id']),
+      existingStem: _strOrNull(existing['stem']),
+      existingCreatedAt: _dateOrNull(existing['created_at']),
+      diff: json['diff'] is List
+          ? (json['diff']! as List<Object?>)
+              .map((Object? e) => _str(e).trim())
+              .where((String e) => e.isNotEmpty)
+              .toList(growable: false)
+          : const <String>[],
     );
   }
 }
@@ -582,7 +761,8 @@ class QuestionApi {
   /// 导入：`POST /questions/import`。
   ///
   /// [contentBase64] 是文件内容的 base64（JSON 传输，不走 multipart）。
-  /// 后端返回 `{imported, duplicates, errors, stats}`。
+  /// 新契约响应：`{imported:{new,overwritten}, duplicates:{skipped,overwritten},
+  /// duplicate_details, errors, stats, ...}` —— 旧形状由 [ImportResult.fromJson] 兼容。
   Future<ImportResult> importQuestions({
     required String filename,
     required String contentBase64,
@@ -593,18 +773,48 @@ class QuestionApi {
     /// subject_id 降级为匹配失败时的兜底科目）或 `uniform`
     /// （现有行为：全部题进 subject_id，缺省）。
     String subjectMode = 'uniform',
+    /// 判重决策：`skip`（缺省，跳过重复题，与旧行为一致）
+    /// 或 `overwrite`（用文件里的内容覆盖库里同题）。
+    String duplicateAction = 'skip',
   }) async {
-    final Map<String, Object?> body = <String, Object?>{
-      'filename': filename,
-      'content_base64': contentBase64,
-      if (mime != null && mime.isNotEmpty) 'mime': mime,
-      if (subjectId != null && subjectId.isNotEmpty) 'subject_id': subjectId,
-      if (knowledgeNodeId != null && knowledgeNodeId.isNotEmpty) 'knowledge_node_id': knowledgeNodeId,
-      if (subjectMode.isNotEmpty) 'subject_mode': subjectMode,
-    };
+    final Map<String, Object?> body = _importBody(
+      filename: filename,
+      contentBase64: contentBase64,
+      mime: mime,
+      subjectId: subjectId,
+      knowledgeNodeId: knowledgeNodeId,
+      subjectMode: subjectMode,
+    );
+    // 判重决策**无条件**带上：缺省 `skip` 与旧行为完全一致；
+    // 后端按 `decisions.duplicate_action` 分流（字段缺失也当 skip）。
+    body['decisions'] = <String, Object?>{'duplicate_action': duplicateAction};
     final Object? raw = await _client.post('/questions/import', body: body);
     if (raw is! Map) throw ApiException('导入响应不是 JSON 对象', body: raw);
     return ImportResult.fromJson(raw.cast<String, Object?>());
+  }
+  /// 导入预检：`POST /questions/import/preview`（不写库）。
+  ///
+  /// 请求体与 [importQuestions] **完全相同** —— 两者共用 [_importBody] 构造，
+  /// 避免以后补字段时只改了一边、预检与真正导入的口径悄悄漂移。
+  Future<ImportPreviewResult> previewImport({
+    required String filename,
+    required String contentBase64,
+    String? mime,
+    String? subjectId,
+    String? knowledgeNodeId,
+    String subjectMode = 'uniform',
+  }) async {
+    final Map<String, Object?> body = _importBody(
+      filename: filename,
+      contentBase64: contentBase64,
+      mime: mime,
+      subjectId: subjectId,
+      knowledgeNodeId: knowledgeNodeId,
+      subjectMode: subjectMode,
+    );
+    final Object? raw = await _client.post('/questions/import/preview', body: body);
+    if (raw is! Map) throw ApiException('预检响应不是 JSON 对象', body: raw);
+    return ImportPreviewResult.fromJson(raw.cast<String, Object?>());
   }
   /// 单题详情（m23700 FE-02）。
   ///
@@ -959,6 +1169,29 @@ List<String> _stringList(Object? v) {
     }
   }
   return out;
+}
+
+/// 导入类端点（`/questions/import` 与 `/questions/import/preview`）的公共请求体。
+///
+/// 两个端点收的字段**完全一致**，抽成一处是为了防止两处漂移：
+/// 以后新增字段（比如新的 `subject_mode` 取值）只改这里，两条路径同时生效。
+Map<String, Object?> _importBody({
+  required String filename,
+  required String contentBase64,
+  String? mime,
+  String? subjectId,
+  String? knowledgeNodeId,
+  String subjectMode = 'uniform',
+}) {
+  return <String, Object?>{
+    'filename': filename,
+    'content_base64': contentBase64,
+    if (mime != null && mime.isNotEmpty) 'mime': mime,
+    if (subjectId != null && subjectId.isNotEmpty) 'subject_id': subjectId,
+    if (knowledgeNodeId != null && knowledgeNodeId.isNotEmpty)
+      'knowledge_node_id': knowledgeNodeId,
+    if (subjectMode.isNotEmpty) 'subject_mode': subjectMode,
+  };
 }
 
 /// base64 编码（导入端点只走 JSON + base64，不走 multipart）。

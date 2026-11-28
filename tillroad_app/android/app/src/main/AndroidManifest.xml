@@ -4,6 +4,13 @@
          main 里没有 → release APK 一联网就 SocketException: Failed host lookup
          （Android 在无 INTERNET 权限时把 DNS 解析直接判失败，报 errno = 7）。 -->
     <uses-permission android:name="android.permission.INTERNET"/>
+    <!-- m32036：Android 13+（API 33）把通知也变成了运行时权限。
+         不声明则 Permission.notification.request() 直接返回 denied，什么也不弹；
+         声明后仍必须由用户在系统弹窗里点允许（引导页负责申请）。
+         ★ 刻意不申请任何存储权限：私有目录用 getExternalStorageDirectory()
+         （App 专属外部目录，属 scoped storage，无需 READ/WRITE_EXTERNAL_STORAGE）；
+         导出目录将来走 SAF（用户自己选位置），同样不需要声明存储权限。 -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
     <application
         android:label="题路"
         android:name="${applicationName}"

@@ -37,7 +37,7 @@ import '../api/question_api.dart';
 import '../config/api_config.dart';
 import '../theme/app_theme.dart';
 import '../widgets/common.dart' show SectionHeader;
-
+import 'import_preview_page.dart';
 /// 后端限制：单文件最大 10MB。
 const int kMaxImportBytes = 10 * 1024 * 1024;
 
@@ -62,6 +62,9 @@ const List<String> kSupportedExtensions = <String>[
   'csv',
   'pdf',
   'xlsx',
+  // 题库导出包（.tillroad）：导出与导入同源，后端 extract.mjs 按扩展名
+  // 就能直接还原成题目，所以前端也要能选它。
+  'tillroad',
 ];
 
 /// 科目归属模式（与后端 `POST /questions/import` 的 `subject_mode` 同值）。
@@ -263,7 +266,86 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
     }
   }
 
-  Future<void> _upload() async {
+  /// 预检 → 用户决策 → 真正导入（m23700 题库导入预检）。
+  ///
+  /// 改造点：选好文件后**不再直接上传**，先 push `ImportPreviewPage`
+  /// 让用户看清「会新进几道、撞上几道重复、哪些条目解析不出来」，
+  /// 再由用户决定重复题是「全部跳过」还是「全部覆盖」。
+  ///
+  /// 预检页 pop 回来的是决策字符串（`skip` / `overwrite`），
+  /// **null 表示用户取消**（什么都不做）。
+  ///
+  /// 真正的导入仍走 [_upload]，所以原有的三态进度（encoding → processing
+  /// → done）与 `_buildResult` 结果页一条都没动 —— 改动面最小。
+  Future<void> _openPreview() async {
+    final PlatformFile? file = _file;
+    if (file == null) {
+      setState(() => _error = '请先选择要导入的文件。');
+      return;
+    }
+    final String? subjectId = _subjectId;
+    // uniform 模式必须有科目（否则后端没有归属可写）；from_file 模式
+    // 允许不选（文件里没写科目名时后端会记到未分类）。
+    if (!_isFromFile && (subjectId == null || subjectId.isEmpty)) {
+      setState(() => _error = '请选择题目所属的科目。');
+      return;
+    }
+
+    // 预检本身也要把文件内容发上去，所以先编码一次；编好的 base64 原样
+    // 传给后面的真正导入，避免同一份文件编码两遍（10MB 的文件要好几秒）。
+    setState(() {
+      _uploading = true;
+      _error = null;
+      _result = null;
+      _stage = ImportStage.encoding;
+    });
+    String base64;
+    try {
+      base64 = await _readBase64(file);
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _error = '文件内容读取失败：$e';
+        _uploading = false;
+        _stage = null;
+      });
+      return;
+    }
+    if (!mounted) return;
+    // 编码阶段结束：接下来是预检页自己的加载态，本页进度条先收起。
+    setState(() {
+      _uploading = false;
+      _stage = null;
+    });
+
+    final String? decision = await Navigator.of(context).push<String>(
+      appRoute<String>(
+        context,
+        ImportPreviewPage(
+          filename: file.name,
+          contentBase64: base64,
+          mime: _mimeOf(file.name),
+          subjectId: subjectId,
+          // from_file 模式下考点由文件里的 node 决定，不再传界面选的考点。
+          knowledgeNodeId: _isFromFile ? null : _knowledgeNodeId,
+          subjectMode: _subjectMode,
+          fileBytes: _fileBytes,
+        ),
+      ),
+    );
+    if (!mounted || decision == null) return;
+    // 决策带回来了（skip / overwrite）—— 交给原有的导入流程干活。
+    await _upload(duplicateAction: decision, contentBase64: base64);
+  }
+
+  Future<void> _upload({
+    /// 判重决策（预检页带回）：`skip` 跳过重复题（旧行为默认），
+    /// `overwrite` 用文件里的内容覆盖库里同题。
+    String duplicateAction = 'skip',
+    /// 已经编码好的文件内容。预检阶段编过一次就复用，
+    /// 为 null 时（老路径）现读现编。
+    String? contentBase64,
+  }) async {
     final PlatformFile? file = _file;
     if (file == null) {
       setState(() => _error = '请先选择要导入的文件。');
@@ -286,7 +368,7 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
     });
 
     try {
-      final String base64 = await _readBase64(file);
+      final String base64 = contentBase64 ?? await _readBase64(file);
       if (!mounted) return;
       // 字节已读完、请求即将发出：后面都是服务端的时间。
       setState(() => _stage = ImportStage.processing);
@@ -298,6 +380,8 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
         subjectId: subjectId,
         // from_file 模式下考点由文件里的 node 决定，不再传界面选的考点。
         knowledgeNodeId: _isFromFile ? null : _knowledgeNodeId,
+        // 预检页里选的决策：skip / overwrite。
+        duplicateAction: duplicateAction,
       );
       if (!mounted) return;
       setState(() {
@@ -375,6 +459,8 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
     if (lower.endsWith('.xlsx')) {
       return 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
     }
+    // 题库导出包（.tillroad）：后端按扩展名识别，没有注册 MIME，
+    // 落到下面默认的 octet-stream 即可。
     return 'application/octet-stream';
   }
 
@@ -620,7 +706,7 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
           // uniform 模式仍需要科目。
           onPressed: (_uploading || file == null || (!_isFromFile && subjectId == null))
               ? null
-              : _upload,
+              : _openPreview,
           child: _uploading
               ? const CupertinoActivityIndicator(color: CupertinoColors.white)
               : const Text(
@@ -641,7 +727,13 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
   }
 
   Widget _buildResult(ImportResult result) {
-    final bool anySuccess = result.imported > 0;
+    // 真正动过库才算「成功」（新增或覆盖）。
+    final bool anySuccess = result.isSuccess;
+    // 但「全部被跳过」不是失败：库里本来就有这些题，用户看得懂，
+    // 不能显示成红的「失败」，要明确告诉他「没有新题入库（全部已存在）」。
+    final bool allSkipped = result.importedNew == 0 &&
+        result.importedOverwritten == 0 &&
+        result.duplicatesSkipped > 0;
     // ★ A2②：题型识别统计。这三个值旧后端可能不返回 ——
     // 缺失就整块不显示（显示 0 会让人误以为「一道都没识别出来」）。
     final int? detected = _statInt(result, 'type_detected');
@@ -667,7 +759,9 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
         ),
         const SizedBox(height: 12),
         Text(
-          anySuccess ? '导入完成' : '没有新题入库',
+          anySuccess
+              ? '导入完成'
+              : (allSkipped ? '没有新题入库（全部已存在）' : '没有新题入库'),
           textAlign: TextAlign.center,
           style: const TextStyle(
             fontFamily: kFontFamily,
@@ -680,10 +774,16 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
         _CardBox(
           child: Column(
             children: <Widget>[
-              _ResultRow(label: '新增题目', value: '${result.imported}'),
+              _ResultRow(label: '新增题目', value: '${result.importedNew}'),
+              // 「已覆盖」即使为 0 也显示：保持行位稳定，用户不会因为
+              // 某次少一行而以为界面变了。
               _ResultRow(
-                label: '已存在（判重）',
-                value: '${result.duplicates.length}',
+                label: '已覆盖',
+                value: '${result.importedOverwritten}',
+              ),
+              _ResultRow(
+                label: '已存在（跳过）',
+                value: '${result.duplicatesSkipped}',
               ),
               _ResultRow(label: '解析失败', value: '${result.errors.length}'),
             ],
@@ -803,7 +903,11 @@ class _QuestionImportPageState extends State<QuestionImportPage> {
         ],
         if (result.duplicates.isNotEmpty) ...<Widget>[
           const SizedBox(height: 16),
-          const SectionHeader(text: '已存在的题（未重复入库）'),
+          SectionHeader(
+            text: result.duplicatesOverwritten > 0
+                ? '重复的题（已覆盖）'
+                : '已存在的题（未重复入库）',
+          ),
           _CardBox(
             child: Column(
               children: <Widget>[

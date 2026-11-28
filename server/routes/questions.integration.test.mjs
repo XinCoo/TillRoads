@@ -188,8 +188,8 @@ test('m17431：用户 A 导入的题 owner_user_id = A', skipOpt, async () => {
   const body = fileBody('sample-01-markdown.md', { subject_id: seed.subjectA });
   const r = await req('POST', '/questions/import', body, TOKEN_A);
   assert.equal(r.status, 200, JSON.stringify(r.data));
-  assert.equal(r.data.imported, 12, `A 应导入 12 题，实际 ${r.data.imported}`);
-  assert.equal(r.data.duplicates.length, 0, 'A 首次导入不应有重复');
+  assert.equal(r.data.imported.new, 12, `A 应导入 12 题，实际 ${r.data.imported.new}`);
+  assert.equal(r.data.duplicates.skipped, 0, 'A 首次导入不应有重复');
 
   const c = await pool.connect();
   try {
@@ -213,8 +213,8 @@ test('m17431：用户 B 导入同样 3 题不判重（owner 维度隔离）', sk
   const body = fileBody('sample-01-markdown.md', { subject_id: seed.subjectB });
   const r = await req('POST', '/questions/import', body, TOKEN_B);
   assert.equal(r.status, 200, JSON.stringify(r.data));
-  assert.equal(r.data.imported, 12, `B 应导入 12 题（与 A 同内容但不同 owner），实际 ${r.data.imported}`);
-  assert.equal(r.data.duplicates.length, 0, 'B 不该被判重');
+  assert.equal(r.data.imported.new, 12, `B 应导入 12 题（与 A 同内容但不同 owner），实际 ${r.data.imported.new}`);
+  assert.equal(r.data.duplicates.skipped, 0, 'B 不该被判重');
 
   const c = await pool.connect();
   try {
@@ -247,8 +247,8 @@ test('m17431：用户 A 二次导入同样内容判重（duplicates = 12）', sk
   const body = fileBody('sample-01-markdown.md', { subject_id: seed.subjectA });
   const r = await req('POST', '/questions/import', body, TOKEN_A);
   assert.equal(r.status, 200, JSON.stringify(r.data));
-  assert.equal(r.data.imported, 0, 'A 二次导入不应新增');
-  assert.equal(r.data.duplicates.length, 12, 'A 二次导入应全部判重');
+  assert.equal(r.data.imported.new, 0, 'A 二次导入不应新增');
+  assert.equal(r.data.duplicates.skipped, 12, 'A 二次导入应全部判重');
 });
 
 // ---------------------------------------------------------------------------

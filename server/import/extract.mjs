@@ -14,6 +14,9 @@
 //   为什么扫描版用 422 而不是 400：请求本身合法（是一份真 PDF），只是服务端
 //   当前能力不支持这种内容 —— 422 的语义正是「理解请求但无法处理」。
 
+// ★ m32773：.tillroad 是 gzip 压缩的 JSON，导入时要解压。
+//   用 node 内置 zlib，不引第三方解压库。
+import { gunzipSync } from 'node:zlib';
 import { readXlsxText } from './xlsx.mjs';
 
 /** 拍板项 1 的硬上限。集中一处，避免散落在 handler 里各写一遍。 */
@@ -57,6 +60,10 @@ const EXT_KINDS = Object.freeze({
   '.webp': 'image',
   '.heic': 'image',
   '.json': 'json',
+  // ★ m32773：题库导出文件（JSON + gzip）。扩展名与 mime 都可能缺失
+  //   （Android 上用户从「下载」里选，系统常给 application/octet-stream），
+  //   所以 detectKind 靠扩展名就能认出来；真正的 gzip 解压看字节头。
+  '.tillroad': 'json',
 });
 /**
  * 构造带 HTTP 语义的导入错误。
@@ -198,7 +205,7 @@ export async function extractText(file = {}) {
     throw importError(
       'UNSUPPORTED_MEDIA',
       415,
-      '不支持的文件类型，请上传 Markdown / TXT / CSV / 文字版 PDF / XLSX / JSON',
+      '不支持的文件类型，请上传 Markdown / TXT / CSV / 文字版 PDF / XLSX / JSON / .tillroad',
       { mime: file.mime || null, filename: file.filename || null },
     );
   }
@@ -210,11 +217,28 @@ export async function extractText(file = {}) {
     case 'markdown':
     case 'text':
     case 'csv':
-    case 'json':
-      // JSON 与文本类一样直接转 utf8，"JSON 长什么样" 交给 json_import.mjs 解析。
-      // 这里不 JSON.parse：抽取阶段只管「字节 → 文本」，解析失败在切题阶段报。
-      text = Buffer.from(buffer).toString('utf8');
+    case 'json': {
+      // ★ m32773：.tillroad 是 gzip 后的 JSON（导出端压缩，导入端解压）。
+      //   不看扩展名、只看字节头：`0x1f 0x8b` 是 gzip magic。这样即使
+      //   用户把 .tillroad 改名成 .json（或反过来）也能正确解。
+      //   解压后仍然只交给 utf8 → json_import.mjs 解析，抽取层不做 JSON.parse。
+      const raw = Buffer.from(buffer);
+      const isGzip = raw.length >= 2 && raw[0] === 0x1f && raw[1] === 0x8b;
+      if (isGzip) {
+        try {
+          text = gunzipSync(raw).toString('utf8');
+        } catch (err) {
+          throw importError('INVALID_GZIP', 422, '题库文件解压失败，可能不是 .tillroad 导出文件或文件已损坏', {
+            reason: err && err.message ? String(err.message).slice(0, 200) : 'gunzip_failed',
+          });
+        }
+      } else {
+        // JSON 与文本类一样直接转 utf8，"JSON 长什么样" 交给 json_import.mjs 解析。
+        // 这里不 JSON.parse：抽取阶段只管「字节 → 文本」，解析失败在切题阶段报。
+        text = raw.toString('utf8');
+      }
       break;
+    }
     case 'pdf': {
       const out = await extractPdfText(buffer);
       text = out.text;

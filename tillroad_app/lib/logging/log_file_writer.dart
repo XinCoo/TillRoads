@@ -3,18 +3,20 @@
 // 为什么用 `dart:io` 手写而不引包：
 //   ① 硬约束：不引 logger/ansicolor/logging 一类的第三方日志库；
 //   ② 需求只有「追加一行 + 定期清理」两件事，`RandomAccessFile` 足够。
-//
-// 目录选择：**不引 path_provider**（它虽然是 share_plus 的传递依赖，但直接 import
-// 一个未在 pubspec 声明的包是隐患，会在某次依赖收敛时突然编译失败）。
-// 因此用 `Directory.systemTemp`：在 Flutter Android 上它是应用私有缓存目录
-// （`/data/user/0/<包名>/cache`），写入无需任何权限；代价是系统在存储吃紧时可能
-// 清掉整个缓存目录 —— 对「供用户导出最近几天日志」这个用途可以接受，
-// 真正需要长期留存时应改为上报服务端（已列入遗留项）。
+// 目录选择（m32036 起）：由 `lib/storage/app_dirs.dart` 统一决策 ——
+//   1. `getExternalStorageDirectory()/TillRoad/logs`（应用专属外部目录，无需权限）
+//   2. `getApplicationDocumentsDirectory()/TillRoad/logs`（回落）
+//   3. `<当前工作目录>/logs`（仅桌面调试的兑底，手机上走不到）
+// 历史包袱：旧版本用的是 `Directory.systemTemp/tillroad/logs`（Android 上就是
+// `/data/user/0/<包名>/cache/tillroad/logs`）。那个目录会被系统在存储吃紧时整个清掉，
+// 所以搬出来了；老的 `.log` 由 `lib/storage/log_migration.dart` 一次性迁过来。
 //
 // 落盘策略：**串行队列**。每次 append 只是把 Future 串到队尾，调用方永不等待磁盘。
 // 这样既保证同一文件的写入顺序，也保证并发记日志不会把两行写串。
 
 import 'dart:io';
+
+import '../storage/app_dirs.dart';
 
 /// 日志保留天数（含当天）。
 const int kLogRetentionDays = 3;
@@ -47,15 +49,16 @@ class LogFileWriter {
 
   /// 打开（或创建）日志目录。
   ///
-  /// 候选目录按顺序尝试，第一个能写 `probe` 文件的胜出：
-  ///   1. `<systemTemp>/tillroad/logs` —— Android 上是应用私有缓存目录；
-  ///   2. `<current>/logs` —— 桌面端调试时更直观。
+  /// m32036 起目录由 [AppDirs.logs] 决定（外部私有目录 → 文档目录），
+  /// 本方法只负责「拿目录 + 建 writer + 首轮清理」。
   ///
-  /// 全部失败时抛异常，由 `AppLogger.init` 捕获并降级为纯内存日志。
+  /// 兑底：手机上两个 path_provider 候选都不可用时（极少），
+  /// 再试一次 `<当前工作目录>/logs`（桌面调试友好）；全部失败则抛异常，
+  /// 由 `AppLogger.init` 捕获并降级为纯内存日志。
   static Future<LogFileWriter> open() async {
+    final Directory? appDir = await AppDirs.logs();
     final List<Directory> candidates = <Directory>[
-      Directory('${Directory.systemTemp.path}${Platform.pathSeparator}tillroad'
-          '${Platform.pathSeparator}logs'),
+      if (appDir != null) appDir,
       Directory('${Directory.current.path}${Platform.pathSeparator}logs'),
     ];
 
@@ -65,7 +68,7 @@ class LogFileWriter {
         if (!dir.existsSync()) {
           await dir.create(recursive: true);
         }
-        // 真写一次探针：某些目录能创建但不可写（只读挂载），必须实测。
+        // 真写一次探针：某些目录能创建但不可写（只读挂载 / 被清理工具锁住），必须实测。
         final File probe = File(
           '${dir.path}${Platform.pathSeparator}.write-probe',
         );

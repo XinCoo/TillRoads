@@ -17,9 +17,12 @@
 //   · 「清除所有数据」= shared_preferences 全清（含 Token）+ 上面全部缓存，
 //     然后把 Token 输入页推到根导航栈顶。
 
-import 'dart:io' show Directory, FileSystemEntity, Platform;
+import 'dart:async' show unawaited;
+import 'dart:io' show Directory;
 
 import 'package:flutter/cupertino.dart';
+import 'package:flutter/services.dart' show Clipboard, ClipboardData;
+import 'package:permission_handler/permission_handler.dart';
 import 'package:share_plus/share_plus.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -28,8 +31,18 @@ import '../config/api_config.dart';
 import '../config/app_info.dart';
 import '../logging/app_logger.dart';
 import '../logging/log_export.dart';
+import '../storage/app_dirs.dart';
 import '../theme/app_theme.dart';
-import '../utils/session.dart' show SwitchTokenResult, switchApiToken;
+import '../services/export_location.dart'
+    show ExportLocation, ExportPickResult;
+import '../services/export_service.dart'
+    show
+        ExportException,
+        ExportFailureKind,
+        ExportResult,
+        ExportService;
+import '../utils/session.dart'
+    show SwitchTokenResult, purgeCacheDirectories, switchApiToken;
 import '../widgets/diagnose_dialog.dart';
 import '../widgets/log_export_sheet.dart' show kLogExportIcon, kLogExportLabel;
 import '../widgets/toast_overlay.dart';
@@ -63,7 +76,35 @@ class _SettingsPageState extends State<SettingsPage> {
 
   /// 云端删除进行中 —— 避免重复点、也让列表项可以置灰。
   bool _deleting = false;
+
+  /// 通知权限状态。`null` = 还没读出来（首帧显示「检查中…」）。
+  ///
+  /// 用 `PermissionStatus` 而不是自定义枚举：`permission_handler` 的枚举已经
+  /// 区分了 granted / denied / permanentlyDenied / restricted / limited，
+  /// 自己再包一层只会把信息丢掉。
+  PermissionStatus? _notifStatus;
+
+  /// 日志目录路径（不在 build 里重复调 `AppDirs.logs()`，进页面读一次）。
+  String _logDirLabel = '（尚未就绪）';
+
+  /// ★ m32406：导出位置的展示名（未选时为「未设置，导出时选择」）。
+  ///
+  /// 存展示串而不是 token：设置页只负责「显示 + 更换」，token 的持久化读写
+  /// 全在 `ExportLocation` 里，这里不该持有凭证类数据。
+  String _exportDirLabel = '未设置，导出时选择';
+
+  /// ★ m32406：导出进行中（防止连点重复弹 SAF 选择器 / 重复请求）。
+  bool _exporting = false;
+
   @override
+  void initState() {
+    super.initState();
+    // m32036：权限状态每次进页面重读 —— 用户可能刚从系统设置里改完再回来。
+    unawaited(_loadPermissionState());
+    unawaited(_loadLogDir());
+    unawaited(_loadExportDir());
+  }
+
   Widget build(BuildContext context) {
     return CupertinoPageScaffold(
       backgroundColor: AppColors.groupedBackground,
@@ -89,7 +130,11 @@ class _SettingsPageState extends State<SettingsPage> {
                   _buildConnectionSection(),
                   _buildLogSection(),
                   _buildAccountSection(),
+                  // ★ m32406：数据管理（导出题库 + 导出位置）放在危险操作之前 ——
+                  // 「导出」是保管手段，「删除」才是风险项，两者相邻但轻重不同。
+                  _buildDataSection(),
                   _buildDangerSection(),
+                  _buildPermissionSection(),
                   _buildAboutSection(),
                 ],
               ),
@@ -263,6 +308,149 @@ class _SettingsPageState extends State<SettingsPage> {
           ),
           // 删除进行中时置灰，避免重复提交（云端要跑 9 条 UPDATE）。
           onTap: _deleting ? null : _deleteAllData,
+        ),
+      ],
+    );
+  }
+
+  /// 「权限」分区（m32036 任务 E）。
+  ///
+  /// 两条设计取舍：
+  ///   ① **不在这里 request()**：任务书 E2 明确「不重复申请」。Android 上反复
+  ///      request 会被系统永久拒绝（permanentlyDenied），以后连对话框都不弹，
+  ///      反而把用户彻底锁在无权限状态。所以这里只展示状态 + 跳系统设置。
+  ///   ② **日志位置不给「打开目录」只给「复制路径」**：直接打开文件管理器
+  ///      需要 `open_filex` 之类的额外依赖（本轮禁止），而且 Android 10+ 对
+  ///      路径的访问限制很多；复制路径后用户可自己粘到文件管理器/发给客服。
+  Widget _buildPermissionSection() {
+    final PermissionStatus? status = _notifStatus;
+    final String statusLabel = switch (status) {
+      null => '检查中…',
+      PermissionStatus.granted ||
+      PermissionStatus.limited ||
+      PermissionStatus.provisional =>
+        '已开启',
+      PermissionStatus.permanentlyDenied => '已拒绝（需去系统设置）',
+      PermissionStatus.restricted => '受系统限制',
+      _ => '已拒绝',
+    };
+    final bool granted = status == PermissionStatus.granted ||
+        status == PermissionStatus.limited ||
+        status == PermissionStatus.provisional;
+    return CupertinoListSection.insetGrouped(
+      header: _sectionHeader('权限'),
+      backgroundColor: AppColors.groupedBackground,
+      separatorColor: AppColors.separator,
+      children: <Widget>[
+        CupertinoListTile(
+          leading: Icon(
+            granted
+                ? CupertinoIcons.bell_fill
+                : CupertinoIcons.bell_slash,
+            color: granted ? AppColors.normal : AppColors.secondaryLabel,
+          ),
+          title: const Text('通知权限'),
+          subtitle: Text(
+            statusLabel,
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 12,
+              color: granted ? AppColors.normal : AppColors.secondaryLabel,
+            ),
+          ),
+          trailing: const CupertinoListTileChevron(),
+          // 不 request，只跳系统设置 —— 系统设置里用户可以自己改，
+          // 改完回到本页时 initState 已经读过一次，但用户往往只 pop 回来，
+          // 所以这里用 `_openSystemSettings` 里带一次重读。
+          onTap: _openSystemSettings,
+        ),
+        CupertinoListTile(
+          leading: const Icon(
+            CupertinoIcons.folder,
+            color: AppColors.accent,
+          ),
+          title: const Text('日志位置'),
+          subtitle: Text(
+            _logDirLabel,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 12,
+              color: AppColors.secondaryLabel,
+            ),
+          ),
+          trailing: const CupertinoListTileChevron(),
+          onTap: _copyLogDir,
+        ),
+      ],
+    );
+  }
+  /// 「数据管理」分区（m32406 任务 D3）。
+  ///
+  /// 两条：①「导出题库」快捷入口（与题库管理页右上角「⋯ → 导出题库」同一条链路）；
+  /// ②「导出位置」显示当前目录友好名 + 「更换」按钮（调 pickAndSaveDirectory）。
+  ///
+  /// 没选过目录时 subtitle 显示「未设置，导出时选择」而不是空白 —— 空白会让用户
+  /// 以为功能坏了，而不是「还没选」。
+  Widget _buildDataSection() {
+    final bool hasDir = _exportDirLabel != '未设置，导出时选择';
+    return CupertinoListSection.insetGrouped(
+      header: _sectionHeader('数据管理'),
+      backgroundColor: AppColors.groupedBackground,
+      separatorColor: AppColors.separator,
+      children: <Widget>[
+        CupertinoListTile(
+          leading: const Icon(
+            CupertinoIcons.arrow_up_doc,
+            color: AppColors.accent,
+          ),
+          title: const Text('导出题库'),
+          subtitle: const Text(
+            '存成 .tillroad 压缩文件（不包含练习记录与缺陷单）',
+            style: TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 12,
+              color: AppColors.secondaryLabel,
+            ),
+          ),
+          // 导出中置灰，同时把 subtitle 换成进度文案式的提示（不改变布局高度）。
+          trailing: _exporting
+              ? const CupertinoActivityIndicator(radius: 7)
+              : const CupertinoListTileChevron(),
+          onTap: _exporting ? null : _exportQuestions,
+        ),
+        CupertinoListTile(
+          leading: const Icon(
+            CupertinoIcons.folder_badge_plus,
+            color: AppColors.accent,
+          ),
+          title: const Text('导出位置'),
+          subtitle: Text(
+            _exportDirLabel,
+            maxLines: 2,
+            overflow: TextOverflow.ellipsis,
+            style: const TextStyle(
+              fontFamily: kFontFamily,
+              fontSize: 12,
+              color: AppColors.secondaryLabel,
+            ),
+          ),
+          // 只给「更换」不给「清除」：Android 上遗留一个未使用的持久化 URI
+          // 会占 128 个名额中的一个，而「更换」内部已经 release 旧 token 了。
+          trailing: CupertinoButton(
+            padding: EdgeInsets.zero,
+            minimumSize: const Size(36, 36),
+            onPressed: _exporting ? null : _changeExportDir,
+            child: Text(
+              hasDir ? '更换' : '选择',
+              style: const TextStyle(
+                fontFamily: kFontFamily,
+                fontSize: 15,
+                color: AppColors.accent,
+              ),
+            ),
+          ),
         ),
       ],
     );
@@ -544,30 +732,149 @@ class _SettingsPageState extends State<SettingsPage> {
 
   // ------------------------------------------------------------ 清理实现细节
 
-  /// 删掉 `tillroad/export`（日志导出的落盘目录）下的文件。
+  /// 清掉缓存目录（导出临时文件 + 日志/数据目录）。
   ///
-  /// `AppLogger.instance.clearAll()` 只清 `tillroad/logs`，导出目录不归它管，
-  /// 所以缓存清理要单独收一遍，否则「清缓存」之后导出文件还在。
-  Future<int> _purgeCacheDirectories() async {
-    final String sep = Platform.pathSeparator;
-    final Directory exportDir = Directory(
-      '${Directory.systemTemp.path}${sep}tillroad${sep}export',
-    );
-    int removed = 0;
-    if (!exportDir.existsSync()) return removed;
+  /// m32036 起这里**不再自己拼路径**，而是委托给 `utils/session.dart` 的
+  /// `purgeCacheDirectories()`：那个函数同时覆盖旧 `systemTemp/tillroad`
+  /// （升级前残留导出文件）与新 `AppDirs` 根目录（m32036 起的日志/数据）。
+  /// 两边维护两份路径拼接的话，迟早会出现「点清缓存但新目录没清」——
+  /// 这个 bug 在 m32036 就真的发生过一次（当时只改了日志写入器）。
+  Future<int> _purgeCacheDirectories() => purgeCacheDirectories();
+
+  // ------------------------------------------------------------ 权限与目录
+
+  /// 读一次通知权限状态（m32036 任务 E）。
+  ///
+  /// 失败不报错：权限只是说明信息，读不到就停在「检查中…」，
+  /// 不应该让整个设置页变成错误页。
+  Future<void> _loadPermissionState() async {
     try {
-      await for (final FileSystemEntity entity in exportDir.list()) {
-        try {
-          await entity.delete(recursive: true);
-          removed++;
-        } catch (e) {
-          AppLogger.instance.warn('CLEAR', '缓存文件删除失败：${entity.path} · $e');
-        }
-      }
+      final PermissionStatus status = await Permission.notification.status;
+      if (!mounted) return;
+      setState(() => _notifStatus = status);
     } catch (e) {
-      AppLogger.instance.warn('CLEAR', '缓存目录遍历失败：$e');
+      AppLogger.instance.warn('PERM', '读取通知权限状态失败：$e');
     }
-    return removed;
+  }
+
+  /// 取一次日志目录路径（不在 build 里调，避免每次重建都碰一次磁盘）。
+  Future<void> _loadLogDir() async {
+    try {
+      final Directory? dir = await AppDirs.logs();
+      if (!mounted) return;
+      setState(() => _logDirLabel = AppDirs.describe(dir));
+    } catch (e) {
+      AppLogger.instance.warn('PERM', '读取日志目录失败：$e');
+    }
+  }
+
+  /// 跳系统设置（任务书 E2：不重复 request，只引导）。
+  ///
+  /// 从系统设置返回后重读一次状态：`openAppSettings` 只是把 App 挂到系统页面，
+  /// 用户改完权限回来时本页不会重建（settings 页在整个导航栈里一直活到 pop），
+  /// 所以必须在这里留一个「回来后刷新」的入口。
+  Future<void> _openSystemSettings() async {
+    try {
+      await openAppSettings();
+    } catch (e) {
+      AppLogger.instance.warn('PERM', '打开系统设置失败：$e');
+      if (mounted) {
+        _info(title: '无法打开系统设置', message: '请手动进入系统设置 → 应用 → 题路 → 通知 中开启。');
+      }
+      return;
+    }
+    if (!mounted) return;
+    await _loadPermissionState();
+  }
+
+  /// 复制日志目录路径到剪贴板。
+  Future<void> _copyLogDir() async {
+    final String path = _logDirLabel;
+    if (path == '（尚未就绪）') {
+      _info(title: '日志目录不可用', message: '还没有找到可写的日志目录，可能存储空间不足。');
+      return;
+    }
+    await Clipboard.setData(ClipboardData(text: path));
+    if (!mounted) return;
+    showAppToast(context, '路径已复制');
+  }
+
+  /// 读一次导出位置（m32406 任务 D3）。
+  ///
+  /// 只读展示串，不碰 token 本身：token 的持久化读写全在 `ExportLocation` 里。
+  Future<void> _loadExportDir() async {
+    try {
+      final String? token = await ExportLocation.getSavedToken();
+      if (!mounted) return;
+      setState(() => _exportDirLabel = ExportLocation.describeToken(token));
+    } catch (e) {
+      AppLogger.instance.warn('EXPORT', '读取导出位置失败：$e');
+    }
+  }
+
+  /// 导出题库（m32406 任务 D3）。
+  ///
+  /// 与题库管理页右上角「⋯ → 导出题库」共用 `ExportService`，两条入口行为一致。
+  /// 失败分档报文案：网络异常 / 其他失败（目录不可写、压缩出错都已在
+  /// `ExportException.message` 里写清楚了，这里不再二次分类）。
+  Future<void> _exportQuestions() async {
+    if (_exporting) return;
+    setState(() => _exporting = true);
+
+    final ExportService service = ExportService();
+    try {
+      final ExportResult result = await service.exportQuestions(kDemoUserId);
+      if (!mounted) return;
+      await _info(
+        title: '导出完成',
+        message: '已导出 ${result.questionCount} 道题到 ${result.path}\n'
+            '文件大小 ${result.sizeLabel}。',
+      );
+    } on ExportException catch (e) {
+      if (!mounted) return;
+      // 用户在 SAF 选择器里按了取消 —— 不是错误，不弹窗。
+      if (e.kind == ExportFailureKind.location && e.message.contains('已取消')) {
+        return;
+      }
+      AppLogger.instance.warn('EXPORT', '导出失败（${e.kind.name}）：${e.message}');
+      await _info(
+        title: e.kind == ExportFailureKind.network ? '网络异常' : '导出失败',
+        message: e.message,
+      );
+    } catch (e) {
+      if (!mounted) return;
+      AppLogger.instance.error('EXPORT', '导出出错：$e');
+      await _info(title: '导出失败', message: '导出过程出错：$e');
+    } finally {
+      service.close();
+      if (mounted) setState(() => _exporting = false);
+    }
+  }
+
+  /// 更换导出位置（m32406 任务 D3）。
+  ///
+  /// 先置 `_exporting`：换目录本身也会弹系统选择器，与导出共用一个「忙」态，
+  /// 避免用户在导出进行中又把目录换掉（换掉后本次导出会写到旧目录）。
+  Future<void> _changeExportDir() async {
+    if (_exporting) return;
+    setState(() => _exporting = true);
+    try {
+      final ExportPickResult picked = await ExportLocation.pickAndSaveDirectory();
+      if (!mounted) return;
+      if (picked.isFailed) {
+        await _info(title: '无法更换导出位置', message: picked.error ?? '未知错误');
+        return;
+      }
+      if (!picked.isPicked) return; // 用户取消，静默
+      setState(() => _exportDirLabel = ExportLocation.describeToken(picked.token));
+      await _info(title: '已更换导出位置', message: _exportDirLabel);
+    } catch (e) {
+      if (!mounted) return;
+      AppLogger.instance.error('EXPORT', '更换导出位置出错：$e');
+      await _info(title: '无法更换导出位置', message: '更换过程出错：$e');
+    } finally {
+      if (mounted) setState(() => _exporting = false);
+    }
   }
 
   /// 删除 shared_preferences 里除 Token 之外的键（当前仓库只有 api_token，

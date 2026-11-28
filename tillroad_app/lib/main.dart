@@ -14,16 +14,39 @@ import 'local/local_db.dart' show LocalDb;
 import 'local/local.dart' show checkLocalStatusConsistency, kLocalDataRevision, PushScheduler;
 import 'logging/app_logger.dart';
 import 'logging/nav_observer.dart';
+import 'pages/api_token_page.dart';
 import 'pages/defects_page.dart';
 import 'pages/home_page.dart';
+import 'pages/onboarding_page.dart' show OnboardingPage, isOnboardingDone;
 import 'pages/profile_page.dart';
-import 'pages/api_token_page.dart';
+import 'storage/app_dirs.dart';
+import 'storage/log_migration.dart' show migrateLegacyLogs;
 import 'theme/app_theme.dart';
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
   await initializeApiToken();
   // 日志初始化要尽可能早：越早接上，越不容易丢掉启动阶段的异常。
   await AppLogger.instance.init();
+  // m32036：先建好 App 私有目录，再迁移旧日志目录。
+  //
+  // 顺序要紧：`AppDirs.init()` 必须在 `AppLogger.init()` 之后——日志写入器
+  // 初始化时就要求目录能写（它在 `open()` 里直接调 `AppDirs.logs()`），
+  // 而 `AppDirs` 自带幂等的 create + 探针，所以这里再调一次只是「确保 data/ 也在」。
+  //
+  // 迁移必须放在**日志初始化之后**：迁移自己要用 `AppLogger` 记录结果；
+  // 也必须放在读日志之前，否则首启动那一瞬间读到的还是旧目录。
+  // 两步都不阻塞启动失败：失败已经由内部 catch + warn 处理，这里再兜一层，
+  // 保证「目录/迁移出问题」永远不会让 App 起不来。
+  try {
+    await AppDirs.init();
+  } catch (e) {
+    AppLogger.instance.warn('APP', 'App 私有目录初始化失败，降级运行：$e');
+  }
+  try {
+    await migrateLegacyLogs();
+  } catch (e) {
+    AppLogger.instance.warn('APP', '旧日志迁移失败，跳过：$e');
+  }
   _installErrorHandlers();
   // 本地库初始化（R1）。失败不拖垮启动：降级为「不启用本地优先」并记日志。
   await _initLocalDb();
@@ -176,11 +199,50 @@ class ApiTokenGate extends StatefulWidget {
   @override
   State<ApiTokenGate> createState() => _ApiTokenGateState();
 }
-
 class _ApiTokenGateState extends State<ApiTokenGate> {
+  /// `null` = 还在读标记；`true/false` = 已读出。
+  ///
+  /// 用三态而不是 `bool _done = false`：如果默认 false，首帧会先渲染引导页
+  /// 再被 setState 换成首页（老用户升级后每次冷启动都要闪一下），很难看。
+  bool? _onboardingDone;
+
+  @override
+  void initState() {
+    super.initState();
+    if (kUseMock) {
+      // mock 模式（含 widget_test）不走引导页：测试与演示都不该被权限弹窗拦住。
+      _onboardingDone = true;
+      return;
+    }
+    isOnboardingDone().then((bool done) {
+      if (!mounted) return;
+      setState(() => _onboardingDone = done);
+    }).catchError((Object e) {
+      // 读标记失败不应该把用户挂在一个空白页上——当它「已完成」，直接进主流程。
+      AppLogger.instance.warn('APP', '读取引导标记失败，按已完成处理：$e');
+      if (mounted) setState(() => _onboardingDone = true);
+    });
+  }
+
   @override
   Widget build(BuildContext context) {
-    if (kUseMock || hasApiToken) return const RootTabs();
+    if (kUseMock) return const RootTabs();
+    final bool? done = _onboardingDone;
+    if (done == null) {
+      // 读标记很快（一次 shared_preferences），但必须给个不闪的占位：
+      // 白底分组背景与引导页/首页同色，切换时不会有突兀的色块。
+      return const CupertinoPageScaffold(
+        backgroundColor: AppColors.groupedBackground,
+        child: SizedBox.shrink(),
+      );
+    }
+    if (!done) {
+      // 引导页只出现一次；`onDone` 里改本地状态即可（标记已由引导页自己写入）。
+      return OnboardingPage(
+        onDone: () => setState(() => _onboardingDone = true),
+      );
+    }
+    if (hasApiToken) return const RootTabs();
     return ApiTokenPage(onSaved: () => setState(() {}));
   }
 }

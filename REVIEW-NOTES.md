@@ -3400,7 +3400,232 @@ D4 证据（真库）：选「科目一 + 题型 choice + 未掌握」→ 只剩
 2. **筛选条件不参与分页**：`limit` 固定 100，超过 100 条时没有「加载更多」。四个维度叠加后很容易筛出不到 100 条，但如果只有一个维度，100 上限会咬到。
 3. **「已删除」「已隐藏」两档不支持任何维度叠加**：前者走 `/questions/deleted`、后者走本机快照，接口都不带这些参数。要恢复某批题，得先切回「全部批次」。
 4. **`type` 参数不做别名归一**：前端传的是 `kQuestionTypeLabels` 的 key（`choice` / `multi` …），但如果有人手工调 API 传 `选择题`，会被 `parseTypeFilter` 静默丢弃（返回空数组 = 不过滤）。
+---
+
+## 53. m32036 归档（通知权限引导 + App 私有存储目录 + 日志迁移）
+
+### 53.1 范围与三个判断
+
+1. **日志必须搬出 `systemTemp`**：Android 上 `Directory.systemTemp` 是应用私有*缓存*目录（`/data/user/0/<包名>/cache`），系统存储吃紧时会被整个清掉。用户报障时「日志目录是空的」多半就是这个原因。搬到 `getExternalStorageDirectory()/TillRoad/logs`（应用专属外部目录，**scoped storage 下无需任何存储权限**，且在「设置 → 应用 → 存储」里用户可见、可清理）。
+2. **只定义 logs / data 两个目录，不定义导出目录**：导出位置将来走 SAF（Storage Access Framework），由用户自己选，与「App 自己的数据放哪」是两条完全不同的决策链。
+3. **通知权限只在首启动引导页申请一次**：`POST_NOTIFICATIONS` 是 Android 13+ 运行时权限。反复 request 会被系统永久拒绝（用户拒绝两次后连对话框都不再显示），所以「允许」与「暂不开启」**两条路都置 `onboarding_done=true`**，之后想开启只能走系统设置。
+
+### 53.2 文件表
+
+| 文件 | 行数 | 改动 |
+|---|---|---|
+| `android/app/src/main/AndroidManifest.xml` | +8 | 只加 `POST_NOTIFICATIONS`，**零存储权限** |
+| `pubspec.yaml` | +2 | `permission_handler: ^11.0.0` + `path_provider: ^2.1.5` |
+| `lib/storage/app_dirs.dart` | 146（新建） | `init()` / `logs()` / `data()` / `root()` / `describe()`；外部目录→文档目录两档回落；实测探针 |
+| `lib/storage/log_migration.dart` | 176（新建） | 旧 `systemTemp/tillroad/logs` → `AppDirs.logs()` 一次性搬迁 |
+| `lib/logging/log_file_writer.dart` | 改动 | `open()` 候选改为 `AppDirs.logs()` + 当前工作目录兜底 |
+| `lib/pages/onboarding_page.dart` | 219（新建） | 首启动单屏引导 + `Permission.notification.request()` |
+| `lib/main.dart` | 改动 | `AppDirs.init()` + `migrateLegacyLogs()`；`ApiTokenGate` 改为引导→token→主界面 |
+| `lib/pages/settings_page.dart` | 改动 | 新增「权限」分区（通知状态 + 去系统设置、日志位置 + 复制路径） |
+| `lib/utils/session.dart` | 改动 | `purgeCacheDirectories()` 同时扫旧根目录与 `AppDirs.root()` |
+| `test/log_migration_test.dart` | 新建 | 10 用例（`AppDirs` 5 + 迁移 5） |
+
+### 53.3 关键实现
+
+**「返回非 null 就一定可写」**：`_ensure()` 不仅 `create(recursive: true)`，还真实写一个 `.write-probe` 再删掉。`getExternalStorageDirectory()` 返回的路径在某些设备上存在但不可写（如外部存储被弹出/SD 卡只读），只靠 `exists()` 判断会把日志写入做成静默失败。
+
+**`root()` 不建目录、不写探针**：它只用于「清除本地缓存」时报告要删的根，删除操作不需要写权限；如果它也带 `_ensure` 的副作用，就会在用户点「清除缓存」时反而把目录建出来。
+
+**迁移必须 copy + delete，不能 rename**：`systemTemp` 在内部存储、目标在外部存储，两者是不同挂载点，`File.rename()` 会抛 `EXDEV: Cross-device link`。
+
+**同名文件不覆盖**：升级当天可能两版都写过 `app-2026-11-20.log`。覆盖会丢新日志；追加需要额外做「同日合并」的语义（且要处理时间序），本轮不值得 —— 跳过并计数，结果对象里 `skipped` 能看出这种情况。
+
+**失败不置标记**：`failed == 0` 才写 `log_migration_done`。否则一次偶发的 IO 失败会让剩余文件永远搬不过来（标记已置 → 下次直接 `alreadyDone`）。
+
+**`_onboardingDone` 用 `bool?` 而非 `bool`**：`null` = 正在读 SharedPreferences。如果初值是 `false`，老用户升级后首帧会闪一下引导页（build 先跑、标记后到）。`null` 时渲染空白 `CupertinoPageScaffold`（背景色已是 `AppColors.groupedBackground`，不会闪白）。
+
+**`kUseMock` 时直接跳过引导**：`widget_test.dart` 的 5 个用例都是 `pumpWidget(const TillRoadApp())` 后 `pumpAndSettle()`，不跳过就会停在引导页，5 个用例全挂。这是「生产代码为测试让路」的一个点，写在代码注释里。
+
+**设置页不重复 `request()`**：用户已经在引导页拒过一次，这里再 `request()` 会被系统永久拒绝（Android 的 `permanentlyDenied`）。只展示 `Permission.notification.status` + `openAppSettings()`。
+
+### 53.4 一个真 bug（顺手修掉）
+
+「清除本地缓存」原来在 `settings_page.dart` 里自己拼 `${Directory.systemTemp.path}/tillroad/export` 去删。日志搬到 `AppDirs` 之后，这个路径就**删不到新的日志目录**了 —— 用户点「清除本地缓存」，日志还在。修法：`utils/session.dart` 的 `purgeCacheDirectories()` 改为同时扫旧根目录（升级前残留）与 `AppDirs.root()`，设置页改成一行委托。
+
+这是典型的「改了写入方、忘了读取/清理方」。凡是「路径」类改动，必须把所有引用点搜一遍（`systemTemp`、`tillroad` 两处 grep）。
+
+### 53.5 测试与验证
+
+- `test/log_migration_test.dart` 10 用例：`AppDirs` 建目录/探针已清/`root()` 不创建/`describe()` 占位；迁移的旧目录不存在→置标记、搬运并删源（杂项保留）、同名跳过不覆盖、`force` 重扫、重置标记。用 `AppDirs.debugOverrideRoot()` 钉到临时目录，**绝不碰真实设备目录**。
+- `flutter analyze --no-fatal-infos` → **0 error / 0 warning / 101 info**（判据 `Select-String '^\s*(error|warning)\s'` 零命中）。
+- `flutter test` → **118/118**（原 108 + 新增 10）。
+
+### 53.6 踩坑
+
+1. **`path_provider` 不能写 `^2.1.0`**：`share_plus ^13.3.1` → `share_plus_platform_interface ^7.2.0` → `path_provider ^2.1.5`，写 `^2.1.0` 会 pub 解析失败。必须 `^2.1.5`。
+2. **`windows/flutter/generated_plugin_registrant.cc` 与 `generated_plugins.cmake` 会被 `pub get` 自动改**：`permission_handler_windows` / `path_provider_windows` 注册产物，属预期，不是手改。
+3. **`systemTemp` 的清理方容易被忘记**：见 53.4。
+4. **多批 `edit` 会把 import 区改成重复**：`log_file_writer.dart` 的注释两行重复、`settings_page.dart` 与 `main.dart` 的 import 块都出现过重复行。多批编辑后必须整块读一遍 import 区。
+5. **`edit` 用纯数字当锚点会被拒**：`E_MALFORMED_ANCHOR: Invalid anchor "33"` —— 锚点只能是 3 位哈希，不能是行号。
+6. **一次 edit 改多处，任一处锚点 stale 会整批 abort**：`settings_page.dart` 第三次改动的锚点已 stale，导致前两处也没写入。要么拆成多次单点 edit，要么先 read 重同步。
+
+### 53.7 偏离任务书
+
+1. **任务书 C5 说「迁移失败记 `AppLogger.error`」**，实际用的是 `warn`。理由：迁移失败不影响启动与核心功能（只是日志少搬几个文件），用 `error` 会污染「错误」这个级别，也会让用户看到「导出日志」里一堆 error 反而以为是 App 坏了。**但任务书确实写的是 error**，此处如实标注。
+2. **`path_provider` 版本写 `^2.1.5` 而非任务书的 `^2.1.0`**：pub 依赖冲突，无法用 `^2.1.0`。
+3. **设置页「日志位置」只给复制路径，没给「打开目录」**：打开目录需要 `open_filex` 或 `url_launcher`，本轮硬约束禁止新增依赖。
+
+### 53.8 遗留
+
+1. **只申请了权限，没有真正的推送**：`flutter_local_notifications` 未引入，没有本地通知调度；后端也没有窗口到期扫描或 FCM/APNs 通道。当前权限只是为后续功能预铺。
+2. **`AppDirs.data()` 目前无人使用**：目录建出来了但没有代码往里写（导入临时文件还走 `systemTemp`）。后续接导入/缓存时需要迁移。
+3. **`log_export.dart` 的导出临时目录仍是 `systemTemp/tillroad`**：本轮任务书明确「不涉及导出/导入，导出目录后续通过 SAF 由用户选择」，故未动。
+4. **没有 UI 显示「迁移成功」**：只在日志里记一条 `[LOG] 旧日志迁移：搬入 N 个…`，设置页看不到。用户反馈「日志没了」时仍需先确认版本号。
 
 ---
 
-> 文档 v1.1 结束（m31635 多条件组合筛选归档）
+## 54. m32406 归档（题库导出 + SAF 目录选择 + 持久化 URI）
+
+### 54.1 范围与三个关键判断
+
+任务书要求：后端只读导出端点 + 前端 SAF 目录选择/持久化 + `.tillroad` 写入 + 设置页「数据管理」分区。三个判断决定了实现形状：
+
+1. **不能复用 `listVisible`**。它的归属条件是 `(owner_user_id IS NULL OR owner_user_id = $n)` —— 会带上公共题；任务 A2 要求**只导当前用户自己的题**。所以 `server/routes/export.mjs` 写了独立 SQL（`WHERE owner_user_id = $1 AND deleted_at IS NULL`），这也是本项目**唯一一个不复用列表查询的读端点**。
+2. **压缩放在客户端**。后端是统一 `json()` 契约（`Content-Type: application/json`），返二进制需要新增一条不经过 `json()` 的出参路径，为节省带宽改协议不值得；而「压缩失败」要被单独汇报（任务 C3 四档），在客户端压才能分出 `compress` 档。
+3. **选方案 A（`dir_picker` + `saf_stream`）**。任务书推荐 A，核实后同意：`dir_picker` 的 `pick()` / `persist()` / `restore()` / `release()` 四件套正好一一对应任务书 B2/B4 的「选、记住、失效判断、换目录」；`docman` 一站式但把三件事耦在一个包里，且它的 `SecurityException` 只能靠字符串判断。
+
+### 54.2 文件表
+
+| 文件 | 行数变化 | 说明 |
+|---|---|---|
+| `server/routes/export.mjs` | 新建 ~250 | `GET /export/questions`：`loadUser` / `loadSubjects` / `loadKnowledgeNodes` / `loadQuestions` + `shapeQuestion` / `shapeNode` / `shapeSubject` + `exportQuestions(ctx)` + `match()` |
+| `server/routes/index.mjs` | +5 | import + `ROUTE_MODULES` 插在 `import_batches` 之后 |
+| `server/routes/export.integration.test.mjs` | 新建 ~380 | 6 个用例（见 54.5） |
+| `package.json` | +1 行 | `test:integration` 追加该文件（现 18 个） |
+| `tillroad_app/lib/services/export_location.dart` | 新建 ~290 | `ExportLocation`（`getSavedToken` / `getSavedDirectory` / `pickAndSaveDirectory` / `clearSavedDirectory` / `isUsable` / `describeToken`）+ `ExportPickResult` 三态 |
+| `tillroad_app/lib/services/export_service.dart` | 新建 ~285 | `ExportService.exportQuestions` + `ExportException` 四档 + `ExportResult.sizeLabel` + `buildFileName` |
+| `tillroad_app/lib/pages/question_manage_page.dart` | +101 | `_openMoreMenu()`（`CupertinoActionSheet`）+ `_exportQuestions()`；导航栏 `trailing` 从单个「浏览」改为 `Row[⋯, 浏览]` |
+| `tillroad_app/lib/pages/settings_page.dart` | +155 | 「数据管理」分区 `_buildDataSection()` + `_loadExportDir()` / `_exportQuestions()` / `_changeExportDir()` |
+| `tillroad_app/test/export_test.dart` | 新建 19 用例 | 纯函数（文件名 / 体积文案 / 四档枚举 / 三态 / 目录名解码） |
+| `tillroad_app/pubspec.yaml` | +依赖 | `dir_picker: 0.8.1` + `saf_stream: 4.0.3` |
+
+### 54.3 关键实现
+
+- **导出 SQL 与 shape 函数**：`loadQuestions` 显式列名（`SELECT ... FROM questions WHERE owner_user_id = $1 AND deleted_at IS NULL ORDER BY created_at ASC, id ASC LIMIT 50000`），**不返回 `deleted_at` / `version` / `updated_at`** —— 导出格式是「可读快照」，不是数据表导出。`shapeNode` 把 `weight_to_target` 从字符串转 number：`numeric(4,3)` 经 `pg` 驱动返的是 `'0.500'` 字符串，不转的话 JSON 里会变成 `"0.5"`，导入端做数值比较会出错。
+- **`exported_at` 用 `new Date().toISOString()`**：不用 SQL 的 `now()`，因为导出是瞬时快照，不依赖事务时间语义。
+- **`dir_picker` 的真实 API 与任务书写法不同**：0.8.1 **没有** `pickDirectory()`，入口是 `DirPicker.pick()`；`PickOptions.android(shouldPersist:)` 已标 `@Deprecated`（1.0.0 移除），现写法是 `pick()` 后调 `DirPicker.persist(location)` 拿持久化 token。`restore(token)` 返回 null 即失效。**保存的是 token 而不是 URI 字符串** —— iOS/macOS 上它是 bookmark 的 base64（URI 字符串换个进程就废）。换目录时必须 `DirPicker.release(旧 token)`（Android 每个 App 最多 128 个持久化 URI 配额，Android 11+ 512，超了丢最旧的）。
+- **`SafNewFile` 不能显式声明类型**：该类定义在 `saf_stream_platform_interface.dart`，主入口库未 re-export，写 `final SafNewFile x = ...` 报 `undefined_class`。必须靠类型推断 `final written = await ...; written.fileName`。**SAF 可能改名**（同名已存在且 `overwrite != true` 时自动加后缀），所以返回的文件名以 `written.fileName` 为准，不能用请求传的名字。
+- **桌面分支**：`uri.scheme == 'file' && !Platform.isAndroid` 时直接 `File(...).writeAsBytes(flush: true)` —— `saf_stream` 只有 Android 实现，Windows/Linux 上 token 就是普通 `file://` URI。
+- **失败四档**（`ExportFailureKind`）：`network`（`ApiException`，`isNetworkError` 时文案加「网络连接失败」）/ `location`（取不到 token、`DirPicker` 异常、SAF 写入失败）/ `compress`（`gzip.encode` 抛错）/ `other`（兜底）。UI 上 `location` 且文案含「已取消」时**静默返回** —— 用户主动取消不该弹错误框。
+- **设置页不持有凭证**：State 只存展示串 `_exportDirLabel`（由 `describeToken(token)` 算出），不存 token 本身；每次需要时重新 `getSavedToken()`。
+
+### 54.4 两个真 bug
+
+1. **`is_subjective` 不是派生列**：它由导入管线按题型写入（`SUBJECTIVE_TYPES`），不是触发器维护。集成测试里造一道 `short_answer` 后断言 `is_subjective === true` 会失败 —— 必须显式传 `isSubjective: true` 或让导入路径写。这一条写进测试 helper 的注释，避免后来者以为状态机漏了列。
+2. **`settings_page.dart` 的三个方法只加了调用点没加方法体**：一次 edit 只写了 `_buildDataSection()` 里的 `onTap: _exportQuestions` 等引用，analyze 立刻报 `undefined_method`。补齐时又漏了 `ExportPickResult` 的 import（`show ExportLocation` 单写不够），`_changeExportDir` 报 `undefined_class`。
+
+### 54.5 测试与验证
+
+- `server/routes/export.integration.test.mjs` 6 个用例：①A 导 5 题（题干集合、公共题/B 题不出现、answer/analysis/content_hash/options 完整、无科目题两列为 null 且键存在、`short_answer` 的 `is_subjective === true`）②科目与考点取用户**全量**（不只是被引用的；`weight_to_target` 是 number）③顶层键严格等于 `['exported_at','knowledge_nodes','questions','subjects','user','version']`（证明不导练习/缺陷单）④B 只看到自己的 1 题 ⑤无 Token → `401 unauthorized` ⑥软删题不出现。
+- **服务启动必须用 `app.server.listen(...)`**：`createApp()` 返回值里 `listen` 的签名让 `app.listen(0)` 拿不到 `address()`；既有 `question_filter.integration.test.mjs:212` 也是 `app.server.address().port`。
+- `process.env.TOKENS` 必须在 `createApp` **之前**设置 —— `server/index.mjs:89` 在 `createApp` 调用时把 `parseTokens()` 读进闭包，设晚了拿到空数组。
+- PGlite 真库：**6/6 pass**。`npm test`：**425 tests / 215 pass / 0 fail / 210 skipped**。`flutter test`：**137/137**。`flutter analyze --no-fatal-infos`：**0 error / 0 warning / 100 info**。
+- **E4 证据**（PGlite + 真 `GET /export/questions` + `gzipSync`，50 道贴近真实行测题）：`jsonBytes=56227`、`gzipBytes=3094`（≈3.0 KB）。**远低于任务书预期的 100–200 KB** —— 中文题库 JSON 高度同构，gzip 压缩率约 18×；任务书那个数量级是按「已压缩的二进制」估的。
+
+### 54.6 踩坑
+
+1. `SafNewFile` 不能显式声明类型（主入口库未 re-export）→ 用类型推断。
+2. `gzip` 来自 `dart:io` 而不是 `dart:convert`；`import 'dart:io' show File, Platform;` 会缺 `gzip`。
+3. `dir_picker` 0.8.1 没有 `pickDirectory()`；`shouldPersist` 已弃用。
+4. 换目录不 `release` 旧 token 会累积配额（Android 128 上限）。
+5. `listVisible` 的 owner 条件带公共题 —— 导出必须另写 SQL。
+6. 大批 edit 后 import 块/括号容易重复或漏闭合；本轮 `question_manage_page.dart` 的 `trailing` 替换漏了一个 `),`（`Expected an identifier`），`settings_page.dart` 出现重复 `onTap: _openSystemSettings,`（`duplicate_named_argument`）。
+7. 判断 analyze 仍用 `Select-String '^\s*(error|warning)\s'`（级别词后任意空白），**不要写 `\s+-`**。
+
+### 54.7 偏离任务书
+
+1. **依赖实际版本**：`dir_picker: 0.8.1` / `saf_stream: 4.0.3`（任务书没给版本）。
+2. **目录选择 API 写法**：任务书写 `pickDirectory(shouldPersist: true, writePermission: true)`，实际库只有 `DirPicker.pick()` + `DirPicker.persist()`，且无 `writePermission` 参数（持久化即含写权限）。
+3. **E4 文件大小预期不符**：3.0 KB vs 100–200 KB（见 54.5）。
+4. **桌面也支持导出**：任务书只提 SAF（Android）；Windows 上 token 是 `file://`，直接写文件系统，属顺带支持。
+5. **设置页分区名用「数据管理」**（任务书 D3 原话），位置在「危险操作」之前 —— 理由是「导出」是保管手段、「删除」才是风险项。
+
+### 54.8 遗留
+
+1. **`.tillroad` 只能导出、没有导入端**：`version:"1.0"` 已预留，但后端还没有能把它读回来的端点，所以导出目前只是备份/交付手段，不能「设备 A 导出 → 设备 B 恢复」。
+2. **iOS 的 bookmark 分支未实机验证**：只在本机 Windows/Android 验了 `file://` 与 `content://` 两条；`describeToken` 对认不出的 bookmark 回落「已选择的文件夹」是保守做法。
+3. **导出不限条数**：`MAX_QUESTIONS = 50000` 只是防爆内存的上限，没有分批/进度条；题库极大时（数万题）单次导出会占几百 MB 内存（gzip 前）。
+4. **换目录时旧目录不清理**：`release` 只撤权限，之前导出的文件仍在旧目录里。
+
+---
+
+## 55. m32773 归档（题库导入预检 + 批量决策：skip / overwrite）
+
+### 55.1 范围与三个关键判断
+
+任务书：导入前先预检（只读），用户看到「会新进几道、撞上几道重复」后再决定重复题怎么处理。硬约束：不改 schema、不改 `core/` 与状态机、**不传 decisions 时默认 skip**、不做相似判定 / 逐条决策 / 保留两份、不截图、不执行 git 命令。三个判断决定了实现形状：
+
+1. **`subject` / `node` 只能从 JSON 进来**。md/txt/csv/pdf/xlsx 都是纯文本，`splitter.parseBlock` 只产出 `{stem,options,answer,analysis,separator,startLine,endLine}`，拿不到科目名与考点路径。所以本轮不碰切题器，而是给 `.tillroad` / `.json` 加一条解析路径（`json_import.mjs`，m30197 已建），文本格式的行为**一字未改**。
+2. **预检必须与真导入拿到同一份解析结果**。否则预检说 300 道新题、真导入只进 298 道，用户无法理解差在哪。所以把 `runImport` 的「阶段 1–2」抽成独立函数 `parseImportBody(body, ownerUserId)`（约 130 行），两条路径共用它。
+3. **预检期间绝不能碰数据库**。`resolveNode` 会 `knRepo.create(...)` 建考点 —— 预检里调它就会写库，违反「预检不创建任何数据」。所以预检路径**不解析 subject/node**，只做 content_hash 判重。
+
+### 55.2 文件表
+
+| 文件 | 行数变化 | 说明 |
+|---|---|---|
+| `server/import/extract.mjs` | +~30 | `EXT_KINDS` 加 `.tillroad`；`case 'json'` 改为按 gzip magic（`0x1f 0x8b`）判定并 `gunzipSync`；415 文案补 JSON / .tillroad |
+| `server/routes/questions_import.mjs` | +~260 | `parseImportBody` 抽出；`previewImport`；`describeDuplicates` / `diffAgainst` / `signature`；`overwriteDuplicates`；`parseDuplicateAction`；`runImport` 支持 decisions；响应体拆分 |
+| `server/import/import.integration.test.mjs` | +159 | 3 个新用例 + 4 个 helper；`after()` 删除条件扩容 |
+| `server/routes/questions.integration.test.mjs` | 22 处断言 | 响应结构变了，`.data.imported` → `.data.imported.new`、`.data.duplicates.length` → `.data.duplicates.skipped`、`.data.duplicates` → `.data.duplicate_details` |
+| `tillroad_app/lib/api/question_api.dart` | +269 | `ImportResult` 拆字段 + 兼容旧结构；新增 `ImportPreviewResult` / `ImportPreviewDuplicate` / `previewImport`；`importQuestions` 带 `duplicateAction` |
+| `tillroad_app/lib/pages/question_import_page.dart` | +124 | `.tillroad` 扩展名；`_openPreview()` 两段式；结果页显示 new / overwritten / skipped |
+| `tillroad_app/lib/pages/import_preview_page.dart` | 新建 825 | 预检页（摘要卡 / 跳过·覆盖二选一 / 重复明细可展开 / 底部确认） |
+
+### 55.3 关键实现
+
+- **`parseImportBody(body, ownerUserId)`**：原 `runImport` 的阶段 1（`decodeBase64` → `extractText`）+ 阶段 2（`splitQuestions` / `parseQuestionJson`）+ `parseProblems` 映射 + `EMPTY_CONTENT` 抛错 + `createCtx` 构造 + `sanitizeQuestionText` 清洗整段搬进来，返回 `{buffer, filename, extracted, isJson, split, parseProblems, createCtx, sanitizedCount, cleanedQuestions}`。函数头注释写明「两条路径必须拿到同一份解析结果」。
+- **`previewImport(pool, body, ownerUserId)`**：`parseImportBody` → `toCreateInput` 造候选（**不解析 subject/node**）→ `dedupe` → `describeDuplicates`；返回 `{new_count, duplicate_count, duplicates, parse_errors, stats:{kind,mime,bytes,total,sanitized}}`；日志 `[IMPORT] 预检：新题 N 条 / 重复 M 条（owner=…）`。
+- **`describeDuplicates`**：一次 `ANY(uuid[])` 批量查 existing 行（**只查「自己的题」**，owner 非空时 `owner_user_id = $n`）；每条返回 `{incoming:{stem,type,content_hash}, existing:{id,stem,created_at}|null, diff:[...]}`。**批内重复**（同一份文件里出现两次、库里还没有）的 `existing` 为 null，`diff` 写「同一份文件里重复出现（库内还没有这道题）」。
+- **`diffAgainst`**：对比 answer / analysis / difficulty / tags / type，输出中文标签「答案不同 / 解析不同 / 难度不同 / 标签不同 / 题型不同」。`signature(value)` 把 jsonb 值压成可比较字符串（数组排序、对象键排序）。
+- **`overwriteDuplicates`**：**直写 SQL，不复用 `questionsRep.update`** —— `update` 要求 `base_version`，而且改题干会重算 `content_hash`（覆盖场景 hash 本就不该变）。只 UPDATE `stem/options/answer/analysis/difficulty/tags`，WHERE 带 `owner_user_id = $n AND deleted_at IS NULL`；返回覆盖行数。`schema.sql` 的 `set_updated()` 触发器自动 `version+1` / `updated_at` 刷新。
+- **`parseDuplicateAction(body)`**：`body.decisions.duplicate_action === 'overwrite'` → overwrite，**其余一律 skip**（含非法值）。理由：导入是「确认即要结果」的操作，为一个拼错的枚举挡掉整批体验更差；且缺省必须等价 skip（硬约束）。
+- **`runImport` 响应体**：`imported: {new, overwritten}`、`duplicates: {skipped, overwritten}`、`duplicate_details: [...]`（数组，形状与旧 `duplicates` 一致）、`batch_id`、`import_filename`、`errors`、`subject_matched`、`node_created`、`stats`（旧字段一个没删）。并发撞上的 `DUPLICATE_QUESTION` 归 `skipped`。
+- **`match()` 分支顺序**：preview 分支（`seg.length === 3`）**排在 `POST /questions/import`（`seg.length === 2`）之前**，catch 逻辑与导入分支相同（`MISSING*` / `INVALID_BASE64` → 400）。
+- **`.tillroad` 解压**：`extract.mjs` 的 `case 'json'` 先看字节头是不是 gzip magic `0x1f 0x8b` —— 是则 `gunzipSync`（失败抛 `INVALID_GZIP` 422「题库文件解压失败，可能不是 .tillroad 导出文件或文件已损坏」），否则按普通 JSON 读。**判据看字节而不是扩展名**：Android 上系统常给 `application/octet-stream`。
+- **前端两段式**：`question_import_page.dart` 的 `_openPreview()` 选好文件 → 编码一次 base64 → push `ImportPreviewPage` → 预检页 `pop` 回决策串（`null` = 用户取消，什么都不做）→ `_upload(duplicateAction: decision, contentBase64: base64)`。**base64 只编一次**（10MB 文件要好几秒），**原有三态进度与结果页一条没动**。
+
+### 55.4 三个真 bug
+
+1. **PGlite 清理时 FK 报错**：m32773 的新用例用 `POST /questions` 造「库里已有的题」，这类题**没有 `subject_id`**，挂不到 profile 的科目下。`after()` 原先只删「挂在本用户科目下的题」，残留题卡住 `DELETE FROM users` → `questions_owner_user_id_fkey`。修法：删除条件改为 `owner_user_id = $1 OR subject_id IN (本用户科目)`。
+2. **`import_preview_page.dart` 用了 Material 的 `Divider`**：纯 Cupertino 工程无 Material 依赖 → analyze 报 `creation_with_non_type` + `undefined_method`。改用 `SizedBox(height: 0.5, child: ColoredBox(...))`。另外 `SectionHeader` 漏 import → `import '../widgets/common.dart' show SectionHeader;`。
+3. **断言脚本误伤**：批量替换 `.data.imported` → `.data.imported.new` 时，把 `imported.data.imported` 也替成了 `imported.data.imported.new.new`。单行 edit 修回。
+
+### 55.5 测试与验证
+
+- 新增 3 个用例：①`m32773 预检：5 题里 3 道已存在 → new=2 / duplicate=3，且不写任何数据`（断言 `new_count`/`duplicate_count`/`duplicates.length`/`parse_errors` 空、明细含 `incoming.stem`/`incoming.content_hash`/`existing.id`/`existing.created_at`/`diff` 含「答案不同」；**预检后题数与批次数都不变**）②`m32773 决策：不传 decisions 默认 skip → 新增 2 道、跳过 3 道`③`m32773 决策：overwrite 覆盖同 hash 的题（保留 id 与归属），且不新增行`（总题数 = before+2；原 3 道题 id 与 `owner_user_id` 不变、answer 被改成文件里的值）。
+- **E4 证据**（PGlite 真库）：预检 5 题（3 道已存在）→ `new_count=2` / `duplicate_count=3`；同一文件 `skip` 导入 → `imported.new=2` / `duplicates.skipped=3` / `imported.overwritten=0`；同一文件 `overwrite` 导入 → `imported.overwritten=3` / `duplicates.skipped=0` / `imported.new=2`。
+- PGlite 真库：**23/23 pass**。`npm test`：**428 tests / 215 pass / 0 fail / 213 skipped**。`flutter test`：**137/137**。`flutter analyze --no-fatal-infos`：**0 error / 0 warning / 101 info**。
+
+### 55.6 踩坑
+
+1. **大段删除不要靠反复 `edit`**：删 73 行连续代码时反复 `E_STALE_RANGE`（同一 range 在连续 edit 后哈希漂移，工具提示的「current range」又不被记录为 served）→ 改用一次性脚本按行索引定位并重写整文件。
+2. **先插入后删除 = 重复定义**：先加 `parseImportBody` 而没删原块 → `const buffer` 等重复声明 73 行。**先删后加更安全**。
+3. **小范围 edit 会连带删掉相邻行**：插入 `subjectResolved = true;` 时把紧随的 `matchedCount += 1;` 覆盖掉了（m30197 已犯过一次，本轮又踩）—— 每次 edit 后必须 read 回读整个分支块。
+4. **`edit` 锚点可能重复**：`questions_import.mjs` 里 `  return {`（toCreateInput）与 `    return {`（runImport 响应）哈希相同 → `E_STALE_ANCHOR ambiguous anchor`；解法是用整段唯一锚点或小范围多步替换。
+5. **对象字面量漏 `});`**：`EXT_KINDS` 加 `.json` 后忘了闭合 → `SyntaxError: Unexpected token 'function'`。
+6. **PGlite 适配器要求**：`createPool()` 必须**同步**返回 `{query, connect, end}`；`exec` 里「无参数且 `/;\s*\S/` 命中」→ `db.exec`，否则 `db.query(text, params)`（否则 `42601`）；`rowCount` 取 `rows.length > 0 ? rows.length : res.affectedRows`。
+7. **PowerShell 读中文文件会显示乱码**：用 `Get-Content` 读含中文的 Dart 文件会得到乱码（编码问题，**不是文件损坏**）；生成文件用 `[System.IO.File]::ReadAllText` / `WriteAllText(UTF8Encoding($false))`。
+
+### 55.7 偏离任务书
+
+1. **非法 `duplicate_action` 不报 400，回落 skip**（任务书没说非法值怎么办）。理由见 55.3。
+2. **覆盖不含 `subject_id` / `knowledge_node_id`**：只覆盖内容字段。理由：改归属是另一件事（`PATCH /questions/batch` 专管这个），混在一起会让「覆盖」语义变得含糊。
+3. **响应体加了 `duplicate_details`**：任务书 C3 只要求 `{imported:{new,overwritten}, duplicates:{skipped,overwritten}}`；但明细（每道重复题的题干与差异）是用户做决策的依据，只给数字没有意义，所以额外保留 `duplicate_details` 数组（形状与旧 `duplicates` 一致，前端优先读它）。
+4. **预检也走 `POST` 而不是 `GET`**：请求体是 base64 文件内容（可能 10MB），不能放 URL。
+
+### 55.8 遗留
+
+1. **跨设备完整恢复仍未做**：导出快照里的 `subject_id` / `knowledge_node_id` 指向原库 uuid，在另一台设备上并不存在 → 题会落到未分类 / 空考点。要真正恢复需按快照里的 `subjects` / `knowledge_nodes` 先建树再按名字回挂。
+2. **覆盖不改归属、不改批次**：被覆盖的题仍算在原 `import_batches` 里，批次计数不变。
+3. **预检不做相似度**（硬约束）：只能告诉用户「完全相同」与「不同」，无法提示「疑似同一题」。
+4. **预检明细全量返回**：没有分页 / 截断上限，超大文件（数万道重复题）时响应体很大。
+5. **前端两段式只做了「全部跳过 / 全部覆盖」**：任务书 D2 明确「不做逐条决策」，所以没有单题勾选。
+6. **未做真机验证**（任务书要求不截图、不跑 adb）：`.tillroad` 的 gzip 解压与预检页交互只做了代码级验证。
+---
+
+> 文档 v1.3 结束（m32406 题库导出与 SAF 归档）

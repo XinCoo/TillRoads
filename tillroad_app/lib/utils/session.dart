@@ -31,6 +31,7 @@ import '../api/user_api.dart';
 import '../config/api_config.dart';
 import '../local/local.dart';
 import '../logging/app_logger.dart';
+import '../storage/app_dirs.dart';
 /// Token 在 shared_preferences 里的键名（与 api_config.dart 一致）。
 const String kApiTokenPrefsKey = 'api_token';
 
@@ -119,19 +120,45 @@ Future<int> clearSessionLocalState() async {
   return removedFiles;
 }
 
-/// 删掉 `systemTemp/tillroad/` 下的文件（导出目录等）。
+/// 删掉缓存目录里的文件（旧 systemTemp/tillroad 与新 AppDirs 根目录）。
 ///
 /// 与设置页原本的 `_purgeCacheDirectories()` 同源，抽到这里给两边共用。
 /// 返回删除的文件数；单个文件删除失败只记日志，不中断整体清理。
+///
+/// m32036：日志/数据目录从 `systemTemp/tillroad` 搬到 `AppDirs` 的
+/// `.../TillRoad/{logs,data}` 后，这里必须**两个位置都扫**：
+///   · 旧位置是升级前的残留（迁移只搬 `app-*.log`，别的杂物还在）；
+///   · 新位置是现在的真目录，不扫就等于「清除本地缓存」对新版本无效。
+/// 两处都扫且都不因单个失败中断。
 Future<int> purgeCacheDirectories() async {
+  int removed = 0;
   final String sep = Platform.pathSeparator;
-  final Directory root = Directory(
+
+  // 旧位置：升级前的残留。
+  final Directory legacyRoot = Directory(
     '${Directory.systemTemp.path}${sep}tillroad',
   );
-  if (!root.existsSync()) return 0;
+  removed += await _purgeDirectory(legacyRoot);
+
+  // 新位置：AppDirs 根目录（含 logs/ 与 data/ 两个子目录）。
+  // `AppDirs.root()` 只报告存在的目录、不创建 —— 删东西不需要能写，
+  // 而且不该因为「用户点了清缓存」反而把空目录建出来。
+  final Directory? appRoot = await AppDirs.root();
+  if (appRoot != null) {
+    removed += await _purgeDirectory(appRoot);
+  }
+  return removed;
+}
+
+/// 递归删除 [dir] 下所有条目（保留 [dir] 本身，下次启动还能直接写入）。
+///
+/// 为什么保留根目录：日志写入器一旦初始化就绑定了路径，把目录本身删掉会让
+/// 下一次 `append` 报错；留着空目录是无害的。
+Future<int> _purgeDirectory(Directory dir) async {
+  if (!dir.existsSync()) return 0;
   int removed = 0;
   try {
-    await for (final FileSystemEntity entity in root.list(recursive: true)) {
+    await for (final FileSystemEntity entity in dir.list(recursive: true)) {
       try {
         await entity.delete(recursive: true);
         removed++;
@@ -143,7 +170,7 @@ Future<int> purgeCacheDirectories() async {
       }
     }
   } catch (e) {
-    AppLogger.instance.warn('SESSION', '缓存目录遍历失败：$e');
+    AppLogger.instance.warn('SESSION', '缓存目录遍历失败：${dir.path} · $e');
   }
   return removed;
 }

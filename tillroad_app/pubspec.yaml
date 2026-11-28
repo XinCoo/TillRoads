@@ -46,6 +46,17 @@ dependencies:
   # 这里升到 file_picker 13.x（与 share_plus 13.x 同代 win32），
   # API 形状不变（FilePicker.platform.pickFiles / FilePickerResult.files.first.bytes）。
   file_picker: ^13.4.1
+  # m32036（通知权限 + 私有目录）：本轮唯一新增的两个依赖。
+  # permission_handler —— Android 13+ 的 POST_NOTIFICATIONS 是**运行时权限**，
+  #   必须经原生 API 申请；只靠 Manifest 声明不会弹窗，状态也读不到。
+  # path_provider —— 拿 getExternalStorageDirectory()（App 专属外部目录，
+  #   卸载即删、无需任何存储权限）与 getApplicationDocumentsDirectory()（回落）。
+  # 注意：path_provider 本来是 share_plus 的传递依赖（且被钉在 ^2.1.5），
+  #   这里显式声明成直接依赖 —— 与日志模块原先「不直接 import 未声明的包」的原则一致。
+  permission_handler: ^11.0.0
+  path_provider: ^2.1.5
+  dir_picker: 0.8.1
+  saf_stream: 4.0.3
 
 dev_dependencies:
   flutter_test:

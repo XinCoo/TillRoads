@@ -131,10 +131,14 @@ after(async () => {
   const c = await pool.connect();
   let cleanupFailure = null;
   try {
-    // 先删题（FK 指向 subjects），再删科目/profile/user。硬删，不用软删。
+    // 先删题（FK 指向 subjects / import_batches），再删科目/profile/batch/user。硬删，不用软删。
+    // m32773：预检/决策用例会造出「没有 subject_id」的新题（POST /questions 不带科目），
+    // 它们挂不到 profile 的 subjects 上，所以删除条件必须同时覆盖
+    // 「属于本用户的题」与「挂在本用户科目下的题」，否则残留题会卡住 users 的外键删除。
     await c.query(
       `DELETE FROM questions
-        WHERE subject_id IN (SELECT s.id FROM subjects s
+        WHERE owner_user_id = $1
+           OR subject_id IN (SELECT s.id FROM subjects s
                               JOIN exam_profiles p ON p.id = s.exam_profile_id
                              WHERE p.user_id = $1)`,
       [seed.userId],
@@ -186,8 +190,8 @@ test('POST /questions/import：Markdown 样本首次导入全入库，二次导�
 
   const first = await req('POST', '/questions/import', body);
   assert.equal(first.status, 200, JSON.stringify(first.data));
-  assert.equal(first.data.imported, 12, `应导入 12 题，实际 ${first.data.imported}`);
-  assert.equal(first.data.duplicates.length, 0, '首次导入不应有重复');
+  assert.equal(first.data.imported.new, 12, `应导入 12 题，实际 ${first.data.imported.new}`);
+  assert.equal(first.data.duplicates.skipped, 0, '首次导入不应有重复');
   assert.equal(first.data.stats.kind, 'markdown');
   assert.equal(first.data.stats.total, 12);
 
@@ -221,9 +225,9 @@ test('POST /questions/import：Markdown 样本首次导入全入库，二次导�
   // 二次上传同一份文件：0 新入库，12 条 duplicates
   const second = await req('POST', '/questions/import', body);
   assert.equal(second.status, 200, JSON.stringify(second.data));
-  assert.equal(second.data.imported, 0, '二次导入不应新增');
-  assert.equal(second.data.duplicates.length, 12, '二次导入应全部判重');
-  for (const d of second.data.duplicates) {
+  assert.equal(second.data.imported.new, 0, '二次导入不应新增');
+  assert.equal(second.data.duplicates.skipped, 12, '二次导入应全部判重');
+  for (const d of second.data.duplicate_details) {
     assert.ok(d.content_hash, 'duplicate 必须带 content_hash');
     assert.ok(d.existing_id, 'duplicate 必须带 existing_id');
     assert.ok(d.stem, 'duplicate 必须带 stem 供前端提示');
@@ -252,7 +256,7 @@ test('POST /questions/import：纯文本样本（折行 + 无 Markdown 语法）
 
   const first = await req('POST', '/questions/import', body);
   assert.equal(first.status, 200, JSON.stringify(first.data));
-  assert.equal(first.data.imported, 10);
+  assert.equal(first.data.imported.new, 10);
   assert.equal(first.data.stats.kind, 'text');
 
   // 折行题干入库后仍然是一条题（不是两条），且保留换行
@@ -421,7 +425,7 @@ test('导入清洗：题干里的 ____ 占位符入库前变成「（  ）」', 
     subject_id: seed.subjectId,
   }));
   assert.equal(r.status, 200, JSON.stringify(r.data));
-  assert.equal(r.data.imported, 1);
+  assert.equal(r.data.imported.new, 1);
 
   const rows = await queryQuestions('stem LIKE $2', ['%中国的首都是%']);
   assert.equal(rows.length, 1);
@@ -441,7 +445,7 @@ test('题型自动识别：单选题落库 type=choice 且 type_source=auto', sk
     subject_id: seed.subjectId,
   }));
   assert.equal(r.status, 200, JSON.stringify(r.data));
-  assert.equal(r.data.imported, 1);
+  assert.equal(r.data.imported.new, 1);
 
   const rows = await queryQuestions('stem LIKE $2', ['%下列说法正确的是%']);
   assert.equal(rows.length, 1);
@@ -459,7 +463,7 @@ test('题型自动识别：判断题落库 type=judge', skipOpt, async () => {
     subject_id: seed.subjectId,
   }));
   assert.equal(r.status, 200, JSON.stringify(r.data));
-  assert.equal(r.data.imported, 1);
+  assert.equal(r.data.imported.new, 1);
 
   const rows = await queryQuestions('stem LIKE $2', ['%地球围绕太阳运行%']);
   assert.equal(rows.length, 1);
@@ -475,7 +479,7 @@ test('题型无法识别：落库用 default_type，generation_meta 标记 needs
     subject_id: seed.subjectId,
   }));
   assert.equal(r.status, 200, JSON.stringify(r.data));
-  assert.equal(r.data.imported, 1);
+  assert.equal(r.data.imported.new, 1);
 
   const rows = await queryQuestions('stem LIKE $2', ['%简单的几个字%']);
   assert.equal(rows.length, 1);
@@ -572,7 +576,7 @@ test('from_file：3 道「行测」+ 2 道「公基」分别进入对应科目�
     fileBody('sample-04-ai-json.json', { subject_mode: 'from_file' }),
   );
   assert.equal(r.status, 200, JSON.stringify(r.data));
-  assert.equal(r.data.imported, 5, '5 道题应全部入库');
+  assert.equal(r.data.imported.new, 5, '5 道题应全部入库');
 
   // D4 的第一条证据：3 道 subject=行测 全部匹配成功。
   assert.equal(r.data.subject_matched.matched_count, 5, '5 道题都应匹配到科目');
@@ -638,7 +642,7 @@ test('from_file：subject 写「科技常识」而库里叫「科技常识-物�
     subject_mode: 'from_file',
   });
   assert.equal(r.status, 200, JSON.stringify(r.data));
-  assert.equal(r.data.imported, 1);
+  assert.equal(r.data.imported.new, 1);
   assert.equal(r.data.subject_matched.matched_count, 1, '模糊匹配应算作匹配成功');
   assert.equal(r.data.subject_matched.matched_subjects[0].subject_id, targetId);
   assert.equal(await countQuestionsInSubject(targetId), 1);
@@ -664,7 +668,7 @@ test('from_file：subject 匹配不到时不自动建科目，回落请求里的
     subject_id: seed.subjectId,
   });
   assert.equal(r.status, 200, JSON.stringify(r.data));
-  assert.equal(r.data.imported, 1);
+  assert.equal(r.data.imported.new, 1);
   assert.equal(r.data.subject_matched.matched_count, 0);
   assert.equal(r.data.subject_matched.unmatched_count, 1);
   assert.deepEqual(r.data.subject_matched.unmatched_subjects, ['完全没建过的科目名']);
@@ -730,7 +734,7 @@ test('uniform（默认）：文件里的 subject/node 被忽略，全部进请�
     subject_id: seed.subjectId,
   });
   assert.equal(r.status, 200, JSON.stringify(r.data));
-  assert.equal(r.data.imported, 1);
+  assert.equal(r.data.imported.new, 1);
   assert.equal(r.data.stats.subject_mode, 'uniform', '不传 subject_mode 时按 uniform 处理');
   assert.equal(r.data.subject_matched.matched_count, 0, 'uniform 模式不做科目匹配');
   assert.equal(r.data.node_created.created_count, 0, 'uniform 模式不自动建考点');
@@ -779,7 +783,7 @@ test('PATCH /questions/batch：批量改科目会清空旧考点，批量设考�
     subject_mode: 'from_file',
   });
   assert.equal(imported.status, 200, JSON.stringify(imported.data));
-  assert.equal(imported.data.imported, 2);
+  assert.equal(imported.data.imported.new, 2);
 
   const c = await pool.connect();
   let ids;
@@ -926,7 +930,7 @@ test('m31124 批次：导两次得到两个批次，删第一批不影响第二�
     subject_mode: 'from_file',
   });
   assert.equal(first.status, 200, JSON.stringify(first.data));
-  assert.equal(first.data.imported, 3);
+  assert.equal(first.data.imported.new, 3);
   assert.ok(first.data.batch_id, '响应要回本次批次 id');
   assert.equal(first.data.import_filename, 'batch-first.json');
 
@@ -967,7 +971,7 @@ test('m31124 批次：导两次得到两个批次，删第一批不影响第二�
     subject_mode: 'from_file',
   });
   assert.equal(second.status, 200, JSON.stringify(second.data));
-  assert.equal(second.data.imported, 2);
+  assert.equal(second.data.imported.new, 2);
   assert.notEqual(second.data.batch_id, first.data.batch_id, '两次导入必须是两个批次');
   assert.equal(await countQuestionsInBatch(second.data.batch_id), 2);
 
@@ -1079,4 +1083,162 @@ test('m31124 批次：DELETE /questions/batch 参数校验', skipOpt, async () =
   assert.equal(missing.status, 200, JSON.stringify(missing.data));
   assert.equal(missing.data.deleted, 0);
   assert.equal(missing.data.requested, 0);
+  assert.equal(missing.data.requested, 0);
+});
+
+// ---------------------------------------------------------------------------
+// m32773：导入预检（POST /questions/import/preview）+ 重复题批量决策
+//                    （skip / overwrite）
+// ---------------------------------------------------------------------------
+
+/**
+ * 造一份 JSON 题库。
+ * stemPrefix 用来区分不同场景（不同 stem → 不同 content_hash → 互不判重）。
+ */
+function previewPayload(stemPrefix, count, answer = '正确') {
+  return {
+    questions: Array.from({ length: count }, (_, i) => ({
+      type: 'judge',
+      stem: `${stemPrefix}${i + 1}：预检与决策用例第 ${i + 1} 题`,
+      answer,
+    })),
+  };
+}
+
+/** 用 POST /questions 直接建题（用来造「库里已经有的题」）。 */
+async function createQuestion(stem, answer = '正确') {
+  const res = await req('POST', '/questions', {
+    type: 'judge',
+    stem,
+    answer,
+  });
+  assert.equal(res.status, 201, JSON.stringify(res.data));
+  return res.data.id;
+}
+
+/** 统计库里（未软删、属于测试用户）的题数。 */
+async function countOwnQuestions() {
+  const c = await pool.connect();
+  try {
+    const r = await c.query(
+      `SELECT count(*)::int AS n FROM questions WHERE owner_user_id = $1 AND deleted_at IS NULL`,
+      [seed.userId],
+    );
+    return r.rows[0].n;
+  } finally {
+    c.release();
+  }
+}
+
+/** 统计导入批次行数（预检绝不能建批次）。 */
+async function countBatches() {
+  const c = await pool.connect();
+  try {
+    const r = await c.query(`SELECT count(*)::int AS n FROM import_batches WHERE user_id = $1`, [
+      seed.userId,
+    ]);
+    return r.rows[0].n;
+  } finally {
+    c.release();
+  }
+}
+
+test('m32773 预检：5 题里 3 道已存在 → new=2 / duplicate=3，且不写任何数据', skipOpt, async () => {
+  const prefix = 'm32773预检';
+  const payload = previewPayload(prefix, 5);
+
+  // 先把其中 3 道题建进库里（答案故意与文件不同，好验证 diff）。
+  for (let i = 1; i <= 3; i += 1) {
+    await createQuestion(`${prefix}${i}：预检与决策用例第 ${i} 题`, '错误');
+  }
+
+  const beforeQuestions = await countOwnQuestions();
+  const beforeBatches = await countBatches();
+
+  const preview = await req('POST', '/questions/import/preview', {
+    filename: 'preview-5.json',
+    mime: 'application/json',
+    content_base64: Buffer.from(JSON.stringify(payload), 'utf8').toString('base64'),
+  });
+  assert.equal(preview.status, 200, JSON.stringify(preview.data));
+  assert.equal(preview.data.new_count, 2, '应有 2 道新题');
+  assert.equal(preview.data.duplicate_count, 3, '应有 3 道重复题');
+  assert.equal(preview.data.duplicates.length, 3, '重复明细也要 3 条');
+  assert.deepEqual(preview.data.parse_errors, [], '解析不该有错');
+
+  // 明细形状：incoming（题干/题型/hash）+ existing（库里的 id/题干）+ diff（人话差异）。
+  const first = preview.data.duplicates[0];
+  assert.ok(first.incoming.stem, 'incoming.stem 必须有');
+  assert.ok(first.incoming.content_hash, 'incoming.content_hash 必须有');
+  assert.ok(first.existing.id, 'existing.id 必须有');
+  assert.ok(first.existing.created_at, 'existing.created_at 必须有');
+  assert.ok(
+    first.diff.includes('答案不同'),
+    `答案不同应出现在 diff 里，实际 ${JSON.stringify(first.diff)}`,
+  );
+
+  // 预检是只读的：题数与批次行数都不能变。
+  assert.equal(await countOwnQuestions(), beforeQuestions, '预检不能插题');
+  assert.equal(await countBatches(), beforeBatches, '预检不能建导入批次');
+});
+
+test('m32773 决策：不传 decisions 默认 skip → 新增 2 道、跳过 3 道', skipOpt, async () => {
+  const prefix = 'm32773跳过';
+  const payload = previewPayload(prefix, 5);
+  for (let i = 1; i <= 3; i += 1) {
+    await createQuestion(`${prefix}${i}：预检与决策用例第 ${i} 题`, '正确');
+  }
+
+  const res = await req('POST', '/questions/import', {
+    filename: 'skip-5.json',
+    mime: 'application/json',
+    content_base64: Buffer.from(JSON.stringify(payload), 'utf8').toString('base64'),
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.data));
+  assert.equal(res.data.imported.new, 2, 'skip 模式应新增 2 道');
+  assert.equal(res.data.imported.overwritten, 0, 'skip 模式不该有覆盖');
+  assert.equal(res.data.duplicates.skipped, 3, 'skip 模式应跳过 3 道');
+  assert.equal(res.data.duplicates.overwritten, 0);
+  assert.equal(res.data.duplicate_details.length, 3, '重复明细仍是 3 条');
+});
+
+test('m32773 决策：overwrite 覆盖同 hash 的题（保留 id 与归属），且不新增行', skipOpt, async () => {
+  const prefix = 'm32773覆盖';
+  const payload = previewPayload(prefix, 5, '正确');
+  const ids = [];
+  for (let i = 1; i <= 3; i += 1) {
+    ids.push(await createQuestion(`${prefix}${i}：预检与决策用例第 ${i} 题`, '错误'));
+  }
+  const before = await countOwnQuestions();
+
+  const res = await req('POST', '/questions/import', {
+    filename: 'overwrite-5.json',
+    mime: 'application/json',
+    content_base64: Buffer.from(JSON.stringify(payload), 'utf8').toString('base64'),
+    decisions: { duplicate_action: 'overwrite' },
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.data));
+  assert.equal(res.data.imported.new, 2, 'overwrite 模式仍要新增 2 道新题');
+  assert.equal(res.data.imported.overwritten, 3, '3 道重复题应被覆盖');
+  assert.equal(res.data.duplicates.skipped, 0, 'overwrite 后没有跳过项');
+  assert.equal(res.data.duplicates.overwritten, 3);
+
+  // 覆盖是 UPDATE 不是 INSERT：总数 = 原来 3 + 新增 2。
+  assert.equal(await countOwnQuestions(), before + 2, '覆盖不产生新行');
+
+  // 被覆盖的题：id 不变、归属不变、答案被改成文件里的值。
+  const c = await pool.connect();
+  try {
+    const r = await c.query(
+      `SELECT id, owner_user_id, answer FROM questions WHERE id = ANY($1::uuid[])`,
+      [ids],
+    );
+    assert.equal(r.rows.length, 3, '原三道题都还在');
+    for (const row of r.rows) {
+      assert.equal(row.answer, '正确', '答案应被文件里的值覆盖');
+      assert.equal(row.owner_user_id, seed.userId, '归属不能变');
+    }
+  } finally {
+    c.release();
+  }
 });

@@ -53,6 +53,10 @@ import * as defectQuestions from './defect_questions.mjs';
 // m31124：导入批次列表（GET /import-batches）。
 // 只认单段路径 'import-batches'，不与任何 questions / exam-profiles 路径交叉。
 import * as importBatches from './import_batches.mjs';
+// m32406：题库导出（GET /export/questions）。
+// 前缀 'export' 与其它模块完全不重叠，放在哪里都不会截胡；照「长路径在前」的
+// 既有习惯仍放在靠前位置。
+import * as exportRoute from './export.mjs';
 /**
  * 挂载顺序即匹配优先级。长路径模块在前，短路径在后。
  * @type {Array<{name: string, match: Function}>}
@@ -64,6 +68,8 @@ export const ROUTE_MODULES = Object.freeze([
   { name: 'question_types', match: questionTypes.match },
   // m31124：导入批次列表（单段路径，不遮蔽任何已有路径）。
   { name: 'import_batches', match: importBatches.match },
+  // m32406：题库导出（GET /export/questions，只读快照）。
+  { name: 'export', match: exportRoute.match },
   // m27163 C4：缺陷单↔题目关联 + 历史自定义错因。★ 必须排在 defect_tickets 之前，
   // 否则 GET /defect-tickets/custom-reasons 会被 GET /defect-tickets/:id 抢走。
   { name: 'defect_questions', match: defectQuestions.match },
